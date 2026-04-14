@@ -8,12 +8,13 @@ import com.equipo2b.scheduler.upload.FlightPlanUploader;
 import com.equipo2b.scheduler.upload.AirportUploader;
 import com.equipo2b.scheduler.upload.ShipmentUploader;
 
+import java.io.IOException;
 import java.util.ArrayList;
 
 public class Main {
     public static void main(String[] args){
         //testFlightUploader();
-        testAirportUploader();
+        //testAirportUploader();
         //testShipmentUploader();
     }
 
@@ -55,7 +56,7 @@ public class Main {
         ShipmentUploader uploader = new ShipmentUploader();
 
         try {
-            ArrayList<Shipment> shipments = uploader.uploadAll("data/_envios_preliminar_", 1000);
+            ArrayList<Shipment> shipments = uploader.uploadAll("data/_envios_preliminar_", 10);
 
             System.out.println("Upload successful!");
             System.out.println("Total shipments loaded: " + shipments.size());

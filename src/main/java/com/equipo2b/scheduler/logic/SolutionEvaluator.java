@@ -7,8 +7,7 @@ import com.equipo2b.scheduler.util.TimeConverter;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 
 public class SolutionEvaluator {
 
@@ -17,6 +16,7 @@ public class SolutionEvaluator {
     public double evaluate(Solution solution, AirportManager airportManager) {
         double totalScore = 0;
         List<StorageEvent> storageTimeline = new ArrayList<>();
+        Map<ScheduledFlight, Integer> flightOccupancy = new HashMap<>(); // Flight -> Quantity
 
         for (ShipmentRoute route : solution.getRoutes().values()) {
             // Extremely high cost for infeasible solutions
@@ -29,35 +29,85 @@ public class SolutionEvaluator {
             totalScore += calculateRouteTime(route, airportManager);
 
             // Generate storage events to later check storage constraints
-            //generateStorageEvents(route, storageTimeline, airportManager);
+            generateStorageEvents(route, storageTimeline, airportManager);
+
+            // Collect flight occupancy
+            for (ScheduledFlight f : route.getSteps()) {
+                int currentQty = flightOccupancy.getOrDefault(f, 0);
+                flightOccupancy.put(f, currentQty + route.getShipment().getQuantity());
+            }
         }
+
+        // Verify airport storage capacity constraints
+        totalScore += calculateCapacityPenalties(storageTimeline, airportManager);
+        totalScore += calculateFlightPenalties(flightOccupancy);
 
         return totalScore;
     }
 
-    /*
+    private double calculateFlightPenalties(Map<ScheduledFlight, Integer> occupancyMap) {
+        double penalty = 0;
+
+        for (var entry : occupancyMap.entrySet()) {
+            ScheduledFlight flight = entry.getKey();
+            int totalQuantity = entry.getValue();
+            int maxCapacity = flight.getBaseFlight().getCapacity();
+
+            if (totalQuantity > maxCapacity) {
+                int excess = totalQuantity - maxCapacity;
+
+                // Penalty: A high base cost + the square of the excess
+                // This creates a "steep hill" for the algorithm to climb down
+                penalty += 20000 + (Math.pow(excess, 2) * 100);
+            }
+        }
+        return penalty;
+    }
+
+    private double calculateCapacityPenalties(List<StorageEvent> timeline, AirportManager am) {
+        Collections.sort(timeline); // Order by time
+
+        Map<String, Integer> currentOccupancy = new HashMap<>(); // Assumes initial empty storage
+        double penalty = 0;
+
+        for (StorageEvent event : timeline) {
+            // Update storage with new event
+            int newCount = currentOccupancy.getOrDefault(event.airportId(), 0) + event.delta();
+            currentOccupancy.put(event.airportId(), newCount);
+
+            // if for testing
+            if (am.getAirport(event.airportId()) == null){
+                System.out.println(event);
+            }
+            // Compare with airport max capacity
+            int maxCap = am.getAirport(event.airportId()).getCapacity();
+            if (newCount > maxCap) {
+                penalty += (newCount - maxCap) * 500.0; // Penalty proportional to excess
+            }
+        }
+        return penalty;
+    }
+
     private void generateStorageEvents(ShipmentRoute route, List<StorageEvent> timeline, AirportManager am) {
         Shipment s = route.getShipment();
         List<ScheduledFlight> steps = route.getSteps();
 
-        // Evento 1: Entra al aeropuerto de origen (Registro)
-        timeline.add(new StorageEvent(s.getDepartureDateTime(), 1, s.getOriginId()));
+        // Register luggage in origin airport
+        timeline.add(new StorageEvent(s.getDepartureDateTime(), s.getQuantity(), s.getOriginId()));
 
-        // Eventos intermedios
+        // Other movements
         for (int i = 0; i < steps.size(); i++) {
             ScheduledFlight flight = steps.get(i);
 
-            // Sale del aeropuerto actual (Vuelo despega)
-            timeline.add(new StorageEvent(flight.getDepartureDateTime(), -1, flight.getOrigin()));
+            // Leaves current airport
+            timeline.add(new StorageEvent(flight.getDepartureDateTime(), s.getQuantity(), flight.getOrigin()));
 
-            // Entra al aeropuerto de destino (Vuelo aterriza)
-            // Nota: Si es el último destino, el paquete se entrega y "sale" del sistema de almacenamiento.
+            // Enters arrival airport. If it is the final airport, it is shipped and leaves the system
             if (i < steps.size() - 1) {
-                timeline.add(new StorageEvent(flight.getArrivalDateTime(am), 1, flight.getDestination()));
+                timeline.add(new StorageEvent(flight.getArrivalDateTime(), s.getQuantity(), flight.getDestination()));
             }
         }
     }
-    */
 
     private double calculateRouteTime(ShipmentRoute route, AirportManager am) {
         Shipment shipment = route.getShipment();

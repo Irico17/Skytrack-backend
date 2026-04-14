@@ -1,6 +1,6 @@
 package com.equipo2b.scheduler.model;
 
-import java.util.LinkedList;
+import java.util.ArrayList;
 import java.util.List;
 
 public class ShipmentRoute {
@@ -9,7 +9,15 @@ public class ShipmentRoute {
 
     public ShipmentRoute(Shipment shipment) {
         this.shipment = shipment;
-        this.steps = new LinkedList<>(); // For later insertions/modifications
+        this.steps = new ArrayList<>();
+    }
+
+    public ShipmentRoute(ShipmentRoute other) {
+        this.shipment = other.shipment;
+        this.steps = new ArrayList<>();
+        for (ScheduledFlight flight : other.steps) {
+            this.steps.add(new ScheduledFlight(flight));
+        }
     }
 
     public void addStep(ScheduledFlight flight) { steps.add(flight); }

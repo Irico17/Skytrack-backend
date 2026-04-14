@@ -11,8 +11,7 @@ public class TimeConverter {
      */
     public static LocalDateTime toUTC(LocalDateTime localDateTime, Airport airport) {
         // ZoneOffset expects the format "+05:00" or "-05:00"
-        String offsetSign = airport.getGmtOffset() >= 0 ? "+" : "";
-        ZoneOffset offset = ZoneOffset.of(String.format("%s%02d:00", offsetSign, airport.getGmtOffset()));
+        ZoneOffset offset = ZoneOffset.ofHours(airport.getGmtOffset());
 
         return localDateTime.atOffset(offset)
                 .withOffsetSameInstant(ZoneOffset.UTC) // Changes the offset to UTC

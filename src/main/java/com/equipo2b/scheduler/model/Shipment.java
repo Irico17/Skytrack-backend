@@ -30,6 +30,7 @@ public class Shipment {
         return new_id;
     }
 
+    public int getGlobalId() {return idGlobal;}
     public int getId() { return id; }
     public String getIdAirport() { return idAirport; }
     public LocalDateTime getDepartureDateTime() { return departureDateTime; }

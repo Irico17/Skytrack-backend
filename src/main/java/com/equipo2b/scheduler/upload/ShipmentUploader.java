@@ -31,7 +31,6 @@ public class ShipmentUploader {
             for (Path file : files) {
                 // Extract origin IATA from filename (e.g., "_envios_SKBO_.txt" -> "SKBO")
                 String fileName = file.getFileName().toString();
-                System.out.println(fileName);
                 String originIata = fileName.substring(8,12);
 
                 // Read lines and convert to Shipment objects
@@ -42,7 +41,6 @@ public class ShipmentUploader {
                         Shipment shipment = parseLine(line, originIata);
                         gatheredShipments.add(shipment);
                         if (maxShipments != 0 && gatheredShipments.size() == maxShipments) {
-                            System.out.println("Breaking");
                             allShipments.addAll(gatheredShipments);
                             break;
                         }

@@ -1,5 +1,6 @@
 package com.equipo2b.scheduler.model;
 import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Contiene todos los vuelos programados para el día.
@@ -9,6 +10,18 @@ public class FlightPlan {
 
     public FlightPlan(){
         this.flights = new ArrayList<>();
+    }
+
+    public FlightPlan(List<Flight> flights) {
+        this.flights = new ArrayList<>();
+        for (Flight f : flights) { // Deep copy of each flight
+            this.flights.add(new Flight(
+                    f.getOrigin(),
+                    f.getDestination(),
+                    f.getDepartureTime(),
+                    f.getArrivalTime(),
+                    f.getCapacity()));
+        }
     }
 
     public void addFlight(Flight flight){

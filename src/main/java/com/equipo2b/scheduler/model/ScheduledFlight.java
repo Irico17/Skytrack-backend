@@ -12,6 +12,11 @@ public class ScheduledFlight {
         this.date = date;
     }
 
+    public ScheduledFlight(ScheduledFlight other) {
+        this.baseFlight = other.baseFlight;
+        this.date = other.date;
+    }
+
     public LocalDateTime getDepartureDateTime() {
         // At the departure airport local time
         return baseFlight.getDepartureTime().atDate(date);

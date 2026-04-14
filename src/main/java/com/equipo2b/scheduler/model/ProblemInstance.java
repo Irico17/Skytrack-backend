@@ -7,7 +7,6 @@ import java.util.ArrayList;
 * Los datos que contiene no cambian
 */
 public record ProblemInstance(
-        ArrayList<Airport> airports,
         FlightPlan flightPlan,
         ArrayList<Shipment> shipments
 ) { }
