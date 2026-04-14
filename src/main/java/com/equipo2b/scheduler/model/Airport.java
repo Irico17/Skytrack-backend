@@ -10,8 +10,10 @@ public class Airport {
     private final int capacity;
     private final double latitude;
     private final double longitude;
+    private final Continent continent;
 
-    public Airport(String id, String city, String country, int gmtOffset, int capacity, double latitude, double longitude) {
+    public Airport(String id, String city, String country, int gmtOffset, int capacity, double latitude,
+                   double longitude, Continent continent) {
         this.id = id;
         this.city = city;
         this.country = country;
@@ -19,6 +21,7 @@ public class Airport {
         this.capacity = capacity;
         this.latitude = latitude;
         this.longitude = longitude;
+        this.continent = continent;
     }
 
     public String getId() { return id; }
@@ -26,6 +29,7 @@ public class Airport {
     public int getGmtOffset() { return gmtOffset; }
     public int getCapacity() { return capacity; }
     public String getCountry() { return country; }
+    public Continent getContinent() { return continent; }
 
     @Override
     public boolean equals(Object o) {

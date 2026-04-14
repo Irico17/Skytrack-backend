@@ -19,11 +19,11 @@ public class FlightPlan {
         ArrayList<Flight> newFlights = new ArrayList<Flight>();
         for (Flight f : flights){
             newFlights.add(new Flight(
-                    f.airportOrigin(),
-                    f.airportDestination(),
-                    f.departureTime(),
-                    f.arrivalTime(),
-                    f.capacity()));
+                    f.getOrigin(),
+                    f.getDestination(),
+                    f.getDepartureTime(),
+                    f.getArrivalTime(),
+                    f.getCapacity()));
         }
         return newFlights;
     }

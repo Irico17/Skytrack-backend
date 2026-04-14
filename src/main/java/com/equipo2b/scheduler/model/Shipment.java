@@ -33,7 +33,7 @@ public class Shipment {
     public int getId() { return id; }
     public String getIdAirport() { return idAirport; }
     public LocalDateTime getDepartureDateTime() { return departureDateTime; }
-    public String getOriginIdId() { return originId; }
+    public String getOriginId() { return originId; }
     public String getDestinationId() { return destinationId; }
     public int getQuantity() { return quantity; }
     public String getClientId() { return clientId; }

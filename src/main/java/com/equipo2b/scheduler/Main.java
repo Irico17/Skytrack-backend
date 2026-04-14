@@ -13,8 +13,8 @@ import java.util.ArrayList;
 public class Main {
     public static void main(String[] args){
         //testFlightUploader();
-        //testAirportUploader();
-        testShipmentUploader();
+        testAirportUploader();
+        //testShipmentUploader();
     }
 
     private static void testFlightUploader(){
@@ -43,7 +43,8 @@ public class Main {
             System.out.println("Total airports loaded: " + airports.size());
             if (!airports.isEmpty()){
                 Airport a = airports.get(airports.size() - 1);
-                System.out.println("Last airport: " + a.getId() + " " + a.getCity() + " " + a.getCountry() + " " + a.getCapacity());
+                System.out.println("Last airport: " + a.getId() + " " + a.getCity() + " " + a.getCountry() + " " +
+                        a.getCapacity() + " " + a.getContinent());
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -54,7 +55,7 @@ public class Main {
         ShipmentUploader uploader = new ShipmentUploader();
 
         try {
-            ArrayList<Shipment> shipments = uploader.uploadAll("data/_envios_preliminar_", Integer.MAX_VALUE);
+            ArrayList<Shipment> shipments = uploader.uploadAll("data/_envios_preliminar_", 1000);
 
             System.out.println("Upload successful!");
             System.out.println("Total shipments loaded: " + shipments.size());
