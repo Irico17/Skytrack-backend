@@ -62,7 +62,7 @@ public class Main {
             if (!shipments.isEmpty()){
                 Shipment s = shipments.get(shipments.size() - 1);
                 System.out.println("Last shipment: " + s.getIdAirport() + " " + s.getClientId() + " " +
-                        s.getOriginIdId() + " " + s.getDestinationId() + " " + s.getQuantity() +" " +
+                        s.getOriginId() + " " + s.getDestinationId() + " " + s.getQuantity() +" " +
                         s.getDepartureDateTime());
             }
         } catch (Exception e) {
