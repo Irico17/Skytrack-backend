@@ -29,12 +29,13 @@ public class SolutionEvaluator {
             totalScore += calculateRouteTime(route, airportManager);
 
             // Generate storage events to later check storage constraints
-            generateStorageEvents(route, storageTimeline, airportManager);
+            //generateStorageEvents(route, storageTimeline, airportManager);
         }
 
         return totalScore;
     }
 
+    /*
     private void generateStorageEvents(ShipmentRoute route, List<StorageEvent> timeline, AirportManager am) {
         Shipment s = route.getShipment();
         List<ScheduledFlight> steps = route.getSteps();
@@ -56,6 +57,7 @@ public class SolutionEvaluator {
             }
         }
     }
+    */
 
     private double calculateRouteTime(ShipmentRoute route, AirportManager am) {
         Shipment shipment = route.getShipment();
