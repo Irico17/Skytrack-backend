@@ -1,51 +1,52 @@
 package com.equipo2b.scheduler.model;
 
+import java.time.ZoneId;
 import java.util.Objects;
 
-public class Airport {
-    private final String id;
-    private final String city;
-    private final String country;
-    private final int gmtOffset;
-    private final int capacity;
-    private final double latitude;
-    private final double longitude;
-    private final Continent continent;
-
-    public Airport(String id, String city, String country, int gmtOffset, int capacity, double latitude,
-                   double longitude, Continent continent) {
-        this.id = id;
-        this.city = city;
-        this.country = country;
-        this.gmtOffset = gmtOffset;
-        this.capacity = capacity;
-        this.latitude = latitude;
-        this.longitude = longitude;
-        this.continent = continent;
-    }
-
-    public String getId() { return id; }
-    public String getCity() { return city; }
-    public int getGmtOffset() { return gmtOffset; }
-    public int getCapacity() { return capacity; }
-    public String getCountry() { return country; }
-    public Continent getContinent() { return continent; }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true; // Compara referencias de memoria
-        if (o == null || this.getClass() != o.getClass()) return false;
-        Airport airport = (Airport) o;
-        return Objects.equals(this.id, airport.id);
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(id);
-    }
-
-    @Override
-    public String toString() {
-        return String.format("%s (%s, %s)", id, city, country);
+/**
+ * Representa un aeropuerto con su ubicación geográfica, capacidad de almacén y huso horario.
+ * Inmutable.
+ * 
+ * @param id Código IATA del aeropuerto (ej: "JFK", "CDG")
+ * @param city Ciudad donde se ubica el aeropuerto
+ * @param country País donde se ubica el aeropuerto
+ * @param zoneId Huso horario para conversiones temporales
+ * @param storageCapacity Capacidad máxima del almacén (500-800 maletas)
+ * @param latitude Latitud para cálculos de distancia
+ * @param longitude Longitud para cálculos de distancia
+ * @param continent Continente (AMERICA, EUROPE, ASIA)
+ */
+public record Airport(
+    String id,
+    String city,
+    String country,
+    ZoneId zoneId,
+    int storageCapacity,
+    double latitude,
+    double longitude,
+    Continent continent
+) {
+    /**
+     * Constructor compacto con validaciones.
+     */
+    public Airport {
+        Objects.requireNonNull(id, "Airport ID cannot be null");
+        Objects.requireNonNull(zoneId, "ZoneId cannot be null");
+        Objects.requireNonNull(continent, "Continent cannot be null");
+        
+        // Validación condicional según modo
+        if (ValidationMode.isStrict()) {
+            // Modo STRICT: Especificaciones del diseño
+            if (storageCapacity < 500 || storageCapacity > 800) {
+                throw new IllegalArgumentException(
+                    "Storage capacity must be between 500 and 800 (STRICT mode), got: " + storageCapacity);
+            }
+        } else {
+            // Modo LENIENT: Rango ampliado para datos reales
+            if (storageCapacity < 300 || storageCapacity > 1000) {
+                throw new IllegalArgumentException(
+                    "Storage capacity must be between 300 and 1000 (LENIENT mode), got: " + storageCapacity);
+            }
+        }
     }
 }

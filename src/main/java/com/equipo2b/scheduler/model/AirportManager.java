@@ -18,7 +18,7 @@ public class AirportManager {
     public AirportManager(List<Airport> airportList) {
         Map<String, Airport> airportMap = new HashMap<>();
         for (Airport a : airportList) {
-            airportMap.put(a.getId(), a);
+            airportMap.put(a.id(), a);
         }
 
         this.airports = airportMap;
@@ -29,8 +29,8 @@ public class AirportManager {
     }
 
     public void addAirport(Airport airport) {
-        if (airport != null && airport.getId() != null) {
-            airports.put(airport.getId(), airport);
+        if (airport != null && airport.id() != null) {
+            airports.put(airport.id(), airport);
         }
     }
 

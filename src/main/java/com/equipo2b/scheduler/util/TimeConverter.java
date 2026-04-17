@@ -10,11 +10,9 @@ public class TimeConverter {
      * Converts a local date/time at a specific airport to UTC.
      */
     public static LocalDateTime toUTC(LocalDateTime localDateTime, Airport airport) {
-        // ZoneOffset expects the format "+05:00" or "-05:00"
-        ZoneOffset offset = ZoneOffset.ofHours(airport.getGmtOffset());
-
-        return localDateTime.atOffset(offset)
-                .withOffsetSameInstant(ZoneOffset.UTC) // Changes the offset to UTC
+        // Use the ZoneId from the airport record
+        return localDateTime.atZone(airport.zoneId())
+                .withZoneSameInstant(ZoneOffset.UTC)
                 .toLocalDateTime();
     }
 

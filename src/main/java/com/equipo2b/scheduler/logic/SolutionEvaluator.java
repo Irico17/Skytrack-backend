@@ -1,129 +1,415 @@
 package com.equipo2b.scheduler.logic;
 
-// We use cost as fitness. Objective: Minimize cost (which is a double)
+import com.equipo2b.scheduler.model.FlightPlan;
+import com.equipo2b.scheduler.model.AirportManager;
 
-import com.equipo2b.scheduler.model.*;
-import com.equipo2b.scheduler.util.TimeConverter;
-
-import java.time.Duration;
-import java.time.LocalDateTime;
-import java.util.*;
-
+/**
+ * Evalúa la calidad de una solución mediante función fitness.
+ * 
+ * <p>La función fitness guía la búsqueda de los algoritmos de optimización
+ * (Algoritmo Genético y Búsqueda Tabú) hacia soluciones válidas y eficientes.
+ * 
+ * <h2>Fórmula de Fitness</h2>
+ * <pre>
+ * fitness = suma_penalizaciones - suma_premios
+ * </pre>
+ * 
+ * <p><strong>Menor valor = mejor solución</strong>
+ * 
+ * <h2>Penalizaciones (Restricciones Duras)</h2>
+ * <ul>
+ *   <li><strong>Capacidad de vuelo excedida:</strong> 10,000 puntos por cada maleta excedente</li>
+ *   <li><strong>Capacidad de almacén excedida:</strong> 15,000 puntos por cada maleta excedente en cualquier instante</li>
+ *   <li><strong>Violación de SLA:</strong> 20,000 puntos por cada hora de retraso</li>
+ *   <li><strong>Violación de tiempo de escala:</strong> 5,000 puntos por cada violación del mínimo de 10 minutos</li>
+ * </ul>
+ * 
+ * <h2>Premios (Optimización)</h2>
+ * <ul>
+ *   <li><strong>Holgura de tiempo:</strong> 100 puntos por cada hora de holgura respecto al SLA (máximo 500 puntos por ruta)</li>
+ *   <li><strong>Vuelos no utilizados:</strong> 50 puntos por cada vuelo del plan que no se utiliza</li>
+ * </ul>
+ * 
+ * <h2>Justificación del Diseño</h2>
+ * <p>Las penalizaciones son significativamente mayores que los premios para garantizar que:
+ * <ol>
+ *   <li>Las restricciones duras se respeten (soluciones factibles)</li>
+ *   <li>Los algoritmos prioricen la validez sobre la optimización</li>
+ *   <li>Las violaciones de SLA tengan el mayor impacto (20,000 puntos/hora)</li>
+ *   <li>Los excesos de capacidad de almacén sean más costosos que los de vuelo (15,000 vs 10,000)</li>
+ * </ol>
+ * 
+ * <p>Los premios incentivan:
+ * <ol>
+ *   <li>Rutas con holgura temporal (mayor robustez ante disrupciones)</li>
+ *   <li>Uso eficiente de recursos (minimizar vuelos utilizados)</li>
+ * </ol>
+ * 
+ * <p><strong>Validates: Requirements 9.2, 9.3, 9.4, 9.5, 9.6, 9.7</strong>
+ * 
+ * @see com.equipo2b.scheduler.algorithm.GeneticAlgorithm
+ * @see com.equipo2b.scheduler.algorithm.TabuSearch
+ */
 public class SolutionEvaluator {
-
-    private static final double INVALID_ROUTE_PENALTY = 1_000_000.0;
-
-    public double evaluate(Solution solution, AirportManager airportManager) {
-        double totalScore = 0;
-        List<StorageEvent> storageTimeline = new ArrayList<>();
-        Map<ScheduledFlight, Integer> flightOccupancy = new HashMap<>(); // Flight -> Quantity
-
-        for (ShipmentRoute route : solution.getRoutes().values()) {
-            // Extremely high cost for infeasible solutions
-            if (!RouteValidator.validateRoute(route)) {
-                totalScore += INVALID_ROUTE_PENALTY;
-                continue;
-            }
-
-            // Calculate the "Time to Destination" (Efficiency)
-            totalScore += calculateRouteTime(route, airportManager);
-
-            // Generate storage events to later check storage constraints
-            generateStorageEvents(route, storageTimeline, airportManager);
-
-            // Collect flight occupancy
-            for (ScheduledFlight f : route.getSteps()) {
-                int currentQty = flightOccupancy.getOrDefault(f, 0);
-                flightOccupancy.put(f, currentQty + route.getShipment().getQuantity());
-            }
+    
+    // ==================== Constantes de Penalización ====================
+    
+    /**
+     * Penalización por cada maleta que excede la capacidad de un vuelo.
+     * 
+     * <p>Valor: 10,000 puntos por maleta excedente
+     * 
+     * <p><strong>Validates: Requirement 9.2</strong>
+     */
+    public static final double PENALTY_FLIGHT_CAPACITY = 10_000.0;
+    
+    /**
+     * Penalización por cada maleta que excede la capacidad de almacén de un aeropuerto
+     * en cualquier instante de tiempo.
+     * 
+     * <p>Valor: 15,000 puntos por maleta excedente
+     * 
+     * <p>Esta penalización es mayor que la de capacidad de vuelo porque los excesos
+     * de almacén pueden causar congestión operativa más severa.
+     * 
+     * <p><strong>Validates: Requirement 9.3</strong>
+     */
+    public static final double PENALTY_STORAGE_CAPACITY = 15_000.0;
+    
+    /**
+     * Penalización por cada hora de retraso respecto al SLA (Service Level Agreement).
+     * 
+     * <p>Valor: 20,000 puntos por hora de retraso
+     * 
+     * <p>Esta es la penalización más alta porque las violaciones de SLA afectan
+     * directamente los compromisos contractuales con los clientes.
+     * 
+     * <p><strong>Validates: Requirement 9.4</strong>
+     */
+    public static final double PENALTY_SLA_VIOLATION = 20_000.0;
+    
+    /**
+     * Penalización por cada violación del tiempo mínimo de escala entre vuelos.
+     * 
+     * <p>Valor: 5,000 puntos por violación
+     * 
+     * <p>El tiempo mínimo de escala es 10 minutos. Violaciones de esta restricción
+     * hacen que la ruta sea físicamente infactible.
+     * 
+     * <p><strong>Validates: Requirement 9.5</strong>
+     */
+    public static final double PENALTY_LAYOVER_VIOLATION = 5_000.0;
+    
+    // ==================== Constantes de Premio ====================
+    
+    /**
+     * Premio por cada hora de holgura respecto al SLA.
+     * 
+     * <p>Valor: 100 puntos por hora de holgura
+     * 
+     * <p>La holgura temporal proporciona robustez ante disrupciones operativas
+     * (retrasos, cancelaciones) y mejora la satisfacción del cliente.
+     * 
+     * <p><strong>Validates: Requirement 9.6</strong>
+     * 
+     * @see #REWARD_TIME_SLACK_MAX
+     */
+    public static final double REWARD_TIME_SLACK_PER_HOUR = 100.0;
+    
+    /**
+     * Premio máximo por holgura de tiempo por ruta.
+     * 
+     * <p>Valor: 500 puntos máximo por ruta
+     * 
+     * <p>Este límite evita que el algoritmo priorice excesivamente rutas con
+     * holgura muy grande en detrimento de otros objetivos de optimización.
+     * 
+     * <p><strong>Validates: Requirement 9.6</strong>
+     * 
+     * @see #REWARD_TIME_SLACK_PER_HOUR
+     */
+    public static final double REWARD_TIME_SLACK_MAX = 500.0;
+    
+    /**
+     * Premio por cada vuelo del plan que no se utiliza en la solución.
+     * 
+     * <p>Valor: 50 puntos por vuelo no utilizado
+     * 
+     * <p>Este premio incentiva el uso eficiente de recursos, minimizando el número
+     * total de vuelos necesarios para transportar todos los lotes de maletas.
+     * 
+     * <p><strong>Validates: Requirement 9.7</strong>
+     */
+    public static final double REWARD_UNUSED_FLIGHT = 50.0;
+    
+    // ==================== Dependencias ====================
+    
+    private final FlightPlan flightPlan;
+    private final AirportManager airportManager;
+    
+    /**
+     * Constructor que inicializa el evaluador con las dependencias necesarias.
+     * 
+     * @param flightPlan Plan de vuelos completo para calcular vuelos no utilizados
+     * @param airportManager Gestor de aeropuertos para validar capacidades de almacén
+     * @throws NullPointerException si algún parámetro es null
+     */
+    public SolutionEvaluator(FlightPlan flightPlan, AirportManager airportManager) {
+        if (flightPlan == null) {
+            throw new NullPointerException("FlightPlan cannot be null");
         }
-
-        // Verify airport storage capacity constraints
-        totalScore += calculateCapacityPenalties(storageTimeline, airportManager);
-        totalScore += calculateFlightPenalties(flightOccupancy);
-
-        return totalScore;
+        if (airportManager == null) {
+            throw new NullPointerException("AirportManager cannot be null");
+        }
+        this.flightPlan = flightPlan;
+        this.airportManager = airportManager;
     }
-
-    private double calculateFlightPenalties(Map<ScheduledFlight, Integer> occupancyMap) {
-        double penalty = 0;
-
-        for (var entry : occupancyMap.entrySet()) {
-            ScheduledFlight flight = entry.getKey();
-            int totalQuantity = entry.getValue();
-            int maxCapacity = flight.getBaseFlight().getCapacity();
-
-            if (totalQuantity > maxCapacity) {
-                int excess = totalQuantity - maxCapacity;
-
-                // Penalty: A high base cost + the square of the excess
-                // This creates a "steep hill" for the algorithm to climb down
-                penalty += 20000 + (Math.pow(excess, 2) * 100);
+    
+    // ==================== Métodos de Evaluación ====================
+    
+    /**
+     * Calcula penalizaciones por exceso de capacidad de vuelos.
+     * 
+     * <p>Agrupa maletas por vuelo, calcula exceso respecto a capacidad,
+     * y aplica penalización de 10,000 puntos por maleta excedente.
+     * 
+     * <p><strong>Validates: Requirement 9.2</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Penalización total por exceso de capacidad de vuelos
+     */
+    public double calculateFlightCapacityPenalties(com.equipo2b.scheduler.model.Solution solution) {
+        // Agrupar maletas por vuelo
+        java.util.Map<com.equipo2b.scheduler.model.Flight, Integer> bagsPerFlight = new java.util.HashMap<>();
+        
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            int batchQuantity = route.getBatch().quantity();
+            for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
+                bagsPerFlight.merge(flight, batchQuantity, Integer::sum);
             }
         }
+        
+        // Calcular exceso y aplicar penalización
+        double penalty = 0.0;
+        for (java.util.Map.Entry<com.equipo2b.scheduler.model.Flight, Integer> entry : bagsPerFlight.entrySet()) {
+            com.equipo2b.scheduler.model.Flight flight = entry.getKey();
+            int assignedBags = entry.getValue();
+            int excess = assignedBags - flight.capacity();
+            
+            if (excess > 0) {
+                penalty += excess * PENALTY_FLIGHT_CAPACITY;
+            }
+        }
+        
         return penalty;
     }
-
-    private double calculateCapacityPenalties(List<StorageEvent> timeline, AirportManager am) {
-        Collections.sort(timeline); // Order by time
-
-        Map<String, Integer> currentOccupancy = new HashMap<>(); // Assumes initial empty storage
-        double penalty = 0;
-
-        for (StorageEvent event : timeline) {
-            // Update storage with new event
-            int newCount = currentOccupancy.getOrDefault(event.airportId(), 0) + event.delta();
-            currentOccupancy.put(event.airportId(), newCount);
-
-            // if for testing
-            if (am.getAirport(event.airportId()) == null){
-                System.out.println(event);
+    
+    /**
+     * Calcula penalizaciones por exceso de capacidad de almacenes.
+     * 
+     * <p>Recopila eventos de almacenamiento, simula ocupación a lo largo del tiempo,
+     * y aplica penalización de 15,000 puntos por maleta excedente en cualquier instante.
+     * 
+     * <p><strong>Validates: Requirement 9.3</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Penalización total por exceso de capacidad de almacenes
+     */
+    public double calculateStorageCapacityPenalties(com.equipo2b.scheduler.model.Solution solution) {
+        // Recopilar todos los eventos de almacenamiento
+        java.util.List<com.equipo2b.scheduler.model.StorageEvent> allEvents = new java.util.ArrayList<>();
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            allEvents.addAll(route.getStorageEvents());
+        }
+        
+        // Ordenar eventos por timestamp
+        allEvents.sort(java.util.Comparator.comparing(com.equipo2b.scheduler.model.StorageEvent::timestamp));
+        
+        // Simular ocupación a lo largo del tiempo
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> currentOccupancy = new java.util.HashMap<>();
+        double penalty = 0.0;
+        
+        for (com.equipo2b.scheduler.model.StorageEvent event : allEvents) {
+            com.equipo2b.scheduler.model.Airport airport = event.airport();
+            int quantity = event.quantity();
+            
+            // Actualizar ocupación según tipo de evento
+            int newOccupancy;
+            if (event.type() == com.equipo2b.scheduler.model.StorageEventType.ARRIVAL) {
+                newOccupancy = currentOccupancy.getOrDefault(airport, 0) + quantity;
+            } else { // DEPARTURE
+                newOccupancy = currentOccupancy.getOrDefault(airport, 0) - quantity;
             }
-            // Compare with airport max capacity
-            int maxCap = am.getAirport(event.airportId()).getCapacity();
-            if (newCount > maxCap) {
-                penalty += (newCount - maxCap) * 500.0; // Penalty proportional to excess
+            currentOccupancy.put(airport, newOccupancy);
+            
+            // Calcular exceso respecto a capacidad
+            int excess = newOccupancy - airport.storageCapacity();
+            if (excess > 0) {
+                penalty += excess * PENALTY_STORAGE_CAPACITY;
             }
         }
+        
         return penalty;
     }
-
-    private void generateStorageEvents(ShipmentRoute route, List<StorageEvent> timeline, AirportManager am) {
-        Shipment s = route.getShipment();
-        List<ScheduledFlight> steps = route.getSteps();
-
-        // Register luggage in origin airport
-        timeline.add(new StorageEvent(s.getDepartureDateTime(), s.getQuantity(), s.getOriginId()));
-
-        // Other movements
-        for (int i = 0; i < steps.size(); i++) {
-            ScheduledFlight flight = steps.get(i);
-
-            // Leaves current airport
-            timeline.add(new StorageEvent(flight.getDepartureDateTime(), s.getQuantity(), flight.getOrigin()));
-
-            // Enters arrival airport. If it is the final airport, it is shipped and leaves the system
-            if (i < steps.size() - 1) {
-                timeline.add(new StorageEvent(flight.getArrivalDateTime(), s.getQuantity(), flight.getDestination()));
+    
+    /**
+     * Calcula penalizaciones por violación de SLA.
+     * 
+     * <p>Calcula horas de retraso para rutas que no cumplen SLA,
+     * aplicando penalización de 20,000 puntos por hora de retraso.
+     * 
+     * <p><strong>Validates: Requirement 9.4</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Penalización total por violación de SLA
+     */
+    public double calculateSLAPenalties(com.equipo2b.scheduler.model.Solution solution) {
+        double penalty = 0.0;
+        
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            if (!route.meetsSLA()) {
+                // Calcular horas de retraso (valor negativo de slack)
+                java.time.Duration slack = route.getSLASlack();
+                long delayHours = Math.abs(slack.toHours());
+                penalty += delayHours * PENALTY_SLA_VIOLATION;
             }
         }
+        
+        return penalty;
     }
-
-    private double calculateRouteTime(ShipmentRoute route, AirportManager am) {
-        Shipment shipment = route.getShipment();
-        LocalDateTime startTime = shipment.getDepartureDateTime(); // From the instant it is turned in
-        ScheduledFlight firstFlight = route.getSteps().getFirst();
-
-        // Find the arrival time of the last flight in the sequence
-        ScheduledFlight lastFlight = route.getSteps().getLast();
-        LocalDateTime arrivalTime = lastFlight.getArrivalDateTime();
-
-        // Duration in minutes from shipment registration to final delivery
-        long elapsedMinutes = TimeConverter.getElapsedMinutes(
-                startTime, am.getAirport(firstFlight.getOrigin()),
-                arrivalTime, am.getAirport(lastFlight.getOrigin())
-        );
-
-        return elapsedMinutes * 1.0;
+    
+    /**
+     * Calcula penalizaciones por violación de tiempo mínimo de escala.
+     * 
+     * <p>Verifica que haya al menos 10 minutos entre llegada y siguiente salida,
+     * aplicando penalización de 5,000 puntos por cada violación.
+     * 
+     * <p><strong>Validates: Requirement 9.5</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Penalización total por violación de tiempo de escala
+     */
+    public double calculateLayoverPenalties(com.equipo2b.scheduler.model.Solution solution) {
+        double penalty = 0.0;
+        
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            java.util.List<com.equipo2b.scheduler.model.Flight> flights = route.getFlights();
+            
+            // Verificar tiempo de escala entre vuelos consecutivos
+            for (int i = 0; i < flights.size() - 1; i++) {
+                com.equipo2b.scheduler.model.Flight current = flights.get(i);
+                com.equipo2b.scheduler.model.Flight next = flights.get(i + 1);
+                
+                java.time.Duration layover = java.time.Duration.between(
+                    current.arrivalTime(), 
+                    next.departureTime()
+                );
+                
+                if (layover.toMinutes() < 10) {
+                    penalty += PENALTY_LAYOVER_VIOLATION;
+                }
+            }
+        }
+        
+        return penalty;
+    }
+    
+    /**
+     * Calcula premios por holgura de tiempo respecto al SLA.
+     * 
+     * <p>Otorga 100 puntos por cada hora de holgura, con máximo de 500 puntos por ruta.
+     * La holgura proporciona robustez ante disrupciones operativas.
+     * 
+     * <p><strong>Validates: Requirement 9.6</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Premio total por holgura de tiempo
+     */
+    public double calculateTimeSlackRewards(com.equipo2b.scheduler.model.Solution solution) {
+        double reward = 0.0;
+        
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            if (route.meetsSLA()) {
+                // Calcular horas de holgura
+                java.time.Duration slack = route.getSLASlack();
+                long slackHours = slack.toHours();
+                
+                // Aplicar premio con límite máximo
+                double routeReward = slackHours * REWARD_TIME_SLACK_PER_HOUR;
+                routeReward = Math.min(routeReward, REWARD_TIME_SLACK_MAX);
+                reward += routeReward;
+            }
+        }
+        
+        return reward;
+    }
+    
+    /**
+     * Calcula premios por vuelos no utilizados.
+     * 
+     * <p>Otorga 50 puntos por cada vuelo del plan que no se utiliza en la solución.
+     * Incentiva el uso eficiente de recursos.
+     * 
+     * <p><strong>Validates: Requirement 9.7</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Premio total por vuelos no utilizados
+     */
+    public double calculateUnusedFlightRewards(com.equipo2b.scheduler.model.Solution solution) {
+        int totalFlights = flightPlan.getTotalFlights();
+        int usedFlights = solution.getUsedFlights().size();
+        int unusedFlights = totalFlights - usedFlights;
+        
+        return unusedFlights * REWARD_UNUSED_FLIGHT;
+    }
+    
+    /**
+     * Evalúa la calidad de una solución mediante función fitness.
+     * 
+     * <p>Calcula fitness como: suma_penalizaciones - suma_premios
+     * <p><strong>Menor valor = mejor solución</strong>
+     * 
+     * <p>Penalizaciones:
+     * <ul>
+     *   <li>Capacidad de vuelo excedida: 10,000 puntos/maleta</li>
+     *   <li>Capacidad de almacén excedida: 15,000 puntos/maleta</li>
+     *   <li>Violación de SLA: 20,000 puntos/hora</li>
+     *   <li>Violación de tiempo de escala: 5,000 puntos/violación</li>
+     * </ul>
+     * 
+     * <p>Premios:
+     * <ul>
+     *   <li>Holgura de tiempo: 100 puntos/hora (máx 500 por ruta)</li>
+     *   <li>Vuelos no utilizados: 50 puntos/vuelo</li>
+     * </ul>
+     * 
+     * <p><strong>Validates: Requirements 9.1, 9.8</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Valor de fitness (menor es mejor)
+     */
+    public double evaluate(com.equipo2b.scheduler.model.Solution solution) {
+        // Calcular todas las penalizaciones
+        double flightCapacityPenalty = calculateFlightCapacityPenalties(solution);
+        double storageCapacityPenalty = calculateStorageCapacityPenalties(solution);
+        double slaPenalty = calculateSLAPenalties(solution);
+        double layoverPenalty = calculateLayoverPenalties(solution);
+        
+        double totalPenalties = flightCapacityPenalty + storageCapacityPenalty + 
+                               slaPenalty + layoverPenalty;
+        
+        // Calcular todos los premios
+        double timeSlackReward = calculateTimeSlackRewards(solution);
+        double unusedFlightReward = calculateUnusedFlightRewards(solution);
+        
+        double totalRewards = timeSlackReward + unusedFlightReward;
+        
+        // Fitness = penalizaciones - premios (menor es mejor)
+        double fitness = totalPenalties - totalRewards;
+        
+        // Actualizar el fitness en la solución
+        solution.setFitness(fitness);
+        
+        return fitness;
     }
 }

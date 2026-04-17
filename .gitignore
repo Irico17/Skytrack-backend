@@ -41,3 +41,20 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Project Specific ###
+# Archivos no usados (scripts de prueba y verificación)
+archivos-no-usados/
+
+# Documentación interna
+documentos/
+
+# Documentación adicional (solo README y ALGORITMOS en raíz)
+SCHEDULER.md
+EXPLICACION_DETALLADA_PARA_ENTENDER.md
+
+# Información del caso (archivos del profesor)
+InformacionCaso/
+
+# Archivos temporales de Kiro
+.kiro/

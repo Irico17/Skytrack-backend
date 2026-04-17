@@ -5,6 +5,8 @@ import com.equipo2b.scheduler.model.Continent;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -15,52 +17,113 @@ import java.nio.file.Paths;
 
 public class AirportUploader {
 
-    // Returns mutable new list of airports
-    public ArrayList<Airport> upload(String pathToFile) throws IOException {
-        ArrayList<Airport> airports = new ArrayList<>();
-        Path path = Paths.get(pathToFile);
+    /**
+     * Carga aeropuertos desde un archivo de texto.
+     * Formato: ID, ciudad, país, GMT offset, capacidad, latitud, longitud, continente
+     * 
+     * @param filePath Ruta al archivo de aeropuertos
+     * @return Lista de aeropuertos cargados
+     * @throws IOException Si hay error al leer el archivo
+     * @throws IllegalArgumentException Si el formato del archivo es inválido
+     */
+    public List<Airport> loadAirports(String filePath) throws IOException {
+        List<Airport> airports = new ArrayList<>();
+        Path path = Paths.get(filePath);
 
         Continent continent = null;
+        int lineNumber = 0;
+        
         try (Stream<String> lines = Files.lines(path, StandardCharsets.ISO_8859_1)) {
-            List<String> lineList = lines.filter(line -> !line.isBlank()).collect(Collectors.toList());
-            for (String line: lineList){
-                if (line.matches("^\\s*America del Sur.*")){
-                    continent = Continent.SOUTH_AMERICA;
+            List<String> lineList = lines.collect(Collectors.toList());
+            
+            for (String line : lineList) {
+                lineNumber++;
+                
+                // Skip blank lines
+                if (line.isBlank()) {
+                    continue;
                 }
-                if (line.matches("^\\s*Europa.*")){
+                
+                // Detect continent headers
+                if (line.matches("^\\s*America del Sur.*")) {
+                    continent = Continent.AMERICA;
+                    continue;
+                }
+                if (line.matches("^\\s*Europa.*")) {
                     continent = Continent.EUROPE;
+                    continue;
                 }
-                if (line.matches("^\\s*Asia.*")){
+                if (line.matches("^\\s*Asia.*")) {
                     continent = Continent.ASIA;
+                    continue;
                 }
 
-                // Matches trailing whitespace if any followed by digits (positive) and then any char
+                // Parse airport data lines (start with digits)
                 if (line.matches("^\\s*\\d+.*")) {
-                    Airport airport = parseLine(line, continent);
-                    airports.add(airport);
+                    if (continent == null) {
+                        throw new IllegalArgumentException(
+                            String.format("Line %d: Airport data found before continent header", lineNumber)
+                        );
+                    }
+                    
+                    try {
+                        Airport airport = parseLine(line, continent);
+                        airports.add(airport);
+                    } catch (Exception e) {
+                        throw new IllegalArgumentException(
+                            String.format("Line %d: Error parsing airport data - %s", lineNumber, e.getMessage()),
+                            e
+                        );
+                    }
                 }
             }
-        } catch (IOException e) {
-            System.err.println("File error: " + e.getMessage());
         }
+        
         return airports;
     }
+    
+    /**
+     * @deprecated Use loadAirports(String) instead
+     */
+    @Deprecated
+    public ArrayList<Airport> upload(String pathToFile) throws IOException {
+        return new ArrayList<>(loadAirports(pathToFile));
+    }
 
+    /**
+     * Parsea una línea del archivo de aeropuertos.
+     * Formato esperado: ID, ciudad, país, GMT offset, capacidad, latitud, longitud, continente
+     */
     private Airport parseLine(String line, Continent continent) {
         String cleanLine = line.trim();
         String[] parts = cleanLine.split("\\s{2,}"); // Two whitespaces or more: new part
 
-        String idICAO = parts[1].trim();
-        String city = parts[2].trim();
-        String country = parts[3].trim();
+        if (parts.length < 7) {
+            throw new IllegalArgumentException(
+                String.format("Invalid format: expected at least 7 fields, found %d", parts.length)
+            );
+        }
 
-        int gmt = Integer.parseInt(parts[5]);
-        int capacity = Integer.parseInt(parts[6]);
+        try {
+            String idICAO = parts[1].trim();
+            String city = parts[2].trim();
+            String country = parts[3].trim();
 
-        double lat = extractCoordinate(cleanLine, "Latitude:");
-        double lon = extractCoordinate(cleanLine, "Longitude:");
+            int gmtOffset = Integer.parseInt(parts[5].trim());
+            int storageCapacity = Integer.parseInt(parts[6].trim());
 
-        return new Airport(idICAO, city, country, gmt, capacity, lat, lon, continent);
+            double lat = extractCoordinate(cleanLine, "Latitude:");
+            double lon = extractCoordinate(cleanLine, "Longitude:");
+
+            // Convert GMT offset to ZoneId
+            ZoneId zoneId = ZoneOffset.ofHours(gmtOffset);
+
+            return new Airport(idICAO, city, country, zoneId, storageCapacity, lat, lon, continent);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid number format: " + e.getMessage(), e);
+        } catch (ArrayIndexOutOfBoundsException e) {
+            throw new IllegalArgumentException("Missing required field", e);
+        }
     }
 
     private double extractCoordinate(String line, String key) {
