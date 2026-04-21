@@ -168,9 +168,9 @@ public class RunRealSchedulerSimulation {
         tabuConfig.setInt("neighborhoodSize", 10);
         tabu.configure(tabuConfig);
         
-        // Crear Scheduler
-        Scheduler scheduler = new Scheduler(
-            ga, tabu, queue,
+        // Crear Scheduler con GATS
+        Scheduler scheduler = SchedulerFactory.createGATSScheduler(
+            flightPlan, airportManager, queue,
             new SolutionEvaluator(flightPlan, airportManager),
             new RouteValidator(airportManager),
             Ta, Sa, K

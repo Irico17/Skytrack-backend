@@ -13,17 +13,25 @@ import java.util.*;
 /**
  * Scheduler para planificación programada con ciclos periódicos.
  * 
+ * <p>Soporta dos modos de algoritmo:
+ * <ul>
+ *   <li>GATS: Algoritmo Genético + Búsqueda Tabú (híbrido)</li>
+ *   <li>TABU_PURE: Búsqueda Tabú pura (standalone)</li>
+ * </ul>
+ * 
  * Parámetros:
  * - Ta: Tiempo máximo de ejecución del algoritmo (minutos)
  * - Sa: Salto entre ejecuciones del algoritmo (minutos)
  * - K: Constante de proporcionalidad para consumo de datos
  * - Sc = Sa × K: Salto de consumo de datos (minutos)
  * 
- * **Validates: Requirements 21.5, 22.4, 23.1, 34.1, 34.2**
+ * **Validates: Requirements 21.5, 22.4, 23.1, 34.1, 34.2, Caso de estudio punto a, b**
  */
 public class Scheduler {
-    private final OptimizationAlgorithm geneticAlgorithm;
+    private final OptimizationAlgorithm primaryAlgorithm;
     private final TabuSearch tabuSearch;
+    private final AlgorithmType algorithmType;
+    private final boolean useRefinement;
     private final ShipmentQueue shipmentQueue;
     private final SolutionEvaluator evaluator;
     private final RouteValidator validator;
@@ -38,10 +46,12 @@ public class Scheduler {
     private Solution currentSolution;
     
     /**
-     * Constructor del Scheduler.
+     * Constructor del Scheduler con algoritmo configurable.
      * 
-     * @param geneticAlgorithm Algoritmo Genético para planificación masiva
-     * @param tabuSearch Búsqueda Tabú para refinamiento
+     * @param primaryAlgorithm Algoritmo primario (GA o Tabu)
+     * @param tabuSearch Búsqueda Tabú para refinamiento (opcional)
+     * @param algorithmType Tipo de algoritmo (GATS o TABU_PURE)
+     * @param useRefinement Si se debe aplicar refinamiento Tabú adicional
      * @param shipmentQueue Cola de pedidos pendientes
      * @param evaluator Evaluador de fitness
      * @param validator Validador de soluciones
@@ -49,19 +59,23 @@ public class Scheduler {
      * @param Sa Salto entre ejecuciones (minutos)
      * @param K Constante de proporcionalidad
      * 
-     * **Validates: Requirements 21.5, 22.4, 23.1, 34.1, 34.2**
+     * **Validates: Requirements 21.5, 22.4, 23.1, 34.1, 34.2, Caso de estudio punto a, b**
      */
-    public Scheduler(OptimizationAlgorithm geneticAlgorithm,
+    public Scheduler(OptimizationAlgorithm primaryAlgorithm,
                     TabuSearch tabuSearch,
+                    AlgorithmType algorithmType,
+                    boolean useRefinement,
                     ShipmentQueue shipmentQueue,
                     SolutionEvaluator evaluator,
                     RouteValidator validator,
                     int Ta, int Sa, int K) {
-        this.geneticAlgorithm = Objects.requireNonNull(geneticAlgorithm);
-        this.tabuSearch = Objects.requireNonNull(tabuSearch);
-        this.shipmentQueue = Objects.requireNonNull(shipmentQueue);
-        this.evaluator = Objects.requireNonNull(evaluator);
-        this.validator = Objects.requireNonNull(validator);
+        this.primaryAlgorithm = Objects.requireNonNull(primaryAlgorithm, "Primary algorithm cannot be null");
+        this.tabuSearch = Objects.requireNonNull(tabuSearch, "Tabu search cannot be null");
+        this.algorithmType = Objects.requireNonNull(algorithmType, "Algorithm type cannot be null");
+        this.useRefinement = useRefinement;
+        this.shipmentQueue = Objects.requireNonNull(shipmentQueue, "Shipment queue cannot be null");
+        this.evaluator = Objects.requireNonNull(evaluator, "Evaluator cannot be null");
+        this.validator = Objects.requireNonNull(validator, "Validator cannot be null");
         
         this.Ta = Ta;
         this.Sa = Sa;
@@ -83,18 +97,19 @@ public class Scheduler {
      * 
      * Proceso:
      * 1. Consumir pedidos de ventana Sc
-     * 2. Ejecutar Algoritmo Genético
-     * 3. Refinar con Búsqueda Tabú
+     * 2. Ejecutar algoritmo primario (GA o Tabu)
+     * 3. Refinar con Búsqueda Tabú (solo si useRefinement = true)
      * 4. Validar solución
      * 5. Actualizar rutas asignadas
      * 
      * @param currentTime Tiempo actual de la simulación
      * @return Solución refinada y validada
      * 
-     * **Validates: Requirements 22.1, 22.2, 22.3, 22.5, 23.2**
+     * **Validates: Requirements 22.1, 22.2, 22.3, 22.5, 23.2, Caso de estudio punto a, b**
      */
     public Solution executePlanningCycle(ZonedDateTime currentTime) {
         System.out.println("\n=== CICLO DE PLANIFICACIÓN ===");
+        System.out.println("Algoritmo: " + algorithmType.getDisplayName());
         System.out.println("Tiempo actual: " + currentTime);
         
         // 1. Calcular ventana de consumo: [currentTime, currentTime + Sc]
@@ -112,26 +127,32 @@ public class Scheduler {
             return currentSolution;
         }
         
-        // 3. Ejecutar Algoritmo Genético con pedidos consumidos
+        // 3. Ejecutar algoritmo primario con pedidos consumidos
         long startTime = System.currentTimeMillis();
-        System.out.println("\nEjecutando Algoritmo Genético...");
-        Solution gaSolution = geneticAlgorithm.optimize(batches);
-        long gaTime = System.currentTimeMillis() - startTime;
+        String algorithmName = algorithmType == AlgorithmType.GATS ? "Algoritmo Genético" : "Búsqueda Tabú";
+        System.out.println("\nEjecutando " + algorithmName + "...");
+        Solution primarySolution = primaryAlgorithm.optimize(batches);
+        long primaryTime = System.currentTimeMillis() - startTime;
         
-        System.out.println("✓ GA completado en " + gaTime + " ms");
-        System.out.println("  Fitness: " + String.format("%.2f", gaSolution.getFitness()));
+        System.out.println("✓ " + algorithmName + " completado en " + primaryTime + " ms");
+        System.out.println("  Fitness: " + String.format("%.2f", primarySolution.getFitness()));
         
-        // 4. Refinar mejor solución GA usando Búsqueda Tabú
-        startTime = System.currentTimeMillis();
-        System.out.println("\nRefinando con Búsqueda Tabú...");
-        Solution refinedSolution = tabuSearch.refine(gaSolution);
-        long tabuTime = System.currentTimeMillis() - startTime;
+        Solution finalSolution = primarySolution;
+        long refinementTime = 0;
         
-        System.out.println("✓ Tabú completado en " + tabuTime + " ms");
-        System.out.println("  Fitness mejorado: " + String.format("%.2f", refinedSolution.getFitness()));
+        // 4. Refinar con Búsqueda Tabú (solo para GATS)
+        if (useRefinement) {
+            startTime = System.currentTimeMillis();
+            System.out.println("\nRefinando con Búsqueda Tabú...");
+            finalSolution = tabuSearch.refine(primarySolution);
+            refinementTime = System.currentTimeMillis() - startTime;
+            
+            System.out.println("✓ Refinamiento completado en " + refinementTime + " ms");
+            System.out.println("  Fitness mejorado: " + String.format("%.2f", finalSolution.getFitness()));
+        }
         
-        // 5. Validar solución refinada usando RouteValidator
-        ValidationReport validationReport = validator.validate(refinedSolution);
+        // 5. Validar solución usando RouteValidator
+        ValidationReport validationReport = validator.validate(finalSolution);
         
         if (validationReport.isValid()) {
             System.out.println("✓ Solución válida");
@@ -141,10 +162,10 @@ public class Scheduler {
         }
         
         // 6. Actualizar rutas asignadas en sistema
-        currentSolution = refinedSolution;
+        currentSolution = finalSolution;
         
         // 7. Registrar tiempo de ejecución y verificar que sea <= Ta
-        long totalTime = gaTime + tabuTime;
+        long totalTime = primaryTime + refinementTime;
         long taMillis = Ta * 60 * 1000L;
         
         System.out.println("\nTiempo total: " + totalTime + " ms (límite: " + taMillis + " ms)");
@@ -167,11 +188,12 @@ public class Scheduler {
      * @param maxCycles Número máximo de ciclos (0 = sin límite)
      * @return Solución final
      * 
-     * **Validates: Requirements 21.1, 21.2, 21.3, 21.4, 22.1**
+     * **Validates: Requirements 21.1, 21.2, 21.3, 21.4, 22.1, Caso de estudio punto a, b**
      */
     public Solution run(ZonedDateTime startTime, int maxCycles) {
         System.out.println("=".repeat(80));
         System.out.println("INICIANDO SCHEDULER");
+        System.out.println("Algoritmo: " + algorithmType.getDisplayName());
         System.out.println("Parámetros: Ta=" + Ta + " min, Sa=" + Sa + " min, K=" + K + ", Sc=" + Sc + " min");
         System.out.println("=".repeat(80));
         
@@ -197,11 +219,21 @@ public class Scheduler {
         
         System.out.println("\n" + "=".repeat(80));
         System.out.println("SCHEDULER COMPLETADO");
+        System.out.println("Algoritmo usado: " + algorithmType.getDisplayName());
         System.out.println("Ciclos ejecutados: " + cycle);
         System.out.println("Fitness final: " + String.format("%.2f", currentSolution.getFitness()));
         System.out.println("=".repeat(80));
         
         return currentSolution;
+    }
+    
+    /**
+     * Obtiene el tipo de algoritmo configurado.
+     * 
+     * @return Tipo de algoritmo
+     */
+    public AlgorithmType getAlgorithmType() {
+        return algorithmType;
     }
     
     /**
@@ -211,5 +243,18 @@ public class Scheduler {
      */
     public Solution getCurrentSolution() {
         return currentSolution;
+    }
+    
+    /**
+     * Actualiza la solución actual del sistema.
+     * Usado para replanificación de emergencia.
+     * 
+     * @param newSolution Nueva solución
+     * 
+     * **Validates: Requirements 12.6, 24.5**
+     */
+    public void updateSolution(Solution newSolution) {
+        this.currentSolution = Objects.requireNonNull(newSolution, "New solution cannot be null");
+        System.out.println("✓ Solución actualizada en Scheduler");
     }
 }

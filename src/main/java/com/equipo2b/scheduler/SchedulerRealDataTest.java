@@ -2,6 +2,7 @@ package com.equipo2b.scheduler;
 
 import com.equipo2b.scheduler.algorithm.*;
 import com.equipo2b.scheduler.execution.Scheduler;
+import com.equipo2b.scheduler.execution.SchedulerFactory;
 import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.upload.*;
@@ -147,10 +148,10 @@ public class SchedulerRealDataTest {
             System.out.println("  Sc (salto consumo) = Sa × K = " + (Sa * K) + " minutos");
             System.out.println();
             
-            // Crear Scheduler
-            Scheduler scheduler = new Scheduler(
-                geneticAlgorithm,
-                tabuSearch,
+            // Crear Scheduler con GATS
+            Scheduler scheduler = SchedulerFactory.createGATSScheduler(
+                flightPlan,
+                airportManager,
                 shipmentQueue,
                 evaluator,
                 validator,

@@ -38,6 +38,8 @@ public class SimulationController {
     // Scheduler y componentes
     private Scheduler scheduler;
     private Solution currentSolution;
+    private TabuSearch tabuSearch;
+    private RouteValidator validator;
     
     // Estadísticas
     private int currentCycle = 0;
@@ -86,18 +88,21 @@ public class SimulationController {
         TabuSearch tabu = new TabuSearch(flightPlan, airportManager);
         configureAlgorithms(ga, tabu, scenario);
         
+        // Guardar referencias para replanificación
+        this.tabuSearch = tabu;
+        this.validator = new RouteValidator(airportManager);
+        
         // Crear ShipmentQueue
         ShipmentQueue queue = new ShipmentQueue();
         for (ShipmentBatch batch : batches) {
             queue.addShipment(batch);
         }
         
-        // Crear Scheduler
+        // Crear Scheduler con GATS (por defecto)
         SolutionEvaluator evaluator = new SolutionEvaluator(flightPlan, airportManager);
-        RouteValidator validator = new RouteValidator(airportManager);
         
-        this.scheduler = new Scheduler(
-            ga, tabu, queue, evaluator, validator,
+        this.scheduler = SchedulerFactory.createGATSScheduler(
+            flightPlan, airportManager, queue, evaluator, validator,
             scenario.getTa(), scenario.getSa(), scenario.getK()
         );
         
@@ -182,12 +187,106 @@ public class SimulationController {
     /**
      * Registra una cancelación de vuelo durante la simulación.
      * 
+     * Proceso:
+     * 1. Validar que hay simulación activa
+     * 2. Buscar vuelo por ID
+     * 3. Validar que no haya despegado
+     * 4. Obtener solución actual
+     * 5. Ejecutar replanificación
+     * 6. Actualizar solución en Scheduler
+     * 7. Logging de resultados
+     * 
      * @param flightId ID del vuelo a cancelar
+     * 
+     * **Validates: Requirements 24.1, 24.4, 24.5, 12.1-12.6, 25.1-25.4**
      */
     public void registerCancellation(String flightId) {
-        // TODO: Implementar cancelación durante ejecución
-        System.out.println("⚠️  Cancelación registrada: " + flightId);
-        System.out.println("   (Funcionalidad de replanificación pendiente)");
+        // 1. Validar que hay simulación activa
+        if (!running.get()) {
+            System.out.println("⚠️  No hay simulación activa");
+            return;
+        }
+        
+        System.out.println("\n" + "=".repeat(80));
+        System.out.println("🚫 CANCELACIÓN DE VUELO: " + flightId);
+        System.out.println("=".repeat(80));
+        
+        // 2. Buscar vuelo por ID
+        Flight cancelledFlight = findFlightById(flightId);
+        if (cancelledFlight == null) {
+            System.out.println("❌ Error: Vuelo no encontrado: " + flightId);
+            System.out.println("=".repeat(80));
+            return;
+        }
+        
+        System.out.println("✓ Vuelo encontrado:");
+        System.out.println("  Origen: " + cancelledFlight.origin().id());
+        System.out.println("  Destino: " + cancelledFlight.destination().id());
+        System.out.println("  Salida: " + cancelledFlight.departureTime());
+        
+        // 3. Validar que no haya despegado
+        if (simulatedTime.isAfter(cancelledFlight.departureTime())) {
+            System.out.println("❌ Error: No se puede cancelar - vuelo ya despegó");
+            System.out.println("  Tiempo simulado: " + simulatedTime);
+            System.out.println("  Hora de salida: " + cancelledFlight.departureTime());
+            System.out.println("=".repeat(80));
+            return;
+        }
+        
+        System.out.println("✓ Vuelo puede ser cancelado (no ha despegado)");
+        
+        // 4. Obtener solución actual
+        Solution currentSol = scheduler.getCurrentSolution();
+        
+        // 5. Crear Replanner y ejecutar replanificación
+        System.out.println("\n🔄 Iniciando replanificación de emergencia...");
+        Replanner replanner = new Replanner(flightPlan, tabuSearch, validator);
+        ReplanResult result = replanner.replan(currentSol, cancelledFlight);
+        
+        // 6. Actualizar solución en Scheduler
+        scheduler.updateSolution(result.updatedSolution());
+        this.currentSolution = result.updatedSolution();
+        
+        // 7. Logging de resultados
+        System.out.println("\n📊 RESULTADO DE REPLANIFICACIÓN:");
+        System.out.println("  Lotes replanificados: " + result.replanedBatches().size());
+        System.out.println("  Lotes no replanificables: " + result.unreplannableBatches().size());
+        
+        if (!result.unreplannableBatches().isEmpty()) {
+            System.out.println("\n⚠️  LOTES NO REPLANIFICABLES:");
+            for (ShipmentBatch batch : result.unreplannableBatches()) {
+                System.out.println("    - " + batch.batchId() + 
+                                 " (" + batch.origin().id() + " → " + batch.destination().id() + ")");
+            }
+        }
+        
+        // Usar PlanningLogger
+        com.equipo2b.scheduler.util.PlanningLogger.logCancellation(
+            cancelledFlight, 
+            result.replanedBatches().size() + result.unreplannableBatches().size()
+        );
+        com.equipo2b.scheduler.util.PlanningLogger.logReplanningResult(
+            result.replanedBatches().size(),
+            result.unreplannableBatches().size()
+        );
+        
+        System.out.println("\n✓ Replanificación completada exitosamente");
+        System.out.println("=".repeat(80));
+    }
+    
+    /**
+     * Busca un vuelo por su ID en el plan de vuelos.
+     * 
+     * @param flightId ID del vuelo a buscar
+     * @return Vuelo encontrado o null si no existe
+     */
+    private Flight findFlightById(String flightId) {
+        for (Flight flight : flightPlan.getAllFlights()) {
+            if (flight.flightId().equals(flightId)) {
+                return flight;
+            }
+        }
+        return null;
     }
     
     /**
