@@ -124,4 +124,33 @@ public final class Solution {
                 .mapToInt(route -> route.getBatch().quantity())
                 .sum();
     }
+    
+    /**
+     * Fusiona otra solución en esta solución.
+     * Para cada ruta en la otra solución, la agrega o reemplaza por batchId.
+     * Invalida el fitness después de la fusión.
+     * 
+     * Usado para planificación incremental: acumular rutas de múltiples ciclos.
+     * 
+     * @param other La solución a fusionar en esta
+     */
+    public void merge(Solution other) {
+        for (AssignedRoute route : other.getRoutes().values()) {
+            this.addRoute(route);  // Agrega o reemplaza por batchId
+        }
+        this.evaluated = false;  // Invalidar fitness
+    }
+    
+    /**
+     * Elimina una ruta de la solución por batchId.
+     * Invalida el fitness después de la eliminación.
+     * 
+     * Usado para replanificación: eliminar rutas afectadas antes de agregar nuevas.
+     * 
+     * @param batchId ID del lote cuya ruta se debe eliminar
+     */
+    public void removeRoute(String batchId) {
+        routes.remove(batchId);
+        this.evaluated = false;  // Invalidar fitness
+    }
 }

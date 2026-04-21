@@ -151,20 +151,37 @@ public class Scheduler {
             System.out.println("  Fitness mejorado: " + String.format("%.2f", finalSolution.getFitness()));
         }
         
-        // 5. Validar solución usando RouteValidator
-        ValidationReport validationReport = validator.validate(finalSolution);
+        // 5. ACUMULAR rutas nuevas a la solución existente (PLANIFICACIÓN INCREMENTAL)
+        int routesBeforeAccumulation = currentSolution.getRoutes().size();
+        int newRoutesCount = finalSolution.getRoutes().size();
+        
+        System.out.println("\n=== ACUMULACIÓN DE RUTAS ===");
+        System.out.println("Rutas existentes: " + routesBeforeAccumulation);
+        System.out.println("Rutas nuevas generadas: " + newRoutesCount);
+        
+        // Acumular cada ruta nueva a la solución actual
+        for (AssignedRoute route : finalSolution.getRoutes().values()) {
+            currentSolution.addRoute(route);  // Agrega o reemplaza por batchId
+        }
+        
+        int routesAfterAccumulation = currentSolution.getRoutes().size();
+        System.out.println("Rutas totales acumuladas: " + routesAfterAccumulation);
+        
+        // 6. Re-evaluar fitness de la solución completa
+        evaluator.evaluate(currentSolution);
+        System.out.println("Fitness de solución acumulada: " + String.format("%.2f", currentSolution.getFitness()));
+        
+        // 7. Validar solución acumulada usando RouteValidator
+        ValidationReport validationReport = validator.validate(currentSolution);
         
         if (validationReport.isValid()) {
-            System.out.println("✓ Solución válida");
+            System.out.println("✓ Solución acumulada válida");
         } else {
-            System.out.println("⚠ Solución con violaciones:");
+            System.out.println("⚠ Solución acumulada con violaciones:");
             System.out.println(validationReport.getSummary());
         }
         
-        // 6. Actualizar rutas asignadas en sistema
-        currentSolution = finalSolution;
-        
-        // 7. Registrar tiempo de ejecución y verificar que sea <= Ta
+        // 8. Registrar tiempo de ejecución y verificar que sea <= Ta
         long totalTime = primaryTime + refinementTime;
         long taMillis = Ta * 60 * 1000L;
         

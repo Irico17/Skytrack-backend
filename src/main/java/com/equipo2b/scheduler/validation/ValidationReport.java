@@ -67,4 +67,54 @@ public class ValidationReport {
         
         return sb.toString();
     }
+    
+    /**
+     * Verifica si hay violaciones operativas (capacidad, SLA, escalas).
+     * Estas son violaciones críticas que indican que la solución no es factible.
+     * 
+     * @return true si hay violaciones operativas, false en caso contrario
+     */
+    public boolean hasOperationalViolations() {
+        return violations.stream()
+                .anyMatch(v -> v.type() == ViolationType.FLIGHT_CAPACITY ||
+                              v.type() == ViolationType.STORAGE_CAPACITY ||
+                              v.type() == ViolationType.SLA_VIOLATION ||
+                              v.type() == ViolationType.LAYOVER_VIOLATION);
+    }
+    
+    /**
+     * Verifica si hay violaciones de datos (duración de vuelos).
+     * Estas son violaciones de calidad de datos que pueden ser toleradas en modo LENIENT.
+     * 
+     * @return true si hay violaciones de datos, false en caso contrario
+     */
+    public boolean hasDataViolations() {
+        return violations.stream()
+                .anyMatch(v -> v.type() == ViolationType.FLIGHT_DURATION);
+    }
+    
+    /**
+     * Obtiene solo las violaciones operativas.
+     * 
+     * @return Lista de violaciones operativas
+     */
+    public List<Violation> getOperationalViolations() {
+        return violations.stream()
+                .filter(v -> v.type() == ViolationType.FLIGHT_CAPACITY ||
+                            v.type() == ViolationType.STORAGE_CAPACITY ||
+                            v.type() == ViolationType.SLA_VIOLATION ||
+                            v.type() == ViolationType.LAYOVER_VIOLATION)
+                .toList();
+    }
+    
+    /**
+     * Obtiene solo las violaciones de datos.
+     * 
+     * @return Lista de violaciones de datos
+     */
+    public List<Violation> getDataViolations() {
+        return violations.stream()
+                .filter(v -> v.type() == ViolationType.FLIGHT_DURATION)
+                .toList();
+    }
 }

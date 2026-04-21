@@ -178,7 +178,16 @@ public class TabuSearch implements OptimizationAlgorithm {
                           List<ShipmentBatch> affectedBatches) {
         Solution updatedSolution = new Solution(currentSolution);
         
-        // Buscar vuelos alternativos en ventana +2h desde mismo aeropuerto
+        System.out.println("\n=== REPLANIFICACIÓN TABÚ ===");
+        System.out.println("Rutas antes de eliminar afectadas: " + updatedSolution.getRoutes().size());
+        
+        // 1. ELIMINAR rutas afectadas de la solución
+        for (ShipmentBatch batch : affectedBatches) {
+            updatedSolution.removeRoute(batch.batchId());
+        }
+        System.out.println("Rutas después de eliminar afectadas: " + updatedSolution.getRoutes().size());
+        
+        // 2. Buscar vuelos alternativos en ventana +2h desde mismo aeropuerto
         ZonedDateTime windowStart = cancelledFlight.departureTime();
         ZonedDateTime windowEnd = windowStart.plusHours(2);
         
@@ -188,7 +197,12 @@ public class TabuSearch implements OptimizationAlgorithm {
             windowEnd
         );
         
-        // Para cada lote afectado, generar nueva ruta usando solo vuelos alternativos
+        System.out.println("Vuelos alternativos en ventana +2h: " + alternatives.size());
+        
+        // 3. Para cada lote afectado, generar nueva ruta usando solo vuelos alternativos
+        int replanedCount = 0;
+        int failedCount = 0;
+        
         for (ShipmentBatch batch : affectedBatches) {
             AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(
                 batch, 
@@ -197,12 +211,24 @@ public class TabuSearch implements OptimizationAlgorithm {
             
             if (newRoute != null) {
                 updatedSolution.addRoute(newRoute);
+                replanedCount++;
             } else {
                 // Registrar error si no se puede replanificar algún lote
                 System.err.printf("Cannot replan batch %s - no alternatives found%n", 
                                 batch.batchId());
+                failedCount++;
             }
         }
+        
+        System.out.println("Lotes replanificados exitosamente: " + replanedCount);
+        System.out.println("Lotes que no pudieron replanificarse: " + failedCount);
+        System.out.println("Rutas totales después de replanificación: " + updatedSolution.getRoutes().size());
+        
+        // 4. Re-evaluar fitness de la solución completa
+        double fitnessBefore = currentSolution.getFitness();
+        double fitnessAfter = evaluator.evaluate(updatedSolution);
+        System.out.println("Fitness antes: " + String.format("%.2f", fitnessBefore));
+        System.out.println("Fitness después: " + String.format("%.2f", fitnessAfter));
         
         // Retornar solución actualizada
         return updatedSolution;
