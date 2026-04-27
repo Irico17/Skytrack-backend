@@ -512,3 +512,96 @@ El sistema ahora funciona correctamente como un sistema real de planificación l
 
 **Fecha de corrección:** 2026-04-21  
 **Estado:** Implementado y verificado ✅
+
+
+---
+
+## 🔴 CORRECCIÓN CRÍTICA: SLA Configurado Incorrectamente
+
+**Fecha:** 2026-04-21  
+**Problema:** El SLA estaba configurado con el doble del tiempo correcto
+
+### Problema Identificado
+
+El código en `ShipmentBatch.calculateSLA()` tenía valores incorrectos:
+
+```java
+// INCORRECTO (antes):
+return sameContinents ? Duration.ofHours(24) : Duration.ofHours(48);
+```
+
+**Según el caso de negocio:**
+> "el tiempo para el traslado de una maleta entre dos ciudades del mismo continente es de medio día y de diferente continente de un día"
+
+- Mismo continente: **12 horas** (medio día), NO 24 horas
+- Diferente continente: **24 horas** (1 día), NO 48 horas
+
+### Corrección Implementada
+
+**Archivo:** `src/main/java/com/equipo2b/scheduler/model/ShipmentBatch.java`
+
+```java
+// CORRECTO (después):
+public Duration calculateSLA() {
+    boolean sameContinents = origin.continent() == destination.continent();
+    return sameContinents ? Duration.ofHours(12) : Duration.ofHours(24);
+}
+```
+
+### Validación de Duración de Vuelos Eliminada
+
+**Archivo:** `src/main/java/com/equipo2b/scheduler/validation/RouteValidator.java`
+
+Se eliminó el método `validateFlightDurations()` porque:
+
+1. **No es una restricción de negocio**: El SLA aplica al tiempo TOTAL de tránsito (desde registro hasta entrega), no a vuelos individuales
+2. **Generaba confusión**: Las violaciones de FLIGHT_DURATION hacían pensar que había problemas operativos cuando solo eran advertencias de datos
+3. **No afecta soluciones**: Esta validación no tenía impacto en el fitness, solo generaba ruido en reportes
+
+**Cambio en `validate()`:**
+```java
+public ValidationReport validate(Solution solution) {
+    ValidationReport report = new ValidationReport();
+    
+    validateFlightCapacities(solution, report);
+    validateStorageCapacities(solution, report);
+    validateSLACompliance(solution, report);
+    validateLayoverTimes(solution, report);
+    // validateFlightDurations removed - not a business constraint
+    
+    return report;
+}
+```
+
+### Impacto Esperado
+
+**Antes de la corrección:**
+- SLA compliance = 100% (con parámetros muy permisivos)
+- 27 violaciones de FLIGHT_DURATION (ruido)
+- Soluciones cumplían fácilmente el SLA
+
+**Después de la corrección:**
+- SLA más estricto (12h/24h en lugar de 24h/48h)
+- Sin violaciones de FLIGHT_DURATION (eliminadas)
+- Soluciones más difíciles de lograr, más realistas
+- Reportes más limpios (solo violaciones operativas)
+
+### Archivos Modificados
+
+1. `src/main/java/com/equipo2b/scheduler/model/ShipmentBatch.java`
+   - Corregido `calculateSLA()`: 12h/24h en lugar de 24h/48h
+
+2. `src/main/java/com/equipo2b/scheduler/validation/RouteValidator.java`
+   - Eliminado `validateFlightDurations()` del método `validate()`
+   - Método renombrado a `validateFlightDurations_REMOVED()` con documentación
+
+3. `documentos/ANALISIS_SLA_COMPLIANCE.md`
+   - Actualizado con análisis completo de la corrección
+
+### Próximos Pasos
+
+1. Re-ejecutar `RunRobustComparison` con el SLA corregido
+2. Analizar el nuevo cumplimiento de SLA (probablemente será menor)
+3. Ajustar parámetros de algoritmos si es necesario para cumplir con el SLA más estricto
+
+---

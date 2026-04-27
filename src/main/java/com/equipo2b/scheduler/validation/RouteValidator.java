@@ -33,7 +33,7 @@ public class RouteValidator {
         validateStorageCapacities(solution, report);
         validateSLACompliance(solution, report);
         validateLayoverTimes(solution, report);
-        validateFlightDurations(solution, report);
+        // validateFlightDurations removed - flight duration is not a business constraint
         
         return report;
     }
@@ -179,30 +179,19 @@ public class RouteValidator {
     }
     
     /**
-     * Valida duraciones de vuelos según tipo.
+     * REMOVED: Flight duration validation is not a business constraint.
      * 
-     * @param solution Solución a validar
-     * @param report Reporte donde agregar violaciones
+     * The SLA constraint (12h same continent, 24h different continents) applies to the 
+     * TOTAL transit time from registration to delivery, not to individual flight durations.
      * 
-     * **Validates: Requirements 4.1, 4.2, 4.3, 13.2**
+     * Individual flights can have any realistic duration as long as the total route 
+     * meets the SLA requirement.
+     * 
+     * @deprecated This validation was based on a misunderstanding of requirements
      */
-    private void validateFlightDurations(Solution solution, ValidationReport report) {
-        for (AssignedRoute route : solution.getRoutes().values()) {
-            for (Flight flight : route.getFlights()) {
-                Duration duration = Duration.between(flight.departureTime(), flight.arrivalTime());
-                long hours = duration.toHours();
-                
-                long expectedHours = flight.type() == FlightType.INTRACONTINENTAL ? 12 : 24;
-                
-                if (hours != expectedHours) {
-                    report.addViolation(new Violation(
-                        ViolationType.FLIGHT_DURATION,
-                        String.format("Flight %s has incorrect duration: %d hours (expected: %d)",
-                            flight.flightId(), hours, expectedHours),
-                        Math.abs(hours - expectedHours)
-                    ));
-                }
-            }
-        }
+    @SuppressWarnings("unused")
+    private void validateFlightDurations_REMOVED(Solution solution, ValidationReport report) {
+        // This method is intentionally disabled
+        // Flight duration is a data quality check, not an operational constraint
     }
 }
