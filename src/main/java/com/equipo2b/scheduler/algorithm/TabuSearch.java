@@ -24,6 +24,7 @@ public class TabuSearch implements OptimizationAlgorithm {
     private final SolutionEvaluator evaluator;
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
+    private final Random random;
     
     // Parámetros configurables
     private int maxIterations = 200;
@@ -41,6 +42,8 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.airportManager = Objects.requireNonNull(airportManager, "AirportManager cannot be null");
         this.routeGenerator = new RouteGenerator(flightPlan, airportManager);
         this.evaluator = new SolutionEvaluator(flightPlan, airportManager);
+        // Usar System.nanoTime() para mejor variabilidad entre corridas rápidas
+        this.random = new Random(System.nanoTime());
     }
     
     /**
@@ -287,7 +290,6 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     private Move generateMove(Solution current, List<ShipmentBatch> batches) {
         Solution neighbor = new Solution(current);
-        Random random = new Random();
         
         // Elegir lote aleatorio
         ShipmentBatch randomBatch = batches.get(random.nextInt(batches.size()));
@@ -311,7 +313,6 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     private Move generateMoveFromSolution(Solution current) {
         Solution neighbor = new Solution(current);
-        Random random = new Random();
         
         // Elegir ruta aleatoria de la solución actual
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
@@ -368,6 +369,12 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.maxIterations = config.getInt("maxIterations", 200);
         this.tabuTenure = config.getInt("tabuTenure", 15);
         this.neighborhoodSize = config.getInt("neighborhoodSize", 20);
+        
+        // Permitir configurar semilla aleatoria para experimentación
+        if (config.hasParameter("randomSeed")) {
+            long seed = config.getInt("randomSeed", 0);
+            this.random.setSeed(seed);
+        }
     }
     
     /**

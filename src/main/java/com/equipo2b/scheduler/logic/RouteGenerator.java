@@ -46,13 +46,14 @@ public class RouteGenerator {
      * @param startTime Tiempo de inicio de búsqueda
      * @param sla Duración del SLA permitido
      * @param allowedFlights Lista de vuelos permitidos (null = todos los vuelos)
+     * @param randomize Si true, shufflea vuelos disponibles para generar rutas diferentes
      * @return Lista de vuelos que forman el camino, o null si no hay camino
      * 
      * **Validates: Requirements 14.1, 14.3, 14.4**
      */
     private List<Flight> findPath(Airport origin, Airport destination,
                                   ZonedDateTime startTime, Duration sla,
-                                  List<Flight> allowedFlights) {
+                                  List<Flight> allowedFlights, boolean randomize) {
         ZonedDateTime deadline = startTime.plus(sla);
         
         // Cola BFS: (aeropuerto actual, tiempo actual, camino recorrido)
@@ -61,6 +62,9 @@ public class RouteGenerator {
         
         // Visitados: (aeropuerto, tiempo aproximado) para evitar ciclos
         Set<String> visited = new HashSet<>();
+        
+        // Random para shufflear vuelos (si randomize = true)
+        Random random = randomize ? new Random() : null;
         
         while (!queue.isEmpty()) {
             SearchNode node = queue.poll();
@@ -79,14 +83,21 @@ public class RouteGenerator {
             List<Flight> availableFlights;
             if (allowedFlights != null) {
                 // Filtrar vuelos permitidos desde aeropuerto actual
-                availableFlights = allowedFlights.stream()
+                availableFlights = new ArrayList<>(allowedFlights.stream()
                     .filter(f -> f.origin().equals(node.airport))
                     .filter(f -> f.departureTime().isAfter(node.currentTime))
                     .filter(f -> f.arrivalTime().isBefore(deadline))
-                    .toList();
+                    .toList());
             } else {
                 // Usar todos los vuelos del plan
-                availableFlights = flightPlan.getFlightsFromAirport(node.airport, node.currentTime, deadline);
+                availableFlights = new ArrayList<>(
+                    flightPlan.getFlightsFromAirport(node.airport, node.currentTime, deadline)
+                );
+            }
+            
+            // IMPORTANTE: Shufflear vuelos para generar rutas diferentes
+            if (randomize && random != null) {
+                Collections.shuffle(availableFlights, random);
             }
             
             for (Flight flight : availableFlights) {
@@ -140,6 +151,10 @@ public class RouteGenerator {
      * Genera una ruta factible para un lote de maletas usando solo vuelos permitidos.
      * Intenta hasta MAX_ATTEMPTS veces encontrar una ruta válida.
      * 
+     * IMPORTANTE: Introduce aleatoriedad shuffleando vuelos disponibles para generar
+     * rutas diferentes en cada intento. Esto es crucial para que el Algoritmo Genético
+     * tenga diversidad en la población inicial.
+     * 
      * @param batch Lote de maletas para el cual generar la ruta
      * @param allowedFlights Lista de vuelos permitidos (null = todos los vuelos)
      * @return AssignedRoute factible o null si no se encuentra ruta
@@ -152,15 +167,18 @@ public class RouteGenerator {
         Duration sla = batch.calculateSLA();
         
         // Intentar generar ruta hasta MAX_ATTEMPTS veces
+        // Cada intento usa un orden aleatorio de vuelos para generar rutas diferentes
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
             try {
-                // Buscar secuencia de vuelos usando BFS
+                // Buscar secuencia de vuelos usando BFS con aleatoriedad
+                // IMPORTANTE: Siempre usar randomización para generar diversidad en GA
                 List<Flight> flightPath = findPath(
                     batch.origin(),
                     batch.destination(),
                     batch.ingressTime(),
                     sla,
-                    allowedFlights
+                    allowedFlights,
+                    true  // Siempre usar aleatoriedad para diversidad
                 );
                 
                 // Si no se encontró camino, continuar intentando

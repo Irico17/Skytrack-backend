@@ -57,15 +57,19 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.airportManager = airportManager;
         this.routeGenerator = new RouteGenerator(flightPlan, airportManager);
         this.evaluator = new SolutionEvaluator(flightPlan, airportManager);
-        this.random = new Random();
+        // Usar System.nanoTime() para mejor variabilidad entre corridas rápidas
+        this.random = new Random(System.nanoTime());
     }
     
     /**
      * Inicializa la población con soluciones candidatas.
      * 
      * <p>Para cada solución en la población, genera rutas factibles para todos
-     * los lotes usando RouteGenerator. Si no se puede generar una ruta para
-     * algún lote, registra un warning pero continúa con los demás lotes.
+     * los lotes usando RouteGenerator. Para introducir diversidad, procesa los
+     * lotes en orden aleatorio para cada individuo.
+     * 
+     * <p>Si no se puede generar una ruta para algún lote, registra un warning
+     * pero continúa con los demás lotes.
      * 
      * <p><strong>Validates: Requirement 10.1</strong>
      * 
@@ -78,7 +82,12 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         for (int i = 0; i < populationSize; i++) {
             Solution solution = new Solution();
             
-            for (ShipmentBatch batch : batches) {
+            // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
+            // Sin esto, todos los individuos serían idénticos (RouteGenerator es determinístico)
+            List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
+            Collections.shuffle(shuffledBatches, random);
+            
+            for (ShipmentBatch batch : shuffledBatches) {
                 AssignedRoute route = routeGenerator.generateFeasibleRoute(batch);
                 if (route != null) {
                     solution.addRoute(route);
@@ -194,7 +203,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @param batches Lista de lotes disponibles
      */
     private void mutate(Solution solution, List<ShipmentBatch> batches) {
-        double geneMutationRate = 0.02;  // 2% de genes mutados
+        double geneMutationRate = 0.05;  // Aumentado de 0.02 a 0.05 (5% de genes mutados)
         
         for (ShipmentBatch batch : batches) {
             if (random.nextDouble() < geneMutationRate) {
@@ -292,6 +301,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      *   <li>mutationRate: Tasa de mutación (default: 0.1)</li>
      *   <li>tournamentSize: Tamaño del torneo (default: 4)</li>
      *   <li>eliteCount: Número de élites a preservar (default: 2)</li>
+     *   <li>randomSeed: Semilla para generador aleatorio (default: System.nanoTime())</li>
      * </ul>
      * 
      * <p><strong>Validates: Requirements 15.1, 15.2, 15.3</strong>
@@ -310,5 +320,11 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.mutationRate = config.getDouble("mutationRate", 0.1);
         this.tournamentSize = config.getInt("tournamentSize", 4);
         this.eliteCount = config.getInt("eliteCount", 2);
+        
+        // Permitir configurar semilla aleatoria para experimentación
+        if (config.hasParameter("randomSeed")) {
+            long seed = config.getInt("randomSeed", 0);
+            this.random.setSeed(seed);
+        }
     }
 }
