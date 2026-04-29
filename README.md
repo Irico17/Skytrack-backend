@@ -109,29 +109,26 @@ Jerarquía de excepciones:
 
 ## 🚀 Uso del Sistema
 
-### Ejecución de Simulaciones
+### Ejecución Principal
 
-El sistema incluye varios puntos de entrada para diferentes tipos de simulación:
+El sistema tiene dos puntos de entrada principales:
 
-#### 1. Simulación con Scheduler Real
+#### 1. Experimentación Numérica (Recomendado)
 ```bash
 # Compilar
-./gradlew compileJava
+./gradlew build -x test
 
-# Ejecutar simulación simplificada (K=1 y K=14)
-java -cp "build/classes/java/main" com.equipo2b.scheduler.RunSchedulerSimplified
+# Ejecutar experimentación numérica: GATS vs Tabu Puro
+java -cp "build/classes/java/main" com.equipo2b.scheduler.RunNumericalExperiment
+
+# Analizar resultados estadísticos
+java -cp "build/classes/java/main" com.equipo2b.scheduler.ExperimentAnalyzer experiment_results_TIMESTAMP/
 ```
 
-#### 2. Prueba con Datos Reales
+#### 2. Ejecución General
 ```bash
-# Ejecutar prueba con datos reales (modo LENIENT)
-java -cp "build/classes/java/main" com.equipo2b.scheduler.RealDataTest
-```
-
-#### 3. Simulación Completa
-```bash
-# Ejecutar simulación completa con todos los escenarios
-java -cp "build/classes/java/main" com.equipo2b.scheduler.RunAllSimulationsWithRealData
+# Ejecutar Main (punto de entrada general)
+java -cp "build/classes/java/main" com.equipo2b.scheduler.Main
 ```
 
 ### Parámetros del Scheduler
@@ -141,22 +138,31 @@ java -cp "build/classes/java/main" com.equipo2b.scheduler.RunAllSimulationsWithR
 - **K**: Factor de ventana (1, 14, 75)
 - **Sc**: Ventana de consumo = Sa × K minutos
 
-### Escenarios de Simulación
+### Escenarios de Experimentación
 
-1. **K=1 (Operación día a día)**
-   - Ventana pequeña (5 minutos)
-   - Planificación incremental
-   - Pocos lotes por ciclo
+El sistema implementa experimentación numérica para comparar algoritmos:
 
-2. **K=14 (Periodo 2 semanas)**
-   - Ventana mediana (70 minutos)
-   - Visión a mediano plazo
-   - Más lotes por ciclo
+1. **GATS (Genetic Algorithm + Tabu Search)**
+   - Población: 50 individuos
+   - Generaciones: 100
+   - Tasa de mutación: 0.3
+   - Refinamiento con Tabu: 200 iteraciones
 
-3. **K=75 (Periodo largo)**
-   - Ventana grande (375 minutos)
-   - Planificación a largo plazo
-   - Riesgo de colapso
+2. **Tabu Search Puro**
+   - Iteraciones: 300
+   - Tabu tenure: 20
+   - Vecindario: 30
+
+**Configuración de Experimentos:**
+- NUM_RUNS: 10 corridas por algoritmo
+- FILES_TO_LOAD: 10 archivos de envíos
+- MAX_CYCLES: 1 (medir primer ciclo)
+- K: 100 (ventana de 500 minutos)
+
+**Resultados:**
+- CSV con métricas por corrida
+- Análisis estadístico (media, desviación, normalidad, t-test)
+- Comparación de fitness, tiempo, SLA compliance
 
 ## 📊 Datos del Sistema
 
@@ -268,13 +274,25 @@ tabuConfig.setInt("neighborhoodSize", 20);
 
 ## 📚 Documentación Adicional
 
-Para más detalles, consulta los documentos en la carpeta `documentos/`:
+### Documentos Esenciales
 
+En la carpeta `documentos/`:
+
+- **GUIA_EXPERIMENTACION_NUMERICA.md**: Guía completa de experimentación numérica
+- **GUIA_EXPERIMENTACION_COMPLETA.md**: Metodología de experimentación
+- **ANALISIS_FITNESS_IDENTICO.md**: Análisis del problema de fitness idéntico (resuelto)
+- **COMPARACION_ALGORITMOS_GATS_TABU.md**: Comparación entre algoritmos
+- **ARQUITECTURA_BACKEND_COMPLETA.md**: Arquitectura del sistema
+- **RESUMEN_EJECUTIVO_PROBLEMA_PLANIFICACION.md**: Resumen del problema
+
+En la raíz:
 - **ALGORITMOS.md**: Explicación detallada de los algoritmos
 - **SCHEDULER.md**: Funcionamiento del Scheduler
-- Análisis de datos y resultados de simulaciones
-- Arquitectura del sistema
-- Guías de implementación
+- **EXPLICACION_DETALLADA_PARA_ENTENDER.md**: Guía para entender el sistema
+
+### Archivos Obsoletos
+
+Los archivos antiguos y no utilizados se encuentran en `archivos-no-usados/` para referencia histórica.
 
 ## 🛠️ Tecnologías
 

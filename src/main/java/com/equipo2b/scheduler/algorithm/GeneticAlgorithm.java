@@ -78,6 +78,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      */
     private List<Solution> initializePopulation(List<ShipmentBatch> batches) {
         List<Solution> population = new ArrayList<>();
+        Set<String> unroutableBatches = new HashSet<>();  // Track batches that can't be routed
         
         for (int i = 0; i < populationSize; i++) {
             Solution solution = new Solution();
@@ -92,13 +93,23 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 if (route != null) {
                     solution.addRoute(route);
                 } else {
-                    // Registrar warning si no se puede generar ruta factible
-                    System.err.printf("Warning: Could not generate route for batch %s%n", 
-                                    batch.batchId());
+                    // Solo registrar warning la primera vez que encontramos un lote no ruteable
+                    if (i == 0) {
+                        unroutableBatches.add(batch.batchId());
+                    }
                 }
             }
             
             population.add(solution);
+        }
+        
+        // Mostrar resumen de lotes no ruteables (solo una vez)
+        if (!unroutableBatches.isEmpty()) {
+            System.err.printf("Warning: %d batches could not be routed (no feasible path found)%n", 
+                            unroutableBatches.size());
+            if (unroutableBatches.size() <= 10) {
+                System.err.println("Unroutable batches: " + unroutableBatches);
+            }
         }
         
         return population;
@@ -256,9 +267,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             // Ordenar por fitness (menor es mejor)
             population.sort(Comparator.comparingDouble(Solution::getFitness));
             
-            // Imprimir progreso
-            System.out.printf("Generation %d - Best Fitness: %.2f%n", 
-                            gen, population.get(0).getFitness());
+            // Imprimir progreso (comentado para experimentación silenciosa)
+            // System.out.printf("Generation %d - Best Fitness: %.2f%n", 
+            //                 gen, population.get(0).getFitness());
             
             // Crear nueva generación
             List<Solution> nextGeneration = new ArrayList<>();
