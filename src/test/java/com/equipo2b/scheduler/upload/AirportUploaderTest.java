@@ -77,9 +77,9 @@ class AirportUploaderTest {
         AirportUploader uploader = new AirportUploader();
         List<Airport> airports = uploader.loadAirports("data/c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt");
         
-        // All airports should have capacity between 500 and 800
+        // All airports should have positive capacity
         for (Airport airport : airports) {
-            assertTrue(airport.storageCapacity() >= 500 && airport.storageCapacity() <= 800,
+            assertTrue(airport.storageCapacity() > 0,
                 "Airport " + airport.id() + " has invalid capacity: " + airport.storageCapacity());
         }
     }

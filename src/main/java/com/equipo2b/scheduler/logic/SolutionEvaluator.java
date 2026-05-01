@@ -142,10 +142,29 @@ public class SolutionEvaluator {
      */
     public static final double REWARD_UNUSED_FLIGHT = 50.0;
     
+    /**
+     * Penalización por cada lote de maletas que no pudo ser asignado a una ruta.
+     * 
+     * <p>Valor: 50,000 puntos por lote no asignado
+     * 
+     * <p>Esta penalización es la más alta para garantizar que los algoritmos
+     * prioricen encontrar rutas para todos los lotes antes de optimizar.
+     * 
+     * <p><strong>Validates: Requirement 9.8</strong>
+     */
+    public static final double PENALTY_UNASSIGNED_BATCH = 50_000.0;
+    
     // ==================== Dependencias ====================
     
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
+    
+    /**
+     * Cantidad esperada de lotes a planificar.
+     * Si > 0, se penalizan los lotes no asignados en evaluate().
+     * Usar setExpectedBatchCount() para configurar antes de la evaluación.
+     */
+    private volatile int expectedBatchCount = 0;
     
     /**
      * Constructor que inicializa el evaluador con las dependencias necesarias.
@@ -163,6 +182,16 @@ public class SolutionEvaluator {
         }
         this.flightPlan = flightPlan;
         this.airportManager = airportManager;
+    }
+    
+    /**
+     * Establece la cantidad esperada de lotes para penalizar lotes no asignados.
+     * Llamar antes de las evaluaciones en el loop de optimización.
+     * 
+     * @param count Cantidad total de lotes esperados (0 = no penalizar)
+     */
+    public void setExpectedBatchCount(int count) {
+        this.expectedBatchCount = count;
     }
     
     // ==================== Métodos de Evaluación ====================
@@ -394,9 +423,10 @@ public class SolutionEvaluator {
         double storageCapacityPenalty = calculateStorageCapacityPenalties(solution);
         double slaPenalty = calculateSLAPenalties(solution);
         double layoverPenalty = calculateLayoverPenalties(solution);
+        double unassignedPenalty = calculateUnassignedBatchPenalties(solution);
         
         double totalPenalties = flightCapacityPenalty + storageCapacityPenalty + 
-                               slaPenalty + layoverPenalty;
+                               slaPenalty + layoverPenalty + unassignedPenalty;
         
         // Calcular todos los premios
         double timeSlackReward = calculateTimeSlackRewards(solution);
@@ -411,5 +441,28 @@ public class SolutionEvaluator {
         solution.setFitness(fitness);
         
         return fitness;
+    }
+    
+    /**
+     * Calcula penalizaciones por lotes no asignados a ninguna ruta.
+     * 
+     * <p>Aplica 50,000 puntos por cada lote que no tiene ruta en la solución.
+     * Solo se aplica si se configuró expectedBatchCount > 0.
+     * 
+     * <p><strong>Validates: Requirement 9.8</strong>
+     * 
+     * @param solution La solución a evaluar
+     * @return Penalización total por lotes no asignados
+     */
+    public double calculateUnassignedBatchPenalties(com.equipo2b.scheduler.model.Solution solution) {
+        if (expectedBatchCount <= 0) {
+            return 0.0;
+        }
+        int assignedCount = solution.getRoutes().size();
+        int unassignedCount = expectedBatchCount - assignedCount;
+        if (unassignedCount > 0) {
+            return unassignedCount * PENALTY_UNASSIGNED_BATCH;
+        }
+        return 0.0;
     }
 }

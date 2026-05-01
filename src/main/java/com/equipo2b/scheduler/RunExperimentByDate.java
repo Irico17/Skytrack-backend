@@ -89,9 +89,6 @@ public class RunExperimentByDate {
             log("=".repeat(80));
             log("");
             
-            // Configurar modo lenient
-            ValidationMode.setMode(ValidationMode.Mode.LENIENT);
-            
             // Cargar datos
             log(">>> CARGANDO DATOS <<<");
             ExperimentData data = loadDataForDate(targetDate);

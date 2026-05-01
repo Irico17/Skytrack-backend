@@ -118,9 +118,6 @@ public class RunNumericalExperiment {
         System.out.println();
         
         try {
-            // Configurar modo lenient
-            ValidationMode.setMode(ValidationMode.Mode.LENIENT);
-            
             // Cargar datos una sola vez (reutilizar en todas las corridas)
             System.out.println(">>> CARGANDO DATOS <<<");
             ExperimentData data = loadData();

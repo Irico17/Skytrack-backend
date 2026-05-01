@@ -51,56 +51,19 @@ public record Flight(
             );
         }
         
-        // Validar capacidad según tipo y modo
-        if (ValidationMode.isStrict()) {
-            // Modo STRICT: Especificaciones del diseño
-            if (type == FlightType.INTRACONTINENTAL && (capacity < 150 || capacity > 250)) {
-                throw new IllegalArgumentException(
-                    "Intracontinental flight capacity must be between 150 and 250 (STRICT mode), got: " + capacity
-                );
-            }
-            if (type == FlightType.INTERCONTINENTAL && (capacity < 150 || capacity > 400)) {
-                throw new IllegalArgumentException(
-                    "Intercontinental flight capacity must be between 150 and 400 (STRICT mode), got: " + capacity
-                );
-            }
-        } else {
-            // Modo LENIENT: Rango ampliado para datos reales
-            if (capacity < 100 || capacity > 500) {
-                throw new IllegalArgumentException(
-                    "Flight capacity must be between 100 and 500 (LENIENT mode), got: " + capacity
-                );
-            }
+        // Validar que la capacidad sea positiva (el valor real viene de los datos o backend)
+        if (capacity <= 0) {
+            throw new IllegalArgumentException(
+                "Flight capacity must be positive, got: " + capacity
+            );
         }
         
-        // Validar duración según tipo y modo
-        Duration duration = Duration.between(departureTime, arrivalTime);
-        long hours = duration.toHours();
-        
-        if (ValidationMode.isStrict()) {
-            // Modo STRICT: Duraciones exactas según especificaciones
-            if (type == FlightType.INTRACONTINENTAL && hours != 12) {
-                throw new IllegalArgumentException(
-                    "Intracontinental flight must be exactly 12 hours (STRICT mode), got: " + hours + " hours"
-                );
-            }
-            if (type == FlightType.INTERCONTINENTAL && hours != 24) {
-                throw new IllegalArgumentException(
-                    "Intercontinental flight must be exactly 24 hours (STRICT mode), got: " + hours + " hours"
-                );
-            }
-        } else {
-            // Modo LENIENT: Rango ampliado para duraciones reales
-            if (duration.toMinutes() < 30) {
-                throw new IllegalArgumentException(
-                    "Flight duration must be at least 30 minutes (LENIENT mode), got: " + duration.toMinutes() + " minutes"
-                );
-            }
-            if (hours > 48) {
-                throw new IllegalArgumentException(
-                    "Flight duration cannot exceed 48 hours (LENIENT mode), got: " + hours + " hours"
-                );
-            }
+        // Validar que la llegada sea después de la salida
+        if (!arrivalTime.isAfter(departureTime)) {
+            throw new IllegalArgumentException(
+                String.format("Arrival time must be after departure time: departure=%s, arrival=%s",
+                    departureTime, arrivalTime)
+            );
         }
     }
     

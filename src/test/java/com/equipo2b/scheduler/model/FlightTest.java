@@ -125,7 +125,7 @@ class FlightTest {
     }
 
     @Test
-    void testIntraContinentalCapacityTooLow() {
+    void testFlightCapacityZero() {
         Airport jfk = createAirport("JFK", Continent.AMERICA);
         Airport lax = createAirport("LAX", Continent.AMERICA);
         
@@ -140,98 +140,50 @@ class FlightTest {
                 lax,
                 departure,
                 arrival,
-                149,
+                0,
                 FlightType.INTRACONTINENTAL
             )
         );
         
-        assertTrue(exception.getMessage().contains("Intracontinental flight capacity must be between 150 and 250"));
+        assertTrue(exception.getMessage().contains("positive"));
     }
 
     @Test
-    void testIntraContinentalCapacityTooHigh() {
+    void testFlightCapacityNegative() {
         Airport jfk = createAirport("JFK", Continent.AMERICA);
-        Airport lax = createAirport("LAX", Continent.AMERICA);
+        Airport cdg = createAirport("CDG", Continent.EUROPE);
         
         ZonedDateTime departure = ZonedDateTime.parse("2024-01-15T10:00:00Z");
-        ZonedDateTime arrival = departure.plusHours(12);
+        ZonedDateTime arrival = departure.plusHours(24);
         
         IllegalArgumentException exception = assertThrows(
             IllegalArgumentException.class,
             () -> new Flight(
                 "FL006",
                 jfk,
-                lax,
+                cdg,
                 departure,
                 arrival,
-                251,
-                FlightType.INTRACONTINENTAL
+                -10,
+                FlightType.INTERCONTINENTAL
             )
         );
         
-        assertTrue(exception.getMessage().contains("Intracontinental flight capacity must be between 150 and 250"));
+        assertTrue(exception.getMessage().contains("positive"));
     }
 
     @Test
-    void testInterContinentalCapacityTooLow() {
+    void testFlightArrivalBeforeDeparture() {
         Airport jfk = createAirport("JFK", Continent.AMERICA);
-        Airport cdg = createAirport("CDG", Continent.EUROPE);
+        Airport lax = createAirport("LAX", Continent.AMERICA);
         
         ZonedDateTime departure = ZonedDateTime.parse("2024-01-15T10:00:00Z");
-        ZonedDateTime arrival = departure.plusHours(24);
+        ZonedDateTime arrival = departure.minusHours(1); // Arrival before departure
         
         IllegalArgumentException exception = assertThrows(
             IllegalArgumentException.class,
             () -> new Flight(
                 "FL007",
-                jfk,
-                cdg,
-                departure,
-                arrival,
-                149,
-                FlightType.INTERCONTINENTAL
-            )
-        );
-        
-        assertTrue(exception.getMessage().contains("Intercontinental flight capacity must be between 150 and 400"));
-    }
-
-    @Test
-    void testInterContinentalCapacityTooHigh() {
-        Airport jfk = createAirport("JFK", Continent.AMERICA);
-        Airport cdg = createAirport("CDG", Continent.EUROPE);
-        
-        ZonedDateTime departure = ZonedDateTime.parse("2024-01-15T10:00:00Z");
-        ZonedDateTime arrival = departure.plusHours(24);
-        
-        IllegalArgumentException exception = assertThrows(
-            IllegalArgumentException.class,
-            () -> new Flight(
-                "FL008",
-                jfk,
-                cdg,
-                departure,
-                arrival,
-                401,
-                FlightType.INTERCONTINENTAL
-            )
-        );
-        
-        assertTrue(exception.getMessage().contains("Intercontinental flight capacity must be between 150 and 400"));
-    }
-
-    @Test
-    void testIntraContinentalDurationInvalid() {
-        Airport jfk = createAirport("JFK", Continent.AMERICA);
-        Airport lax = createAirport("LAX", Continent.AMERICA);
-        
-        ZonedDateTime departure = ZonedDateTime.parse("2024-01-15T10:00:00Z");
-        ZonedDateTime arrival = departure.plusHours(10); // Wrong duration
-        
-        IllegalArgumentException exception = assertThrows(
-            IllegalArgumentException.class,
-            () -> new Flight(
-                "FL009",
                 jfk,
                 lax,
                 departure,
@@ -241,31 +193,43 @@ class FlightTest {
             )
         );
         
-        assertTrue(exception.getMessage().contains("Intracontinental flight must be exactly 12 hours"));
+        assertTrue(exception.getMessage().contains("Arrival time must be after departure"));
     }
 
     @Test
-    void testInterContinentalDurationInvalid() {
+    void testFlightAnyCapacityAccepted() {
+        // Verify that any positive capacity is accepted (no range restrictions)
         Airport jfk = createAirport("JFK", Continent.AMERICA);
-        Airport cdg = createAirport("CDG", Continent.EUROPE);
+        Airport lax = createAirport("LAX", Continent.AMERICA);
         
         ZonedDateTime departure = ZonedDateTime.parse("2024-01-15T10:00:00Z");
-        ZonedDateTime arrival = departure.plusHours(20); // Wrong duration
+        ZonedDateTime arrival = departure.plusHours(6);
         
-        IllegalArgumentException exception = assertThrows(
-            IllegalArgumentException.class,
-            () -> new Flight(
-                "FL010",
-                jfk,
-                cdg,
-                departure,
-                arrival,
-                350,
-                FlightType.INTERCONTINENTAL
-            )
-        );
+        // Small capacity
+        Flight flight1 = new Flight("FL008", jfk, lax, departure, arrival, 1, FlightType.INTRACONTINENTAL);
+        assertEquals(1, flight1.capacity());
         
-        assertTrue(exception.getMessage().contains("Intercontinental flight must be exactly 24 hours"));
+        // Very large capacity
+        Flight flight2 = new Flight("FL009", jfk, lax, departure, arrival, 5000, FlightType.INTRACONTINENTAL);
+        assertEquals(5000, flight2.capacity());
+    }
+
+    @Test
+    void testFlightAnyDurationAccepted() {
+        // Verify that any duration is accepted (no 12h/24h restrictions)
+        Airport jfk = createAirport("JFK", Continent.AMERICA);
+        Airport lax = createAirport("LAX", Continent.AMERICA);
+        
+        ZonedDateTime departure = ZonedDateTime.parse("2024-01-15T10:00:00Z");
+        
+        // 2-hour flight (was invalid before)
+        Flight flight1 = new Flight("FL010", jfk, lax, departure, departure.plusHours(2), 200, FlightType.INTRACONTINENTAL);
+        assertEquals(200, flight1.capacity());
+        
+        // 48-hour flight
+        Airport cdg = createAirport("CDG", Continent.EUROPE);
+        Flight flight2 = new Flight("FL011", jfk, cdg, departure, departure.plusHours(48), 350, FlightType.INTERCONTINENTAL);
+        assertEquals(350, flight2.capacity());
     }
 
     @Test

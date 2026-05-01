@@ -48,8 +48,8 @@ class AirportTest {
     }
 
     @Test
-    void testAirportCreationWithInvalidCapacityBelowMinimum() {
-        // Test with capacity below minimum (499)
+    void testAirportCreationWithInvalidCapacityZero() {
+        // Test with capacity of 0 (invalid)
         IllegalArgumentException exception = assertThrows(
             IllegalArgumentException.class,
             () -> new Airport(
@@ -57,19 +57,19 @@ class AirportTest {
                 "New York",
                 "USA",
                 ZoneOffset.ofHours(-5),
-                499,
+                0,
                 40.6413,
                 -73.7781,
                 Continent.AMERICA
             )
         );
         
-        assertEquals("Storage capacity must be between 500 and 800", exception.getMessage());
+        assertTrue(exception.getMessage().contains("positive"));
     }
 
     @Test
-    void testAirportCreationWithInvalidCapacityAboveMaximum() {
-        // Test with capacity above maximum (801)
+    void testAirportCreationWithInvalidCapacityNegative() {
+        // Test with negative capacity
         IllegalArgumentException exception = assertThrows(
             IllegalArgumentException.class,
             () -> new Airport(
@@ -77,14 +77,14 @@ class AirportTest {
                 "New York",
                 "USA",
                 ZoneOffset.ofHours(-5),
-                801,
+                -1,
                 40.6413,
                 -73.7781,
                 Continent.AMERICA
             )
         );
         
-        assertEquals("Storage capacity must be between 500 and 800", exception.getMessage());
+        assertTrue(exception.getMessage().contains("positive"));
     }
 
     @Test
@@ -163,7 +163,7 @@ class AirportTest {
         assertNotNull(airport.city());
         assertNotNull(airport.country());
         assertNotNull(airport.zoneId());
-        assertTrue(airport.storageCapacity() >= 500 && airport.storageCapacity() <= 800);
+        assertTrue(airport.storageCapacity() > 0);
         assertNotNull(airport.continent());
     }
 

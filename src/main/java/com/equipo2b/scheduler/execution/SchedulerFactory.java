@@ -51,18 +51,18 @@ public class SchedulerFactory {
         GeneticAlgorithm ga = new GeneticAlgorithm(flightPlan, airportManager);
         TabuSearch tabu = new TabuSearch(flightPlan, airportManager);
         
-        // Configurar parámetros optimizados para velocidad
-        // Reducidos para experimentación rápida manteniendo calidad
+        // Configurar parámetros balanceados con paralelización
+        // Con paralelización, podemos usar más evaluaciones sin penalización de tiempo
         AlgorithmConfig gaConfig = new AlgorithmConfig();
-        gaConfig.setInt("populationSize", 30);      // Reducido de 50 a 30
-        gaConfig.setInt("generations", 50);         // Reducido de 100 a 50
+        gaConfig.setInt("populationSize", 40);      // Balanceado: más que optimizado (30), menos que original (50)
+        gaConfig.setInt("generations", 80);         // Balanceado: más que optimizado (50), menos que original (100)
         gaConfig.setDouble("mutationRate", 0.1);
         gaConfig.setInt("tournamentSize", 4);
         gaConfig.setInt("eliteCount", 2);
         ga.configure(gaConfig);
         
         AlgorithmConfig tabuConfig = new AlgorithmConfig();
-        tabuConfig.setInt("maxIterations", 100);    // Reducido de 200 a 100
+        tabuConfig.setInt("maxIterations", 150);    // Balanceado: más que optimizado (100), menos que original (200)
         tabuConfig.setInt("tabuTenure", 15);
         tabuConfig.setInt("neighborhoodSize", 20);
         tabu.configure(tabuConfig);

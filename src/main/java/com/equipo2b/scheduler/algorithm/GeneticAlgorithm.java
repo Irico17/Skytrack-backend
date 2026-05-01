@@ -5,6 +5,9 @@ import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * Implementación del Algoritmo Genético para planificación masiva.
@@ -29,14 +32,14 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private final SolutionEvaluator evaluator;
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
-    private final Random random;
     
     // Parámetros configurables con valores por defecto
     private int populationSize = 50;
     private int generations = 100;
-    private double mutationRate = 0.1;
+    private double mutationRate = 0.15;
     private int tournamentSize = 4;
     private int eliteCount = 2;
+    private int stagnationLimit = 15;  // Early stopping: max generations sin mejora
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -57,19 +60,17 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.airportManager = airportManager;
         this.routeGenerator = new RouteGenerator(flightPlan, airportManager);
         this.evaluator = new SolutionEvaluator(flightPlan, airportManager);
-        // Usar System.nanoTime() para mejor variabilidad entre corridas rápidas
-        this.random = new Random(System.nanoTime());
     }
     
     /**
-     * Inicializa la población con soluciones candidatas.
+     * Inicializa la población con soluciones candidatas (PARALELIZADO).
      * 
      * <p>Para cada solución en la población, genera rutas factibles para todos
      * los lotes usando RouteGenerator. Para introducir diversidad, procesa los
      * lotes en orden aleatorio para cada individuo.
      * 
-     * <p>Si no se puede generar una ruta para algún lote, registra un warning
-     * pero continúa con los demás lotes.
+     * <p>PARALELIZACIÓN: Usa IntStream.parallel() para crear individuos en paralelo.
+     * ThreadLocalRandom garantiza thread-safety sin sincronización.
      * 
      * <p><strong>Validates: Requirement 10.1</strong>
      * 
@@ -77,31 +78,33 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @return Población inicial de soluciones
      */
     private List<Solution> initializePopulation(List<ShipmentBatch> batches) {
-        List<Solution> population = new ArrayList<>();
-        Set<String> unroutableBatches = new HashSet<>();  // Track batches that can't be routed
+        Set<String> unroutableBatches = Collections.synchronizedSet(new HashSet<>());
         
-        for (int i = 0; i < populationSize; i++) {
-            Solution solution = new Solution();
-            
-            // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
-            // Sin esto, todos los individuos serían idénticos (RouteGenerator es determinístico)
-            List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
-            Collections.shuffle(shuffledBatches, random);
-            
-            for (ShipmentBatch batch : shuffledBatches) {
-                AssignedRoute route = routeGenerator.generateFeasibleRoute(batch);
-                if (route != null) {
-                    solution.addRoute(route);
-                } else {
-                    // Solo registrar warning la primera vez que encontramos un lote no ruteable
-                    if (i == 0) {
-                        unroutableBatches.add(batch.batchId());
+        List<Solution> population = IntStream.range(0, populationSize)
+            .parallel()
+            .mapToObj(i -> {
+                Solution solution = new Solution();
+                
+                // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
+                // ThreadLocalRandom es thread-safe sin sincronización
+                List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
+                Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
+                
+                for (ShipmentBatch batch : shuffledBatches) {
+                    AssignedRoute route = routeGenerator.generateFeasibleRoute(batch);
+                    if (route != null) {
+                        solution.addRoute(route);
+                    } else {
+                        // Solo registrar warning la primera vez que encontramos un lote no ruteable
+                        if (i == 0) {
+                            unroutableBatches.add(batch.batchId());
+                        }
                     }
                 }
-            }
-            
-            population.add(solution);
-        }
+                
+                return solution;
+            })
+            .collect(Collectors.toList());
         
         // Mostrar resumen de lotes no ruteables (solo una vez)
         if (!unroutableBatches.isEmpty()) {
@@ -116,22 +119,25 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
     
     /**
-     * Evalúa el fitness de cada solución no evaluada en la población.
+     * Evalúa el fitness de cada solución no evaluada en la población (PARALELIZADO).
      * 
      * <p>Usa SolutionEvaluator para calcular el fitness y marca las soluciones
      * como evaluadas para evitar recálculos innecesarios.
+     * 
+     * <p>PARALELIZACIÓN: Usa parallelStream() para evaluar múltiples soluciones
+     * simultáneamente. SolutionEvaluator es thread-safe (stateless).
      * 
      * <p><strong>Validates: Requirement 10.2</strong>
      * 
      * @param population Población de soluciones a evaluar
      */
     private void evaluatePopulation(List<Solution> population) {
-        for (Solution solution : population) {
-            if (!solution.isEvaluated()) {
+        population.parallelStream()
+            .filter(solution -> !solution.isEvaluated())
+            .forEach(solution -> {
                 double fitness = evaluator.evaluate(solution);
                 solution.setFitness(fitness);
-            }
-        }
+            });
     }
     
     /**
@@ -140,6 +146,8 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * <p>Selecciona tournamentSize candidatos aleatorios de la población
      * y retorna el de mejor fitness (menor valor).
      * 
+     * <p>Usa ThreadLocalRandom para thread-safety sin sincronización.
+     * 
      * <p><strong>Validates: Requirement 10.3</strong>
      * 
      * @param population Población de soluciones
@@ -147,6 +155,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      */
     private Solution tournamentSelection(List<Solution> population) {
         Solution best = null;
+        ThreadLocalRandom random = ThreadLocalRandom.current();
         
         for (int i = 0; i < tournamentSize; i++) {
             int index = random.nextInt(population.size());
@@ -169,6 +178,8 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * <p>Este operador mantiene el principio "Equipaje con Dueño": no intercambia
      * maletas entre clientes, solo rutas completas.
      * 
+     * <p>Usa ThreadLocalRandom para thread-safety sin sincronización.
+     * 
      * <p><strong>Validates: Requirements 8.3, 10.4</strong>
      * 
      * @param parent1 Primer padre
@@ -177,6 +188,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      */
     private Solution crossover(Solution parent1, Solution parent2) {
         Solution child = new Solution();
+        ThreadLocalRandom random = ThreadLocalRandom.current();
         
         // Obtener todos los batch IDs de ambos padres
         Set<String> allBatchIds = new HashSet<>();
@@ -204,9 +216,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     /**
      * Aplica mutación a una solución.
      * 
-     * <p>Para cada lote, con probabilidad geneMutationRate (2%), regenera
-     * la ruta usando RouteGenerator. Esto introduce diversidad genética
-     * y ayuda a escapar de óptimos locales.
+     * <p>Selecciona 1-3 lotes aleatorios y regenera sus rutas usando RouteGenerator.
+     * Esto introduce diversidad genética y ayuda a escapar de óptimos locales.
+     * 
+     * <p>Usa ThreadLocalRandom para thread-safety sin sincronización.
      * 
      * <p><strong>Validates: Requirements 8.4, 10.5</strong>
      * 
@@ -214,14 +227,15 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @param batches Lista de lotes disponibles
      */
     private void mutate(Solution solution, List<ShipmentBatch> batches) {
-        double geneMutationRate = 0.05;  // Aumentado de 0.02 a 0.05 (5% de genes mutados)
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        // Mutar 1-3 genes aleatorios (en vez de iterar todos con 5%)
+        int mutationCount = random.nextInt(1, Math.min(4, batches.size() + 1));
         
-        for (ShipmentBatch batch : batches) {
-            if (random.nextDouble() < geneMutationRate) {
-                AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
-                if (newRoute != null) {
-                    solution.addRoute(newRoute);
-                }
+        for (int m = 0; m < mutationCount; m++) {
+            ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
+            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            if (newRoute != null) {
+                solution.addRoute(newRoute);
             }
         }
     }
@@ -256,10 +270,17 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             throw new NullPointerException("Batches cannot be null");
         }
         
+        // Configurar evaluador con cantidad esperada de lotes
+        evaluator.setExpectedBatchCount(batches.size());
+        
         // 1. Inicializar población con rutas factibles
         List<Solution> population = initializePopulation(batches);
         
-        // 2. Evolucionar durante N generaciones
+        // Variables para early stopping
+        double bestFitnessSoFar = Double.MAX_VALUE;
+        int stagnationCounter = 0;
+        
+        // 2. Evolucionar durante N generaciones (con early stopping)
         for (int gen = 0; gen < generations; gen++) {
             // Evaluar fitness de toda la población
             evaluatePopulation(population);
@@ -267,9 +288,20 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             // Ordenar por fitness (menor es mejor)
             population.sort(Comparator.comparingDouble(Solution::getFitness));
             
-            // Imprimir progreso (comentado para experimentación silenciosa)
-            // System.out.printf("Generation %d - Best Fitness: %.2f%n", 
-            //                 gen, population.get(0).getFitness());
+            // Early stopping: detectar convergencia prematura
+            double currentBest = population.get(0).getFitness();
+            if (currentBest < bestFitnessSoFar - 0.01) {
+                bestFitnessSoFar = currentBest;
+                stagnationCounter = 0;
+            } else {
+                stagnationCounter++;
+            }
+            
+            if (stagnationCounter >= stagnationLimit) {
+                System.out.printf("Early stopping at generation %d (no improvement for %d generations)%n", 
+                                gen, stagnationLimit);
+                break;
+            }
             
             // Crear nueva generación
             List<Solution> nextGeneration = new ArrayList<>();
@@ -285,7 +317,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 Solution parent2 = tournamentSelection(population);
                 Solution child = crossover(parent1, parent2);
                 
-                if (random.nextDouble() < mutationRate) {
+                if (ThreadLocalRandom.current().nextDouble() < mutationRate) {
                     mutate(child, batches);
                 }
                 
@@ -312,8 +344,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      *   <li>mutationRate: Tasa de mutación (default: 0.1)</li>
      *   <li>tournamentSize: Tamaño del torneo (default: 4)</li>
      *   <li>eliteCount: Número de élites a preservar (default: 2)</li>
-     *   <li>randomSeed: Semilla para generador aleatorio (default: System.nanoTime())</li>
      * </ul>
+     * 
+     * <p>NOTA: randomSeed ya no es configurable. Se usa ThreadLocalRandom
+     * para paralelización thread-safe.
      * 
      * <p><strong>Validates: Requirements 15.1, 15.2, 15.3</strong>
      * 
@@ -328,14 +362,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         
         this.populationSize = config.getInt("populationSize", 50);
         this.generations = config.getInt("generations", 100);
-        this.mutationRate = config.getDouble("mutationRate", 0.1);
+        this.mutationRate = config.getDouble("mutationRate", 0.15);
         this.tournamentSize = config.getInt("tournamentSize", 4);
         this.eliteCount = config.getInt("eliteCount", 2);
-        
-        // Permitir configurar semilla aleatoria para experimentación
-        if (config.hasParameter("randomSeed")) {
-            long seed = config.getInt("randomSeed", 0);
-            this.random.setSeed(seed);
-        }
+        this.stagnationLimit = config.getInt("stagnationLimit", 15);
     }
 }

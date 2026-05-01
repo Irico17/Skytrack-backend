@@ -4,6 +4,7 @@ import com.equipo2b.scheduler.logic.*;
 import com.equipo2b.scheduler.model.*;
 import java.time.ZonedDateTime;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Implementación de Búsqueda Tabú para refinamiento local y replanificación.
@@ -24,7 +25,7 @@ public class TabuSearch implements OptimizationAlgorithm {
     private final SolutionEvaluator evaluator;
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
-    private final Random random;
+    // ThreadLocalRandom se usa en cada método para thread-safety
     
     // Parámetros configurables
     private int maxIterations = 200;
@@ -42,8 +43,6 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.airportManager = Objects.requireNonNull(airportManager, "AirportManager cannot be null");
         this.routeGenerator = new RouteGenerator(flightPlan, airportManager);
         this.evaluator = new SolutionEvaluator(flightPlan, airportManager);
-        // Usar System.nanoTime() para mejor variabilidad entre corridas rápidas
-        this.random = new Random(System.nanoTime());
     }
     
     /**
@@ -57,6 +56,9 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     @Override
     public Solution optimize(List<ShipmentBatch> batches) {
+        // Configurar evaluador con cantidad esperada de lotes
+        evaluator.setExpectedBatchCount(batches.size());
+        
         // Generar solución inicial con rutas factibles
         Solution currentSolution = generateInitialSolution(batches);
         currentSolution.setFitness(evaluator.evaluate(currentSolution));
@@ -288,50 +290,161 @@ public class TabuSearch implements OptimizationAlgorithm {
      * 
      * **Validates: Requirements 11.2**
      */
+    /**
+     * Genera un movimiento eligiendo aleatoriamente entre tipos diversificados.
+     * REGENERATE (60%): Ruta aleatoria regenerada.
+     * CONGESTION_RELIEF (25%): Regenera batch del vuelo más congestionado.
+     * MULTI_REGENERATE (15%): Regenera 2-3 batches simultáneamente.
+     *
+     * @param current Solución actual
+     * @param batches Lista de lotes disponibles
+     * @return Move con solución vecina y batch ID modificado
+     *
+     * **Validates: Requirements 11.2**
+     */
     private Move generateMove(Solution current, List<ShipmentBatch> batches) {
-        Solution neighbor = new Solution(current);
-        
-        // Elegir lote aleatorio
-        ShipmentBatch randomBatch = batches.get(random.nextInt(batches.size()));
-        
-        // Generar nueva ruta para ese lote usando RouteGenerator
-        AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(randomBatch);
-        if (newRoute != null) {
-            neighbor.addRoute(newRoute);
+        int moveType = ThreadLocalRandom.current().nextInt(100);
+        if (moveType < 60) {
+            return generateRegenerateMove(current, batches);
+        } else if (moveType < 85) {
+            return generateCongestionReliefMove(current);
+        } else {
+            return generateMultiRegenerateMove(current, batches);
         }
-        
-        // Retornar Move(solution, batchId)
-        return new Move(neighbor, randomBatch.batchId());
     }
     
     /**
-     * Genera un movimiento desde una solución existente.
-     * Elige una ruta aleatoria de la solución y la regenera.
-     * 
+     * Genera un movimiento desde solución existente con tipos diversificados.
+     *
      * @param current Solución actual
      * @return Move con solución vecina y batch ID modificado
      */
     private Move generateMoveFromSolution(Solution current) {
-        Solution neighbor = new Solution(current);
-        
-        // Elegir ruta aleatoria de la solución actual
-        List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
-        if (batchIds.isEmpty()) {
-            return new Move(neighbor, "");
+        int moveType = ThreadLocalRandom.current().nextInt(100);
+        if (moveType < 60) {
+            return generateRegenerateMoveFromSolution(current);
+        } else if (moveType < 85) {
+            return generateCongestionReliefMove(current);
+        } else {
+            return generateMultiRegenerateMoveFromSolution(current);
         }
-        
-        String randomBatchId = batchIds.get(random.nextInt(batchIds.size()));
-        
-        AssignedRoute currentRoute = current.getRoute(randomBatchId);
-        ShipmentBatch batch = currentRoute.getBatch();
-        
-        // Generar nueva ruta para ese lote
+    }
+    
+    // ==================== Tipos de Movimiento ====================
+    
+    /** REGENERATE: Elige lote aleatorio de la lista y regenera su ruta. */
+    private Move generateRegenerateMove(Solution current, List<ShipmentBatch> batches) {
+        Solution neighbor = new Solution(current);
+        ShipmentBatch batch = batches.get(ThreadLocalRandom.current().nextInt(batches.size()));
         AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
         if (newRoute != null) {
             neighbor.addRoute(newRoute);
         }
+        return new Move(neighbor, batch.batchId());
+    }
+    
+    /** REGENERATE desde solución: Elige ruta existente y la regenera. */
+    private Move generateRegenerateMoveFromSolution(Solution current) {
+        Solution neighbor = new Solution(current);
+        List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
+        if (batchIds.isEmpty()) {
+            return new Move(neighbor, "");
+        }
+        String batchId = batchIds.get(ThreadLocalRandom.current().nextInt(batchIds.size()));
+        ShipmentBatch batch = current.getRoute(batchId).getBatch();
+        AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+        if (newRoute != null) {
+            neighbor.addRoute(newRoute);
+        }
+        return new Move(neighbor, batchId);
+    }
+    
+    /**
+     * CONGESTION_RELIEF: Encuentra el vuelo más utilizado (por número de lotes),
+     * elige un batch de ese vuelo y lo regenera para aliviar congestión.
+     */
+    private Move generateCongestionReliefMove(Solution current) {
+        List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
+        if (batchIds.isEmpty()) {
+            return new Move(new Solution(current), "");
+        }
         
-        return new Move(neighbor, randomBatchId);
+        // Contar cuántos lotes usa cada vuelo (por flightId)
+        Map<String, List<String>> flightToBatchIds = new HashMap<>();
+        for (Map.Entry<String, AssignedRoute> entry : current.getRoutes().entrySet()) {
+            for (Flight flight : entry.getValue().getFlights()) {
+                flightToBatchIds.computeIfAbsent(flight.flightId(), k -> new ArrayList<>())
+                    .add(entry.getKey());
+            }
+        }
+        
+        // Encontrar vuelo con más lotes asignados
+        String mostUsedFlightId = null;
+        int maxUsage = 0;
+        for (Map.Entry<String, List<String>> entry : flightToBatchIds.entrySet()) {
+            if (entry.getValue().size() > maxUsage) {
+                maxUsage = entry.getValue().size();
+                mostUsedFlightId = entry.getKey();
+            }
+        }
+        
+        if (mostUsedFlightId == null) {
+            return generateRegenerateMoveFromSolution(current);
+        }
+        
+        // Elegir batch aleatorio del vuelo más congestionado y regenerar
+        List<String> candidates = flightToBatchIds.get(mostUsedFlightId);
+        String targetBatchId = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+        
+        Solution neighbor = new Solution(current);
+        ShipmentBatch batch = current.getRoute(targetBatchId).getBatch();
+        AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+        if (newRoute != null) {
+            neighbor.addRoute(newRoute);
+        }
+        return new Move(neighbor, targetBatchId);
+    }
+    
+    /** MULTI_REGENERATE: Regenera 2-3 lotes simultáneamente (salto grande en vecindario). */
+    private Move generateMultiRegenerateMove(Solution current, List<ShipmentBatch> batches) {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        Solution neighbor = new Solution(current);
+        int count = random.nextInt(2, Math.min(4, batches.size() + 1));
+        String firstBatchId = null;
+        
+        for (int i = 0; i < count; i++) {
+            ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
+            if (firstBatchId == null) firstBatchId = batch.batchId();
+            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            if (newRoute != null) {
+                neighbor.addRoute(newRoute);
+            }
+        }
+        return new Move(neighbor, firstBatchId != null ? firstBatchId : "");
+    }
+    
+    /** MULTI_REGENERATE desde solución existente. */
+    private Move generateMultiRegenerateMoveFromSolution(Solution current) {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
+        if (batchIds.isEmpty()) {
+            return new Move(new Solution(current), "");
+        }
+        
+        Solution neighbor = new Solution(current);
+        int count = random.nextInt(2, Math.min(4, batchIds.size() + 1));
+        String firstBatchId = null;
+        
+        for (int i = 0; i < count; i++) {
+            String batchId = batchIds.get(random.nextInt(batchIds.size()));
+            if (firstBatchId == null) firstBatchId = batchId;
+            ShipmentBatch batch = current.getRoute(batchId).getBatch();
+            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            if (newRoute != null) {
+                neighbor.addRoute(newRoute);
+            }
+        }
+        return new Move(neighbor, firstBatchId != null ? firstBatchId : "");
     }
     
     /**
@@ -369,12 +482,6 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.maxIterations = config.getInt("maxIterations", 200);
         this.tabuTenure = config.getInt("tabuTenure", 15);
         this.neighborhoodSize = config.getInt("neighborhoodSize", 20);
-        
-        // Permitir configurar semilla aleatoria para experimentación
-        if (config.hasParameter("randomSeed")) {
-            long seed = config.getInt("randomSeed", 0);
-            this.random.setSeed(seed);
-        }
     }
     
     /**

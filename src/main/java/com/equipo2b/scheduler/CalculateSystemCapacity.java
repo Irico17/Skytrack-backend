@@ -22,10 +22,6 @@ public class CalculateSystemCapacity {
     
     public static void main(String[] args) {
         try {
-            // Configurar modo LENIENT para datos reales
-            com.equipo2b.scheduler.model.ValidationMode.setMode(
-                com.equipo2b.scheduler.model.ValidationMode.Mode.LENIENT
-            );
             
             System.out.println("================================================================================");
             System.out.println("FASE 1: CÁLCULO DE CAPACIDAD MÁXIMA DEL SISTEMA");
