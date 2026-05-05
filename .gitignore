@@ -56,5 +56,8 @@ EXPLICACION_DETALLADA_PARA_ENTENDER.md
 # Información del caso (archivos del profesor)
 InformacionCaso/
 
+#
+experimentos-historicos/
+
 # Archivos temporales de Kiro
 .kiro/

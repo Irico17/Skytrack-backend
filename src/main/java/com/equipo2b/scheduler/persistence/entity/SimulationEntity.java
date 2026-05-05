@@ -39,6 +39,18 @@ public class SimulationEntity {
     @Column(name = "collapse_level", length = 20)
     private String collapseLevel;
 
+    @Column(name = "algorithm_type", length = 20)
+    private String algorithmType;  // GATS o TABU_PURE
+
+    @Column(name = "total_batches")
+    private int totalBatches;
+
+    @Column(name = "routed_batches")
+    private int routedBatches;
+
+    @Column(name = "unroutable_batches")
+    private int unroutableBatches;
+
     protected SimulationEntity() {}
 
     public SimulationEntity(String id, String scenario) {
@@ -64,4 +76,12 @@ public class SimulationEntity {
     public void setSlaCompliance(double s) { this.slaCompliance = s; }
     public String getCollapseLevel() { return collapseLevel; }
     public void setCollapseLevel(String c) { this.collapseLevel = c; }
+    public String getAlgorithmType() { return algorithmType; }
+    public void setAlgorithmType(String algorithmType) { this.algorithmType = algorithmType; }
+    public int getTotalBatches() { return totalBatches; }
+    public void setTotalBatches(int totalBatches) { this.totalBatches = totalBatches; }
+    public int getRoutedBatches() { return routedBatches; }
+    public void setRoutedBatches(int routedBatches) { this.routedBatches = routedBatches; }
+    public int getUnroutableBatches() { return unroutableBatches; }
+    public void setUnroutableBatches(int unroutableBatches) { this.unroutableBatches = unroutableBatches; }
 }

@@ -54,6 +54,9 @@ public class SimulationController {
     private int batchesProcessed = 0;
     private int batchesFailed = 0;
     
+    // Almacena los lotes procesados para persistencia final
+    private List<ShipmentBatch> currentBatches;
+    
     /**
      * Constructor del SimulationController.
      */
@@ -84,8 +87,8 @@ public class SimulationController {
         System.out.println("INICIANDO SIMULACIÓN: " + scenario.getDescription());
         System.out.println("=".repeat(80));
         
-        // Preparar datos según el escenario
-        List<ShipmentBatch> batches = prepareData(scenario, historicalBatches);
+        // Preparar datos según el escenario y guardarlos para persistencia final
+        this.currentBatches = prepareData(scenario, historicalBatches);
         
         // Configurar algoritmos según el escenario
         GeneticAlgorithm ga = new GeneticAlgorithm(flightPlan, airportManager);
@@ -98,7 +101,7 @@ public class SimulationController {
         
         // Crear ShipmentQueue
         ShipmentQueue queue = new ShipmentQueue();
-        for (ShipmentBatch batch : batches) {
+        for (ShipmentBatch batch : currentBatches) {
             queue.addShipment(batch);
         }
         
@@ -111,7 +114,7 @@ public class SimulationController {
         );
         
         // Inicializar estado
-        this.simulatedTime = batches.get(0).ingressTime();
+        this.simulatedTime = currentBatches.get(0).ingressTime();
         this.currentCycle = 0;
         this.batchesProcessed = 0;
         this.batchesFailed = 0;
@@ -330,6 +333,20 @@ public class SimulationController {
      */
     public boolean isRunning() {
         return running.get();
+    }
+
+    /**
+     * Retorna los lotes actuales preparados para esta simulación.
+     */
+    public List<ShipmentBatch> getCurrentBatches() {
+        return currentBatches;
+    }
+    
+    /**
+     * Retorna el tipo de algoritmo utilizado.
+     */
+    public String getAlgorithmType() {
+        return scheduler != null ? scheduler.getAlgorithmType().name() : "UNKNOWN";
     }
 
     // ==================== MÉTODOS PRIVADOS ====================

@@ -174,15 +174,15 @@ public class AssignedRouteEntity {
         int stopCount = route.getFlights().size() - 1; // Número de escalas
         long durationMinutes = java.time.Duration.between(
             route.getFlights().get(0).departureTime(),
-            route.arrivalTime()
+            route.getFinalArrivalTime()
         ).toMinutes();
         
-        double slackHours = route.slack().toHours();
+        double slackHours = route.getSLASlack().toHours();
         
         return new AssignedRouteEntity(
             simulationId,
             batchId,
-            route.arrivalTime(),
+            route.getFinalArrivalTime(),
             (int) durationMinutes,
             stopCount,
             route.meetsSLA(),
@@ -411,19 +411,22 @@ public class SolutionPersistenceService {
             batchRepository.save(batchEntity);
         }
         
+        // 1.5. Construir mapa para lookup O(1)
+        java.util.Map<String, Long> batchIdToEntityId = batchRepository
+            .findBySimulationId(simulationId)
+            .stream()
+            .collect(java.util.stream.Collectors.toMap(
+                ShipmentBatchEntity::getBatchId, 
+                ShipmentBatchEntity::getId
+            ));
+        
         // 2. Persistir rutas asignadas y sus segmentos
         for (AssignedRoute route : solution.getRoutes().values()) {
-            // Buscar el batch entity para obtener su ID
-            ShipmentBatchEntity batchEntity = batchRepository
-                .findBySimulationId(simulationId)
-                .stream()
-                .filter(b -> b.getBatchId().equals(route.getBatch().batchId()))
-                .findFirst()
-                .orElseThrow();
+            Long batchEntityId = batchIdToEntityId.get(route.getBatch().batchId());
             
             // Crear ruta asignada
             AssignedRouteEntity routeEntity = AssignedRouteEntity.from(
-                simulationId, batchEntity.getId(), route
+                simulationId, batchEntityId, route
             );
             routeEntity = routeRepository.save(routeEntity);
             

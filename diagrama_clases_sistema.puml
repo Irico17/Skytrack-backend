@@ -51,8 +51,7 @@ package "model" #DDFFDD {
     }
     
     enum FlightType {
-        DOMESTIC
-        INTERNATIONAL
+        INTRACONTINENTAL
         INTERCONTINENTAL
     }
     
@@ -80,10 +79,11 @@ package "model" #DDFFDD {
         - batch: ShipmentBatch
         - flights: List<Flight>
         - storageEvents: List<StorageEvent>
-        - arrivalTime: ZonedDateTime
-        - totalCost: double
+        - finalArrivalTime: ZonedDateTime
         + getStopCount(): int
         + meetsSLA(): boolean
+        + getSLASlack(): Duration
+        + getTotalTransitTime(): Duration
         + calculateStorageEvents(): List<StorageEvent>
     }
     

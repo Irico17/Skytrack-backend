@@ -6,6 +6,8 @@ import com.equipo2b.scheduler.execution.*;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.monitoring.*;
 import com.equipo2b.scheduler.validation.RouteValidator;
+import com.equipo2b.scheduler.persistence.service.SolutionPersistenceService;
+import com.equipo2b.scheduler.persistence.repository.SimulationRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -17,10 +19,16 @@ import java.util.List;
  * para los REST controllers y el WebSocket.
  */
 @Service
-public class SimulationService {
+public class SimulationService implements SimulationController.SimulationListener {
 
     @Autowired
     private DataLoadingService dataService;
+
+    @Autowired
+    private SolutionPersistenceService persistenceService;
+
+    @Autowired
+    private SimulationRepository simulationRepository;
 
     @Autowired(required = false)
     private SimulationWebSocketHandler webSocketHandler;
@@ -74,11 +82,13 @@ public class SimulationService {
 
             activeController.startSimulation(scenario, historicalBatches);
 
-            // Registrar WebSocket como listener para tiempo real
+            // Escuchar eventos de la simulación
+            activeController.setListener(this);
+
+            // Registrar WebSocket
             String simId = activeController.getSimulationId();
             if (webSocketHandler != null) {
                 webSocketHandler.setActiveSimId(simId);
-                activeController.setListener(webSocketHandler);
             }
 
 
@@ -186,6 +196,47 @@ public class SimulationService {
     private void validateSimId(String simId) {
         if (activeController == null || !simId.equals(activeController.getSimulationId())) {
             throw new IllegalArgumentException("Simulación no encontrada: " + simId);
+        }
+    // ===== MÉTODOS DE SimulationListener =====
+    
+    @Override
+    public void onCycleCompleted(SimulationStatus status, Solution solution) {
+        if (webSocketHandler != null) {
+            webSocketHandler.onCycleCompleted(status, solution);
+        }
+    }
+
+    @Override
+    public void onSimulationFinished(SimulationStatus status) {
+        if (webSocketHandler != null) {
+            webSocketHandler.onSimulationFinished(status);
+        }
+        
+        // Ejecutar persistencia
+        if (activeController != null) {
+            String simId = activeController.getSimulationId();
+            Solution solution = activeController.getCurrentSolution();
+            List<ShipmentBatch> batches = activeController.getCurrentBatches();
+            String algoType = activeController.getAlgorithmType();
+            
+            try {
+                persistenceService.persistSolution(simId, solution, batches);
+                
+                // Actualizar estadísticas de simulación
+                var simOpt = simulationRepository.findById(simId);
+                if (simOpt.isPresent()) {
+                    var simEntity = simOpt.get();
+                    simEntity.setTotalBatches(batches.size());
+                    simEntity.setRoutedBatches(solution.getRoutes().size());
+                    simEntity.setUnroutableBatches(solution.getUnroutableBatches().size());
+                    simEntity.setAlgorithmType(algoType);
+                    simulationRepository.save(simEntity);
+                    System.out.println("✓ Persistencia de simulación completada: " + simId);
+                }
+            } catch(Exception e) {
+                System.err.println("❌ Error persistiendo la simulación: " + e.getMessage());
+                e.printStackTrace();
+            }
         }
     }
 }
