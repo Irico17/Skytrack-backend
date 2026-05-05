@@ -35,12 +35,18 @@ public class ShipmentGenerator {
     private static final double MIN_FACTOR = 1.16;
     private static final double MAX_FACTOR = 1.23;
     private final AtomicInteger batchIdCounter;
-    
-    /**
-     * Construye un nuevo generador de envíos.
-     */
+    private final java.util.Random random;
+
+    /** Constructor con aleatoriedad no determinista. */
     public ShipmentGenerator() {
         this.batchIdCounter = new AtomicInteger(0);
+        this.random = new java.util.Random();
+    }
+
+    /** Constructor con semilla fija para simulaciones reproducibles. */
+    public ShipmentGenerator(long seed) {
+        this.batchIdCounter = new AtomicInteger(0);
+        this.random = new java.util.Random(seed);
     }
     
     /**
@@ -251,7 +257,7 @@ public class ShipmentGenerator {
             remainingQuantity -= batchQuantity;
             
             // Avanzar tiempo (cada 1-3 horas según patrón)
-            currentTime = currentTime.plusHours(1 + (int) (Math.random() * 3));
+            currentTime = currentTime.plusHours(1 + (int) (random.nextDouble() * 3));
         }
         
         return result;
@@ -261,18 +267,18 @@ public class ShipmentGenerator {
      * Selecciona una hora según el patrón de distribución temporal.
      */
     private int selectHourByPattern(TemporalPattern pattern) {
-        double random = Math.random();
+        double r = random.nextDouble();
         double cumulative = 0.0;
-        
+
         for (Map.Entry<Integer, Double> entry : pattern.hourlyProportions.entrySet()) {
             cumulative += entry.getValue();
-            if (random <= cumulative) {
+            if (r <= cumulative) {
                 return entry.getKey();
             }
         }
-        
+
         // Fallback: hora aleatoria
-        return (int) (Math.random() * 24);
+        return (int) (random.nextDouble() * 24);
     }
     
     /**

@@ -20,28 +20,35 @@ import java.util.*;
  * @see CollapseStatus
  */
 public class CollapseDetector {
-    
+
     // Umbrales configurables
-    private double collapseThreshold;  // Umbral de colapso (60-80%)
-    private double unserviceableThreshold;  // Umbral de pedidos no atendibles (20%)
-    
-    /**
-     * Constructor con umbrales por defecto.
-     * Umbral de colapso: 70%
-     * Umbral de no atendibles: 20%
-     */
+    private double collapseThreshold;
+    private double unserviceableThreshold;
+
+    /** Monitor de capacidad para calcular ocupación real. Puede ser null. */
+    private CapacityMonitor capacityMonitor;
+
+    /** Constructor con umbrales por defecto y sin monitor de capacidad. */
     public CollapseDetector() {
-        this(70.0, 20.0);
+        this(70.0, 20.0, null);
+    }
+
+    /** Constructor con monitor de capacidad real (recomendado para el backend). */
+    public CollapseDetector(CapacityMonitor capacityMonitor) {
+        this(70.0, 20.0, capacityMonitor);
     }
     
     /**
      * Constructor con umbrales personalizados.
-     * 
-     * @param collapseThreshold Umbral de colapso entre 60 y 80
-     * @param unserviceableThreshold Umbral de pedidos no atendibles
-     * @throws IllegalArgumentException si los umbrales están fuera de rango
      */
     public CollapseDetector(double collapseThreshold, double unserviceableThreshold) {
+        this(collapseThreshold, unserviceableThreshold, null);
+    }
+
+    /**
+     * Constructor completo.
+     */
+    public CollapseDetector(double collapseThreshold, double unserviceableThreshold, CapacityMonitor capacityMonitor) {
         if (collapseThreshold < 60 || collapseThreshold > 80) {
             throw new IllegalArgumentException(
                 "Collapse threshold must be between 60 and 80, got: " + collapseThreshold
@@ -54,6 +61,7 @@ public class CollapseDetector {
         }
         this.collapseThreshold = collapseThreshold;
         this.unserviceableThreshold = unserviceableThreshold;
+        this.capacityMonitor = capacityMonitor;
     }
     
     /**
@@ -76,25 +84,32 @@ public class CollapseDetector {
      * **Validates: Requirements 31.1, 31.2, 31.3, 31.4, 31.5**
      */
     public CollapseStatus evaluateCollapse(Solution solution, int totalBatches, int failedBatches) {
+        // Colapso directo si fitness positivo (penalizaciones superan premios)
+        if (solution.isEvaluated() && solution.getFitness() > 0) {
+            String msg = "Sistema colapsado - fitness positivo: " + String.format("%.0f", solution.getFitness());
+            System.out.println("\n⚠️  COLAPSO POR FITNESS: " + msg);
+            return new CollapseStatus(CollapseLevel.COLLAPSED, 100.0, 100.0, msg);
+        }
+
         // 1. Calcular saturación promedio del sistema
         double occupancy = calculateSystemOccupancy(solution);
-        
+
         // 2. Calcular porcentaje de pedidos no atendibles
-        double unserviceablePercentage = totalBatches > 0 
-            ? (failedBatches * 100.0 / totalBatches) 
+        double unserviceablePercentage = totalBatches > 0
+            ? (failedBatches * 100.0 / totalBatches)
             : 0.0;
-        
+
         // 3. Determinar CollapseLevel según umbrales
         CollapseLevel level = determineCollapseLevel(occupancy, unserviceablePercentage);
-        
+
         // 4. Generar mensaje descriptivo
         String message = generateMessage(level, occupancy, unserviceablePercentage);
-        
+
         // 5. Emitir alerta si es necesario
         if (level == CollapseLevel.CRITICAL || level == CollapseLevel.COLLAPSED) {
             System.out.println("\n⚠️  ALERTA DE COLAPSO: " + message);
         }
-        
+
         return new CollapseStatus(level, occupancy, unserviceablePercentage, message);
     }
     
@@ -108,23 +123,20 @@ public class CollapseDetector {
         if (solution.getRoutes().isEmpty()) {
             return 0.0;
         }
-        
-        // Calcular ocupación basada en fitness
-        // Fitness negativo indica penalizaciones (violaciones)
-        // Fitness más negativo = mayor ocupación/saturación
-        double fitness = solution.getFitness();
-        
-        // Normalizar fitness a porcentaje de ocupación
-        // Asumimos que fitness < -100000 indica alta saturación
-        if (fitness >= 0) {
-            return 0.0;  // Sin penalizaciones = baja ocupación
+
+        // Usar CapacityMonitor si está disponible (métrica real)
+        if (capacityMonitor != null) {
+            double realOccupancy = capacityMonitor.calculateAverageFlightOccupancy(solution);
+            return realOccupancy * 100.0;  // Convertir a porcentaje
         }
-        
+
+        // Fallback: normalizar fitness (menos preciso pero no requiere monitor)
+        double fitness = solution.getFitness();
+        if (fitness >= 0) {
+            return 85.0;  // Fitness >= 0 indica alta saturación
+        }
         // Mapear fitness negativo a ocupación
-        // -50000 = 50%, -100000 = 70%, -200000 = 85%, etc.
-        double occupancy = Math.min(100.0, Math.abs(fitness) / 2000.0);
-        
-        return occupancy;
+        return Math.min(80.0, Math.abs(fitness) / 2000.0);
     }
     
     /**

@@ -10,6 +10,7 @@ import com.equipo2b.scheduler.validation.RouteValidator;
 import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.UUID;
 
 /**
  * Controlador principal para gestionar simulaciones del sistema de planificación logística.
@@ -37,9 +38,15 @@ public class SimulationController {
     
     // Scheduler y componentes
     private Scheduler scheduler;
-    private Solution currentSolution;
+    private volatile Solution currentSolution;
     private TabuSearch tabuSearch;
     private RouteValidator validator;
+
+    // Identificador único de la simulación activa
+    private String simulationId;
+
+    // Listener para WebSocket (notificaciones por ciclo)
+    private SimulationListener listener;
     
     // Estadísticas
     private int currentCycle = 0;
@@ -49,12 +56,8 @@ public class SimulationController {
     
     /**
      * Constructor del SimulationController.
-     * 
-     * @param flightPlan Plan de vuelos maestro
-     * @param airportManager Gestor de aeropuertos
-     * @param clientRegistry Registro de clientes
      */
-    public SimulationController(FlightPlan flightPlan, 
+    public SimulationController(FlightPlan flightPlan,
                                AirportManager airportManager,
                                ClientRegistry clientRegistry) {
         this.flightPlan = Objects.requireNonNull(flightPlan);
@@ -62,6 +65,7 @@ public class SimulationController {
         this.clientRegistry = Objects.requireNonNull(clientRegistry);
         this.state = SimulationState.STOPPED;
         this.currentSolution = new Solution();
+        this.simulationId = UUID.randomUUID().toString();
     }
     
     /**
@@ -320,7 +324,14 @@ public class SimulationController {
     public Solution getCurrentSolution() {
         return currentSolution;
     }
-    
+
+    /**
+     * Verifica si hay una simulación en ejecución.
+     */
+    public boolean isRunning() {
+        return running.get();
+    }
+
     // ==================== MÉTODOS PRIVADOS ====================
     
     /**
@@ -341,19 +352,28 @@ public class SimulationController {
                 System.out.println("\n--- CICLO " + currentCycle + " ---");
                 
                 currentSolution = scheduler.executePlanningCycle(simulatedTime);
-                
+
                 // Actualizar estadísticas
                 batchesProcessed = currentSolution.getRoutes().size();
-                
+
                 // Avanzar tiempo simulado
                 simulatedTime = simulatedTime.plusMinutes(scenario.getSa());
-                
+
                 // Verificar colapso
                 CollapseDetector detector = new CollapseDetector();
                 CollapseStatus collapseStatus = detector.evaluateCollapse(
                     currentSolution, batchesProcessed, batchesFailed
                 );
-                
+
+                // Notificar listener (WebSocket) al final de cada ciclo
+                if (listener != null) {
+                    try {
+                        listener.onCycleCompleted(getStatus(), currentSolution);
+                    } catch (Exception e) {
+                        System.err.println("⚠️ Error notificando listener: " + e.getMessage());
+                    }
+                }
+
                 if (collapseStatus.isCollapsed()) {
                     System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
                     break;
@@ -372,6 +392,15 @@ public class SimulationController {
             state = SimulationState.STOPPED;
             System.out.println("\n✓ Simulación finalizada");
             printFinalSummary();
+
+            // Notificar listener (WebSocket) al terminar
+            if (listener != null) {
+                try {
+                    listener.onSimulationFinished(getStatus());
+                } catch (Exception e) {
+                    System.err.println("⚠️ Error notificando listener en finish: " + e.getMessage());
+                }
+            }
         }
     }
     
@@ -480,5 +509,41 @@ public class SimulationController {
         STOPPED,
         RUNNING,
         PAUSED
+    }
+
+    // ===== MÉTODOS ADICIONALES =====
+
+    /**
+     * Retorna el identificador único de la simulación activa.
+     */
+    public String getSimulationId() {
+        return simulationId;
+    }
+
+    /**
+     * Registra un listener para recibir notificaciones por ciclo.
+     * Usado por el WebSocket handler para emitir estado en tiempo real.
+     */
+    public void setListener(SimulationListener listener) {
+        this.listener = listener;
+    }
+
+    /**
+     * Interface de listener para notificaciones de simulación.
+     * Implementada por SimulationWebSocketHandler.
+     */
+    public interface SimulationListener {
+        /**
+         * Llamado al finalizar cada ciclo de planificación.
+         * @param status Estado actual de la simulación
+         * @param solution Solución acumulada actual
+         */
+        void onCycleCompleted(SimulationStatus status, Solution solution);
+
+        /**
+         * Llamado cuando la simulación termina (por fin de datos, colapso o stop manual).
+         * @param status Estado final
+         */
+        void onSimulationFinished(SimulationStatus status);
     }
 }

@@ -2,6 +2,7 @@ package com.equipo2b.scheduler.model;
 
 import java.time.ZonedDateTime;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Gestiona el plan maestro de vuelos.
@@ -17,6 +18,13 @@ import java.util.*;
 public class FlightPlan {
     private final List<Flight> allFlights;
     private final Map<String, List<Flight>> flightsByOrigin;  // Índice para búsqueda rápida por Airport ID
+
+    /**
+     * Set thread-safe de IDs de vuelos cancelados durante la simulación.
+     * Formato: "FL001-D5" (flightId con sufijo de día).
+     * Persistido solo en memoria durante la simulación activa.
+     */
+    private final Set<String> cancelledFlightIds = ConcurrentHashMap.newKeySet();
 
     /**
      * Constructor vacío que inicializa estructuras de datos.
@@ -99,8 +107,15 @@ public class FlightPlan {
                 // Verificar si este vuelo ajustado cae en la ventana temporal
                 if (!adjustedDeparture.isBefore(start) && !adjustedDeparture.isAfter(end)) {
                     // Crear un nuevo vuelo con las fechas ajustadas
+                    String adjustedId = baseFlight.flightId() + "-D" + dayOffset;
+
+                    // Saltar vuelos cancelados para esta instancia de día
+                    if (cancelledFlightIds.contains(adjustedId)) {
+                        continue;
+                    }
+
                     Flight adjustedFlight = new Flight(
-                        baseFlight.flightId() + "-D" + dayOffset,
+                        adjustedId,
                         baseFlight.origin(),
                         baseFlight.destination(),
                         adjustedDeparture,
@@ -132,5 +147,42 @@ public class FlightPlan {
      */
     public int getTotalFlights() {
         return allFlights.size();
+    }
+
+    // ===== GESTIÓN DE CANCELACIONES =====
+
+    /**
+     * Cancela una instancia específica de vuelo para un día dado.
+     * El ID debe incluir el sufijo de día (ej: "FL001-D5").
+     * Thread-safe: puede llamarse durante simulación en curso.
+     *
+     * @param adjustedFlightId ID del vuelo ajustado a cancelar
+     */
+    public void cancelFlight(String adjustedFlightId) {
+        cancelledFlightIds.add(adjustedFlightId);
+    }
+
+    /**
+     * Verifica si un vuelo (con sufijo de día) está cancelado.
+     *
+     * @param adjustedFlightId ID del vuelo ajustado
+     * @return true si está cancelado
+     */
+    public boolean isCancelled(String adjustedFlightId) {
+        return cancelledFlightIds.contains(adjustedFlightId);
+    }
+
+    /**
+     * Retorna una copia del set de vuelos cancelados.
+     */
+    public Set<String> getCancelledFlightIds() {
+        return Set.copyOf(cancelledFlightIds);
+    }
+
+    /**
+     * Limpia todas las cancelaciones (para nueva simulación).
+     */
+    public void clearCancellations() {
+        cancelledFlightIds.clear();
     }
 }
