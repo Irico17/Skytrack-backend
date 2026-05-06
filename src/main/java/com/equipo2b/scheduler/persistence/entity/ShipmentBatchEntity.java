@@ -73,7 +73,7 @@ public class ShipmentBatchEntity {
             batch.destination().id(),
             batch.quantity(),
             batch.ingressTime(),
-            batch.deadline(),
+            batch.ingressTime().plus(batch.calculateSLA()),
             routed
         );
     }

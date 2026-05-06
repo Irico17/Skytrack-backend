@@ -197,6 +197,8 @@ public class SimulationService implements SimulationController.SimulationListene
         if (activeController == null || !simId.equals(activeController.getSimulationId())) {
             throw new IllegalArgumentException("Simulación no encontrada: " + simId);
         }
+    }
+
     // ===== MÉTODOS DE SimulationListener =====
     
     @Override
@@ -228,7 +230,7 @@ public class SimulationService implements SimulationController.SimulationListene
                     var simEntity = simOpt.get();
                     simEntity.setTotalBatches(batches.size());
                     simEntity.setRoutedBatches(solution.getRoutes().size());
-                    simEntity.setUnroutableBatches(solution.getUnroutableBatches().size());
+                    simEntity.setUnroutableBatches(batches.size() - solution.getRoutes().size());
                     simEntity.setAlgorithmType(algoType);
                     simulationRepository.save(simEntity);
                     System.out.println("✓ Persistencia de simulación completada: " + simId);
