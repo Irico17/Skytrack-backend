@@ -32,10 +32,10 @@ public enum ScenarioType {
      * - Debe completarse en 30-90 minutos reales
      */
     PERIOD_SIMULATION(
-        14,   // K: Factor de aceleración
-        2,    // Ta: Tiempo máximo de algoritmo (minutos)
-        5,    // Sa: Salto entre ejecuciones (minutos)
-        "Escenario 2: Simulación de Período (K=14)"
+        120,  // K: Factor de aceleración — Sc=6×120=720min(12h). 5 días = 10 ciclos ≈ 60 min reales
+        3,    // Ta: Tiempo máximo de algoritmo (minutos)
+        6,    // Sa: Salto entre ejecuciones (minutos)
+        "Escenario 2: Simulación 5 Días (K=120, Ta=3, Sa=6)"
     ),
     
     /**

@@ -19,6 +19,8 @@ import java.util.Objects;
  * - Tiempo de escala mínimo de 10 minutos entre vuelos
  */
 public final class AssignedRoute {
+    private static final long DESTINATION_DWELL_MINUTES = 30;
+
     private final ShipmentBatch batch;
     private final List<Flight> flights;
     private final List<StorageEvent> storageEvents;
@@ -117,6 +119,20 @@ public final class AssignedRoute {
      */
     private List<StorageEvent> calculateStorageEvents() {
         List<StorageEvent> events = new ArrayList<>();
+
+        Flight firstFlight = flights.get(0);
+        events.add(new StorageEvent(
+            batch.origin(),
+            batch.ingressTime(),
+            batch.quantity(),
+            StorageEventType.ARRIVAL
+        ));
+        events.add(new StorageEvent(
+            batch.origin(),
+            firstFlight.departureTime(),
+            batch.quantity(),
+            StorageEventType.DEPARTURE
+        ));
         
         for (int i = 0; i < flights.size(); i++) {
             Flight flight = flights.get(i);
@@ -135,6 +151,13 @@ public final class AssignedRoute {
                 events.add(new StorageEvent(
                     flight.destination(),
                     nextFlight.departureTime(),
+                    batch.quantity(),
+                    StorageEventType.DEPARTURE
+                ));
+            } else {
+                events.add(new StorageEvent(
+                    flight.destination(),
+                    flight.arrivalTime().plusMinutes(DESTINATION_DWELL_MINUTES),
                     batch.quantity(),
                     StorageEventType.DEPARTURE
                 ));

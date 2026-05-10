@@ -5,12 +5,15 @@ import com.equipo2b.scheduler.api.websocket.SimulationWebSocketHandler;
 import com.equipo2b.scheduler.execution.*;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.monitoring.*;
-import com.equipo2b.scheduler.validation.RouteValidator;
-import com.equipo2b.scheduler.persistence.service.SolutionPersistenceService;
 import com.equipo2b.scheduler.persistence.repository.SimulationRepository;
+import com.equipo2b.scheduler.persistence.service.SolutionPersistenceService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 /**
@@ -30,6 +33,9 @@ public class SimulationService implements SimulationController.SimulationListene
     @Autowired
     private SimulationRepository simulationRepository;
 
+    @Autowired
+    private SimulationResultExporter resultExporter;
+
     @Autowired(required = false)
     private SimulationWebSocketHandler webSocketHandler;
 
@@ -39,16 +45,20 @@ public class SimulationService implements SimulationController.SimulationListene
     private AirportManager currentAirportManager;
     private ShipmentQueue currentQueue;
     private CapacityMonitor currentCapacityMonitor;
+    private StorageInventoryService currentStorageInventoryService;
     private TrafficLightIndicator trafficLight;
     private ScenarioType currentScenario;
+    private ZonedDateTime currentStartDate;
 
     /**
      * Inicia una nueva simulación del escenario indicado.
      *
      * @param scenarioName "DAY_TO_DAY", "PERIOD_SIMULATION" o "COLLAPSE_SIMULATION"
+     * @param startDateStr Fecha de inicio del rango de datos (yyyy-MM-dd). Null = todos los datos.
+     *                     Para PERIOD_SIMULATION filtra [startDate, startDate+5días].
      * @return simulationId único de la simulación iniciada
      */
-    public synchronized String startSimulation(String scenarioName) {
+    public synchronized String startSimulation(String scenarioName, String startDateStr) {
         // Detener simulación activa si existe
         if (activeController != null && activeController.isRunning()) {
             activeController.stopSimulation();
@@ -57,43 +67,61 @@ public class SimulationService implements SimulationController.SimulationListene
         ScenarioType scenario = ScenarioType.valueOf(scenarioName);
         currentScenario = scenario;
 
+        // Parsear fecha de inicio
+        currentStartDate = parseStartDate(startDateStr);
+
         try {
             System.out.println("🚀 Iniciando simulación: " + scenario.getDescription());
+            if (currentStartDate != null) {
+                System.out.println("   Ventana: " + currentStartDate.toLocalDate()
+                    + " → " + currentStartDate.plusDays(5).toLocalDate());
+            }
 
             // 1. Cargar datos base
             List<Airport> airports = dataService.loadAirports();
             currentAirportManager = dataService.createAirportManager(airports);
             ClientRegistry clientRegistry = dataService.createClientRegistry(airports);
             currentFlightPlan = dataService.loadFlightPlan(currentAirportManager);
-            List<ShipmentBatch> historicalBatches = dataService.loadAllShipments(currentAirportManager, clientRegistry);
 
-            // 2. Construir cola de envíos (SimulationController maneja la generación futura)
-            currentQueue = dataService.buildQueue(historicalBatches);
+            // 2. Cargar envíos — filtrar por rango si es simulación de 5 días
+            List<ShipmentBatch> batches;
+            if (scenario == ScenarioType.PERIOD_SIMULATION && currentStartDate != null) {
+                ZonedDateTime endDate = currentStartDate.plusDays(5);
+                batches = dataService.loadShipmentsInRange(
+                    currentAirportManager, clientRegistry, currentStartDate, endDate
+                );
+            } else {
+                batches = dataService.loadAllShipments(currentAirportManager, clientRegistry);
+            }
 
-            // 3. Crear monitores
+            // 3. Construir cola
+            currentQueue = dataService.buildQueue(batches);
+
+            // 4. Crear monitores
             currentCapacityMonitor = new CapacityMonitor(currentFlightPlan, currentAirportManager);
+            currentStorageInventoryService = new StorageInventoryService(currentAirportManager);
             trafficLight = new TrafficLightIndicator();
 
-            // 4. Crear controlador y iniciar simulación
-            // startSimulation() internamente llama prepareData() para el escenario correcto
+            // 5. Crear controlador
             activeController = new SimulationController(
                 currentFlightPlan, currentAirportManager, clientRegistry
             );
+            activeController.setStartDate(currentStartDate);
 
-            activeController.startSimulation(scenario, historicalBatches);
-
-            // Escuchar eventos de la simulación
+            // 6. Escuchar eventos de la simulación (this implementa SimulationListener)
+            //    ANTES de startSimulation() para no perder ciclos
             activeController.setListener(this);
 
-            // Registrar WebSocket
+            // 7. Registrar WebSocket
             String simId = activeController.getSimulationId();
             if (webSocketHandler != null) {
                 webSocketHandler.setActiveSimId(simId);
             }
 
+            activeController.startSimulation(scenario, batches);
 
-            System.out.println("✓ Simulación iniciada: " + activeController.getSimulationId());
-            return activeController.getSimulationId();
+            System.out.println("✓ Simulación iniciada: " + simId);
+            return simId;
 
         } catch (Exception e) {
             throw new RuntimeException("Error iniciando simulación: " + e.getMessage(), e);
@@ -180,10 +208,171 @@ public class SimulationService implements SimulationController.SimulationListene
         return currentFlightPlan;
     }
 
-    /** Retorna true si hay simulación activa. */
+    /** Retorna true si hay simulación activa con ese ID. */
     public boolean hasActiveSimulation(String simId) {
         return activeController != null
             && simId.equals(activeController.getSimulationId());
+    }
+
+    // ===== MÉTODOS DE SimulationListener =====
+
+    @Override
+    public void onCycleCompleted(SimulationStatus status, Solution solution) {
+        // Calcular semáforos
+        SemaphoreDTO semaphores = SemaphoreDTO.unknown();
+        if (currentCapacityMonitor != null && !solution.getRoutes().isEmpty()) {
+            TrafficLightReport report = trafficLight.generateReport(solution, currentCapacityMonitor);
+            semaphores = new SemaphoreDTO(
+                report.flightColor().name(),
+                report.storageColor().name(),
+                report.slaColor().name(),
+                report.flightOccupancy(),
+                report.storageOccupancy(),
+                report.slaCompliance()
+            );
+        }
+
+        // Calcular días transcurridos
+        double daysElapsed = activeController.getDaysElapsed();
+
+        // Calcular batch summary
+        long onTime  = solution.getRoutes().values().stream().filter(AssignedRoute::meetsSLA).count();
+        long delayed = solution.getRoutes().values().stream().filter(r -> !r.meetsSLA()).count();
+        int  unrouted = Math.max(0, (activeController.getCurrentBatches() != null
+                        ? activeController.getCurrentBatches().size() : 0)
+                        - solution.getRoutes().size());
+
+        // Construir vuelos activos para animación (deduplicado por flightId)
+        java.util.Map<String, CycleUpdateDTO.ActiveFlightDTO> flightMap = new java.util.LinkedHashMap<>();
+        for (AssignedRoute route : solution.getRoutes().values()) {
+            for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
+                String fid = flight.flightId();
+                CycleUpdateDTO.ActiveFlightDTO existing = flightMap.get(fid);
+                if (existing != null) {
+                    flightMap.put(fid, new CycleUpdateDTO.ActiveFlightDTO(
+                        existing.flightId(), existing.originId(), existing.destinationId(),
+                        existing.departureTime(), existing.arrivalTime(),
+                        existing.bagsCount() + route.getBatch().quantity(),
+                        existing.meetsSla() && route.meetsSLA()
+                    ));
+                } else {
+                    flightMap.put(fid, new CycleUpdateDTO.ActiveFlightDTO(
+                        fid,
+                        flight.origin().id(),
+                        flight.destination().id(),
+                        flight.departureTime().toString(),
+                        flight.arrivalTime().toString(),
+                        route.getBatch().quantity(),
+                        route.meetsSLA()
+                    ));
+                }
+            }
+        }
+        java.util.List<CycleUpdateDTO.ActiveFlightDTO> activeFlights =
+            new java.util.ArrayList<>(flightMap.values());
+
+        // Calcular capacidad actual de cada aeropuerto (reusable para todos los modos)
+        java.util.List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities =
+            buildAirportCapacities(solution, status.simulatedTime());
+
+        CycleUpdateDTO update = new CycleUpdateDTO(
+            "CYCLE_UPDATE",
+            activeController.getSimulationId(),
+            status.currentCycle(),
+            status.simulatedTime() != null ? status.simulatedTime().toString() : null,
+            daysElapsed,
+            false,  // simulationComplete
+            status.currentFitness(),
+            status.batchesProcessed(),
+            status.batchesFailed(),
+            solution.getRoutes().size(),
+            solution.getTotalBags(),
+            semaphores,
+            new CycleUpdateDTO.BatchSummaryDTO((int) onTime, (int) delayed, unrouted),
+            activeFlights,
+            airportCapacities
+        );
+
+        // Propagar al WebSocket
+        if (webSocketHandler != null) {
+            webSocketHandler.onCycleCompleted(status, solution, update);
+        }
+    }
+
+    @Override
+    public void onStorageUpdated(SimulationStatus status, Solution solution) {
+        if (webSocketHandler == null) return;
+
+        StorageUpdateDTO update = new StorageUpdateDTO(
+            "STORAGE_UPDATE",
+            activeController.getSimulationId(),
+            status.currentCycle(),
+            status.simulatedTime() != null ? status.simulatedTime().toString() : null,
+            activeController.getDaysElapsed(),
+            buildAirportCapacities(solution, status.simulatedTime())
+        );
+
+        webSocketHandler.onStorageUpdated(update);
+    }
+
+    private java.util.List<CycleUpdateDTO.AirportCapacityDTO> buildAirportCapacities(
+            Solution solution, ZonedDateTime simulatedTime) {
+        java.util.List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities = new java.util.ArrayList<>();
+        if (currentStorageInventoryService == null || currentAirportManager == null) {
+            return airportCapacities;
+        }
+
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> currentBags =
+            currentStorageInventoryService.calculateCurrentBags(solution, simulatedTime);
+
+        for (var entry : currentBags.entrySet()) {
+            com.equipo2b.scheduler.model.Airport ap = entry.getKey();
+            int bags = entry.getValue();
+            double ratio = ap.storageCapacity() > 0 ? (double) bags / ap.storageCapacity() : 0.0;
+            airportCapacities.add(new CycleUpdateDTO.AirportCapacityDTO(
+                ap.id(), bags, ap.storageCapacity(), ratio
+            ));
+        }
+
+        return airportCapacities;
+    }
+
+    @Override
+    public void onSimulationFinished(SimulationStatus status) {
+        // Notificar WebSocket que terminó
+        if (webSocketHandler != null) {
+            webSocketHandler.onSimulationFinished(status);
+        }
+
+        if (activeController == null) return;
+        String simId = activeController.getSimulationId();
+        Solution solution = activeController.getCurrentSolution();
+        List<ShipmentBatch> batches = activeController.getCurrentBatches();
+
+        // Para PERIOD_SIMULATION: exportar a JSON, NO a BD
+        if (currentScenario == ScenarioType.PERIOD_SIMULATION) {
+            try {
+                resultExporter.exportResults(
+                    simId, currentScenario, currentStartDate,
+                    solution,
+                    batches != null ? batches.size() : 0,
+                    status.currentCycle()
+                );
+                System.out.println("✓ Resultados de simulación 5 días exportados a archivo JSON");
+            } catch (Exception e) {
+                System.err.println("❌ Error exportando resultados: " + e.getMessage());
+            }
+        } else if (currentScenario == ScenarioType.DAY_TO_DAY) {
+            // DAY_TO_DAY: persistir en BD
+            try {
+                persistenceService.persistSolution(simId, solution, batches);
+                System.out.println("✓ Persistencia en BD completada: " + simId);
+            } catch (Exception e) {
+                System.err.println("❌ Error persistiendo en BD: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+        // COLLAPSE_SIMULATION: no persistir (descartamos)
     }
 
     // ===== INTERNAL =====
@@ -199,46 +388,14 @@ public class SimulationService implements SimulationController.SimulationListene
         }
     }
 
-    // ===== MÉTODOS DE SimulationListener =====
-    
-    @Override
-    public void onCycleCompleted(SimulationStatus status, Solution solution) {
-        if (webSocketHandler != null) {
-            webSocketHandler.onCycleCompleted(status, solution);
-        }
-    }
-
-    @Override
-    public void onSimulationFinished(SimulationStatus status) {
-        if (webSocketHandler != null) {
-            webSocketHandler.onSimulationFinished(status);
-        }
-        
-        // Ejecutar persistencia
-        if (activeController != null) {
-            String simId = activeController.getSimulationId();
-            Solution solution = activeController.getCurrentSolution();
-            List<ShipmentBatch> batches = activeController.getCurrentBatches();
-            String algoType = activeController.getAlgorithmType();
-            
-            try {
-                persistenceService.persistSolution(simId, solution, batches);
-                
-                // Actualizar estadísticas de simulación
-                var simOpt = simulationRepository.findById(simId);
-                if (simOpt.isPresent()) {
-                    var simEntity = simOpt.get();
-                    simEntity.setTotalBatches(batches.size());
-                    simEntity.setRoutedBatches(solution.getRoutes().size());
-                    simEntity.setUnroutableBatches(batches.size() - solution.getRoutes().size());
-                    simEntity.setAlgorithmType(algoType);
-                    simulationRepository.save(simEntity);
-                    System.out.println("✓ Persistencia de simulación completada: " + simId);
-                }
-            } catch(Exception e) {
-                System.err.println("❌ Error persistiendo la simulación: " + e.getMessage());
-                e.printStackTrace();
-            }
+    private ZonedDateTime parseStartDate(String startDateStr) {
+        if (startDateStr == null || startDateStr.isBlank()) return null;
+        try {
+            LocalDate date = LocalDate.parse(startDateStr, DateTimeFormatter.ISO_LOCAL_DATE);
+            return date.atStartOfDay(ZoneOffset.UTC);
+        } catch (Exception e) {
+            System.err.println("⚠️ No se pudo parsear startDate '" + startDateStr + "': " + e.getMessage());
+            return null;
         }
     }
 }

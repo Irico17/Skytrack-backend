@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.file.*;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
@@ -16,7 +17,6 @@ import java.util.stream.Stream;
 /**
  * Servicio de carga de datos desde archivos .txt hacia objetos en memoria.
  * Abstrae los Uploaders existentes para ser consumidos por los Services de negocio.
- * En el futuro, esta capa puede leer desde BD o API externa.
  */
 @Service
 public class DataLoadingService {
@@ -34,26 +34,19 @@ public class DataLoadingService {
     private final FlightPlanUploader flightUploader = new FlightPlanUploader();
     private final ShipmentUploader shipmentUploader = new ShipmentUploader();
 
-    /**
-     * Carga todos los aeropuertos desde el archivo configurado.
-     */
+    /** Carga todos los aeropuertos desde el archivo configurado. */
     public List<Airport> loadAirports() throws IOException {
         return airportUploader.loadAirports(airportsPath);
     }
 
-    /**
-     * Crea un AirportManager a partir de la lista de aeropuertos.
-     */
+    /** Crea un AirportManager a partir de la lista de aeropuertos. */
     public AirportManager createAirportManager(List<Airport> airports) {
         AirportManager manager = new AirportManager();
         airports.forEach(manager::addAirport);
         return manager;
     }
 
-    /**
-     * Crea un ClientRegistry a partir de los aeropuertos.
-     * Registra cada aeropuerto como un cliente del sistema.
-     */
+    /** Crea un ClientRegistry a partir de los aeropuertos. */
     public ClientRegistry createClientRegistry(List<Airport> airports) {
         ClientRegistry registry = new ClientRegistry();
         airports.forEach(a -> registry.addClient(
@@ -62,20 +55,44 @@ public class DataLoadingService {
         return registry;
     }
 
-
-    /**
-     * Carga el plan de vuelos usando los aeropuertos ya cargados.
-     */
+    /** Carga el plan de vuelos usando los aeropuertos ya cargados. */
     public FlightPlan loadFlightPlan(AirportManager airportManager) throws IOException {
         return flightUploader.loadFlights(flightsPath, airportManager);
     }
 
     /**
-     * Carga todos los envíos del directorio configurado.
-     * Itera sobre todos los archivos _envios_XXXX_.txt del directorio.
+     * Carga TODOS los envíos del directorio configurado.
      */
     public List<ShipmentBatch> loadAllShipments(AirportManager airportManager,
                                                  ClientRegistry clientRegistry) throws IOException {
+        return loadShipmentsFiltered(airportManager, clientRegistry, null, null);
+    }
+
+    /**
+     * Carga envíos filtrados por ventana de tiempo [startInclusive, endExclusive).
+     * Si ambos son null carga todos (equivalente a loadAllShipments).
+     * Uso: simulación de 5 días — solo carga lotes del período elegido.
+     */
+    public List<ShipmentBatch> loadShipmentsInRange(AirportManager airportManager,
+                                                     ClientRegistry clientRegistry,
+                                                     ZonedDateTime startInclusive,
+                                                     ZonedDateTime endExclusive) throws IOException {
+        return loadShipmentsFiltered(airportManager, clientRegistry, startInclusive, endExclusive);
+    }
+
+    /** Construye una ShipmentQueue a partir de una lista de batches. */
+    public ShipmentQueue buildQueue(List<ShipmentBatch> batches) {
+        ShipmentQueue queue = new ShipmentQueue();
+        batches.forEach(queue::addShipment);
+        return queue;
+    }
+
+    // ===== PRIVATE =====
+
+    private List<ShipmentBatch> loadShipmentsFiltered(AirportManager airportManager,
+                                                        ClientRegistry clientRegistry,
+                                                        ZonedDateTime start,
+                                                        ZonedDateTime end) throws IOException {
         List<ShipmentBatch> all = new ArrayList<>();
         Path dir = Paths.get(shipmentsDir);
 
@@ -85,11 +102,22 @@ public class DataLoadingService {
 
         try (Stream<Path> files = Files.list(dir)) {
             files.filter(p -> p.getFileName().toString().startsWith("_envios_")
-                           && p.getFileName().toString().endsWith("_.txt"))
+                               && p.getFileName().toString().endsWith("_.txt"))
                  .forEach(file -> {
                      try {
                          List<ShipmentBatch> batches = shipmentUploader.loadShipments(
                              file.toString(), airportManager, clientRegistry);
+                         // Filtrar por rango si se especificó
+                         if (start != null || end != null) {
+                             batches = batches.stream()
+                                 .filter(b -> {
+                                     ZonedDateTime t = b.ingressTime();
+                                     if (start != null && t.isBefore(start)) return false;
+                                     if (end != null && !t.isBefore(end)) return false;
+                                     return true;
+                                 })
+                                 .toList();
+                         }
                          all.addAll(batches);
                      } catch (Exception e) {
                          System.err.println("⚠️ Error cargando " + file.getFileName() + ": " + e.getMessage());
@@ -97,16 +125,10 @@ public class DataLoadingService {
                  });
         }
 
-        System.out.printf("✓ Cargados %,d lotes desde %s%n", all.size(), shipmentsDir);
+        String rangeMsg = (start != null)
+            ? String.format(" [%s → %s]", start.toLocalDate(), end != null ? end.toLocalDate() : "∞")
+            : " (todos)";
+        System.out.printf("✓ Cargados %,d lotes%s desde %s%n", all.size(), rangeMsg, shipmentsDir);
         return all;
-    }
-
-    /**
-     * Construye una ShipmentQueue a partir de una lista de batches.
-     */
-    public ShipmentQueue buildQueue(List<ShipmentBatch> batches) {
-        ShipmentQueue queue = new ShipmentQueue();
-        batches.forEach(queue::addShipment);
-        return queue;
     }
 }

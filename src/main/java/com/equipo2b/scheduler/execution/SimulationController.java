@@ -56,6 +56,10 @@ public class SimulationController {
     
     // Almacena los lotes procesados para persistencia final
     private List<ShipmentBatch> currentBatches;
+
+    // Fecha de inicio para calcular días transcurridos
+    private ZonedDateTime startDate;
+    private volatile double daysElapsed = 0.0;
     
     /**
      * Constructor del SimulationController.
@@ -114,7 +118,7 @@ public class SimulationController {
         );
         
         // Inicializar estado
-        this.simulatedTime = currentBatches.get(0).ingressTime();
+        this.simulatedTime = startDate != null ? startDate : currentBatches.get(0).ingressTime();
         this.currentCycle = 0;
         this.batchesProcessed = 0;
         this.batchesFailed = 0;
@@ -336,6 +340,21 @@ public class SimulationController {
     }
 
     /**
+     * Establece la fecha de inicio para cálculo de días transcurridos.
+     * Llamar ANTES de startSimulation.
+     */
+    public void setStartDate(ZonedDateTime startDate) {
+        this.startDate = startDate;
+    }
+
+    /**
+     * Retorna los días transcurridos en la simulación (0.0–5.0).
+     */
+    public double getDaysElapsed() {
+        return daysElapsed;
+    }
+
+    /**
      * Retorna los lotes actuales preparados para esta simulación.
      */
     public List<ShipmentBatch> getCurrentBatches() {
@@ -356,6 +375,9 @@ public class SimulationController {
      */
     private void runSimulation(ScenarioType scenario) {
         try {
+            long simStartRealMs = System.currentTimeMillis();
+            long simStartSimMs = simulatedTime.toInstant().toEpochMilli();
+
             while (running.get()) {
                 // Esperar si está pausado
                 while (paused.get() && running.get()) {
@@ -364,25 +386,29 @@ public class SimulationController {
                 
                 if (!running.get()) break;
                 
-                // Ejecutar ciclo de planificación
+                // =========== INICIO DEL CICLO ===========
                 currentCycle++;
+                long cycleStartRealMs = System.currentTimeMillis();
                 System.out.println("\n--- CICLO " + currentCycle + " ---");
                 
+                // 1. Ejecutar algoritmo (hasta Ta minutos reales máximo)
                 currentSolution = scheduler.executePlanningCycle(simulatedTime);
+                long algorithmMs = System.currentTimeMillis() - cycleStartRealMs;
 
                 // Actualizar estadísticas
                 batchesProcessed = currentSolution.getRoutes().size();
 
-                // Avanzar tiempo simulado
-                simulatedTime = simulatedTime.plusMinutes(scenario.getSa());
+                // 2. Avanzar tiempo simulado: basado en tiempo real transcurrido × K
+                //    Esto asegura que el reloj del backend coincida con el del frontend
+                updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
 
-                // Verificar colapso
+                // 3. Verificar colapso
                 CollapseDetector detector = new CollapseDetector();
                 CollapseStatus collapseStatus = detector.evaluateCollapse(
                     currentSolution, batchesProcessed, batchesFailed
                 );
 
-                // Notificar listener (WebSocket) al final de cada ciclo
+                // 4. Notificar listener (WebSocket) INMEDIATAMENTE cuando el algoritmo termina
                 if (listener != null) {
                     try {
                         listener.onCycleCompleted(getStatus(), currentSolution);
@@ -392,12 +418,35 @@ public class SimulationController {
                 }
 
                 if (collapseStatus.isCollapsed()) {
-                    System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
-                    break;
+                    if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                        System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
+                        break;
+                    } else {
+                        System.out.println("⚠️  Alerta de colapso (informativo) - la simulación continúa");
+                    }
                 }
                 
-                // Simular tiempo de espera entre ciclos (para visualización)
-                Thread.sleep(1000); // 1 segundo entre ciclos
+                // 5. Condición de parada natural para simulación de 5 días
+                if (scenario == ScenarioType.PERIOD_SIMULATION && daysElapsed >= 5.0) {
+                    System.out.println("\n✅ Simulación de 5 días completada (días transcurridos: " 
+                        + String.format("%.2f", daysElapsed) + ")");
+                    break;
+                }
+
+                // 6. Esperar Sa minutos reales desde el INICIO del ciclo (no desde el fin del algoritmo)
+                //    Esto mantiene el ritmo constante: ciclos cada Sa minutos reales
+                long saMs = scenario.getSa() * 60_000L;
+                long elapsedInCycleMs = System.currentTimeMillis() - cycleStartRealMs;
+                long remainingMs = saMs - elapsedInCycleMs;
+
+                if (remainingMs > 0) {
+                    System.out.printf("⏳ Algoritmo terminó en %.1fs — esperando %.1fs hasta el siguiente ciclo (Sa=%d min)%n",
+                        algorithmMs / 1000.0, remainingMs / 1000.0, scenario.getSa());
+                    sleepUntilNextCycle(remainingMs, simStartRealMs, simStartSimMs, scenario);
+                } else {
+                    System.out.printf("⚠️ Algoritmo tardó %.1fs (> Sa=%d min) — siguiente ciclo inmediato%n",
+                        algorithmMs / 1000.0, scenario.getSa());
+                }
             }
             
         } catch (InterruptedException e) {
@@ -558,9 +607,85 @@ public class SimulationController {
         void onCycleCompleted(SimulationStatus status, Solution solution);
 
         /**
+         * Llamado periodicamente mientras avanza el reloj simulado.
+         */
+        void onStorageUpdated(SimulationStatus status, Solution solution);
+
+        /**
          * Llamado cuando la simulación termina (por fin de datos, colapso o stop manual).
          * @param status Estado final
          */
         void onSimulationFinished(SimulationStatus status);
+    }
+
+    /**
+     * Duerme por el tiempo indicado pero revisa running/paused cada segundo,
+     * permitiendo cancelación o pausa inmediata durante las esperas largas (Ta, Sa).
+     */
+    private void sleepInterruptibly(long totalMs) throws InterruptedException {
+        long remaining = totalMs;
+        while (remaining > 0 && running.get()) {
+            // Si está pausado, no consumir el tiempo de espera
+            while (paused.get() && running.get()) {
+                Thread.sleep(100);
+            }
+            if (!running.get()) return;
+
+            long chunk = Math.min(remaining, 1000);
+            Thread.sleep(chunk);
+            remaining -= chunk;
+        }
+    }
+
+    private void sleepUntilNextCycle(
+            long totalMs,
+            long simStartRealMs,
+            long simStartSimMs,
+            ScenarioType scenario) throws InterruptedException {
+        long remaining = totalMs;
+        while (remaining > 0 && running.get()) {
+            while (paused.get() && running.get()) {
+                Thread.sleep(100);
+            }
+            if (!running.get()) return;
+
+            long chunk = Math.min(remaining, 1000);
+            Thread.sleep(chunk);
+            remaining -= chunk;
+
+            updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
+            if (listener != null) {
+                try {
+                    listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
+                } catch (Exception e) {
+                    System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private void updateSimulatedClock(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {
+        long realElapsedMs = System.currentTimeMillis() - simStartRealMs;
+        long simElapsedMs = realElapsedMs * scenario.getK();
+        simulatedTime = java.time.Instant.ofEpochMilli(simStartSimMs + simElapsedMs)
+            .atZone(startDate != null ? startDate.getZone() : java.time.ZoneOffset.UTC);
+
+        if (startDate != null) {
+            long minutesElapsed = java.time.Duration.between(startDate, simulatedTime).toMinutes();
+            daysElapsed = Math.min(5.0, minutesElapsed / (24.0 * 60.0));
+        }
+    }
+
+    private SimulationStatus buildLightweightStatus() {
+        return new SimulationStatus(
+            running.get(),
+            paused.get(),
+            currentCycle,
+            simulatedTime,
+            batchesProcessed,
+            batchesFailed,
+            currentSolution.getFitness(),
+            CollapseLevel.NORMAL
+        );
     }
 }

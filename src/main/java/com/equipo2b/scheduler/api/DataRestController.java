@@ -1,13 +1,19 @@
 package com.equipo2b.scheduler.api;
 
 import com.equipo2b.scheduler.model.Airport;
+import com.equipo2b.scheduler.model.AirportManager;
 import com.equipo2b.scheduler.model.Flight;
+import com.equipo2b.scheduler.model.FlightPlan;
 import com.equipo2b.scheduler.persistence.DataImportService;
 import com.equipo2b.scheduler.service.DataLoadingService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -49,6 +55,53 @@ public class DataRestController {
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Error cargando aeropuertos: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Retorna todos los vuelos del plan de vuelos proyectados a un rango de fechas.
+     * Los vuelos se repiten cada día. Cada instancia tiene un ID único (base-D{day}).
+     *
+     * @param startDate Fecha de inicio (yyyy-MM-dd)
+     * @param days Número de días a proyectar (default 5)
+     */
+    @GetMapping("/flights")
+    public ResponseEntity<?> getFlights(
+            @RequestParam String startDate,
+            @RequestParam(defaultValue = "5") int days) {
+        try {
+            List<Airport> airports = dataService.loadAirports();
+            AirportManager manager = dataService.createAirportManager(airports);
+            FlightPlan flightPlan = dataService.loadFlightPlan(manager);
+
+            LocalDate start = LocalDate.parse(startDate);
+            ZonedDateTime windowStart = start.atStartOfDay(ZoneOffset.UTC);
+            ZonedDateTime windowEnd = start.plusDays(days).atStartOfDay(ZoneOffset.UTC);
+
+            // Proyectar todos los vuelos en un solo pase (eficiente)
+            List<Flight> projected = flightPlan.getAllFlightsProjected(windowStart, windowEnd);
+            List<Map<String, Object>> result = new ArrayList<>();
+            for (Flight f : projected) {
+                result.add(Map.of(
+                    "flightId", f.flightId(),
+                    "originId", f.origin().id(),
+                    "destinationId", f.destination().id(),
+                    "departureTime", f.departureTime().toString(),
+                    "arrivalTime", f.arrivalTime().toString(),
+                    "capacity", f.capacity(),
+                    "type", f.type().name()
+                ));
+            }
+
+            return ResponseEntity.ok(Map.of(
+                "flights", result,
+                "totalFlights", result.size(),
+                "startDate", startDate,
+                "days", days
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error proyectando vuelos: " + e.getMessage()));
         }
     }
 

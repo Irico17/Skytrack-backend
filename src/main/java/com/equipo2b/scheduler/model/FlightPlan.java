@@ -132,7 +132,45 @@ public class FlightPlan {
     }
 
     /**
-     * Obtiene todos los vuelos del plan.
+     * Proyecta TODOS los vuelos base a un rango de fechas.
+     * Más eficiente que llamar getFlightsFromAirport() por cada aeropuerto.
+     * 
+     * @param start Inicio del rango (inclusive)
+     * @param end Fin del rango (exclusive)
+     * @return Lista de todos los vuelos proyectados con fechas ajustadas
+     */
+    public List<Flight> getAllFlightsProjected(ZonedDateTime start, ZonedDateTime end) {
+        List<Flight> projected = new ArrayList<>();
+        for (Flight baseFlight : allFlights) {
+            long daysDiff = java.time.temporal.ChronoUnit.DAYS.between(
+                baseFlight.departureTime().toLocalDate(),
+                start.toLocalDate()
+            );
+            for (long dayOffset = daysDiff - 2; dayOffset <= daysDiff + 7; dayOffset++) {
+                ZonedDateTime adjustedDep = baseFlight.departureTime().plusDays(dayOffset);
+                ZonedDateTime adjustedArr = baseFlight.arrivalTime().plusDays(dayOffset);
+                
+                // Incluir vuelo si su LLEGADA es después del inicio, y su SALIDA es antes del fin.
+                // Esto garantiza que los vuelos que empezaron el día anterior y siguen volando se muestren.
+                if (adjustedArr.isAfter(start) && adjustedDep.isBefore(end)) {
+                    String adjustedId = baseFlight.flightId() + "-D" + dayOffset;
+                    if (cancelledFlightIds.contains(adjustedId)) continue;
+                    projected.add(new Flight(
+                        adjustedId,
+                        baseFlight.origin(),
+                        baseFlight.destination(),
+                        adjustedDep, adjustedArr,
+                        baseFlight.capacity(),
+                        baseFlight.type()
+                    ));
+                }
+            }
+        }
+        return projected;
+    }
+
+    /**
+     * Obtiene todos los vuelos del plan (base, sin proyectar).
      * 
      * @return Lista inmutable de todos los vuelos
      */

@@ -130,13 +130,23 @@ public class CollapseDetector {
             return realOccupancy * 100.0;  // Convertir a porcentaje
         }
 
-        // Fallback: normalizar fitness (menos preciso pero no requiere monitor)
+        // Fallback: estimar ocupación basada en fitness (menos preciso pero no requiere monitor)
+        // Fitness negativo = sistema saludable (entregas a tiempo generan recompensa negativa).
+        // Más negativo → más sano → menor ocupación.
+        // Fitness positivo = penalizaciones superan recompensas → sistema saturado.
         double fitness = solution.getFitness();
         if (fitness >= 0) {
             return 85.0;  // Fitness >= 0 indica alta saturación
         }
-        // Mapear fitness negativo a ocupación
-        return Math.min(80.0, Math.abs(fitness) / 2000.0);
+        // Escala razonable: fitness de -100K+ es operación normal → baja ocupación.
+        // Sólo preocuparse cuando fitness se acerca a 0 (penalizaciones crecen).
+        // Mapeo: -200K → ~10%, -100K → ~20%, -10K → ~60%, -1K → ~75%
+        double absFitness = Math.abs(fitness);
+        if (absFitness > 100_000) {
+            return 10.0 + (100_000.0 / absFitness) * 15.0;  // 10–25%
+        }
+        // Para fitness entre 0 y -100K, mapear linealmente a 25–80%
+        return 25.0 + (1.0 - absFitness / 100_000.0) * 55.0;
     }
     
     /**

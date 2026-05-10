@@ -33,7 +33,7 @@ public class AirportUploader {
         Continent continent = null;
         int lineNumber = 0;
         
-        try (Stream<String> lines = Files.lines(path, StandardCharsets.ISO_8859_1)) {
+        try (Stream<String> lines = Files.lines(path, StandardCharsets.UTF_8)) {
             List<String> lineList = lines.collect(Collectors.toList());
             
             for (String line : lineList) {
@@ -128,26 +128,25 @@ public class AirportUploader {
 
     private double extractCoordinate(String line, String key) {
         try {
-            int start = line.indexOf(key) + key.length();
-            int end = line.indexOf("\"", start) + 1;
-            String coordStr = line.substring(start, end).trim();
-            return convertDMSToDecimal(coordStr);
+            int keyIdx = line.indexOf(key);
+            if (keyIdx < 0) return 0.0;
+            // Buscar desde después de "Latitude:" o "Longitude:"
+            String rest = line.substring(keyIdx + key.length()).trim();
+            // Usar regex para capturar: grados, minutos, segundos y dirección
+            // Formato: 04° 42' 05" N  (el ° puede ser el carácter real o variante UTF)
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(\\d+)[^\\d]+(\\d+)'\\s*(\\d+(?:\\.\\d+)?)\"\\s*([NSEW])")
+                .matcher(rest);
+            if (!m.find()) return 0.0;
+            double deg = Double.parseDouble(m.group(1));
+            double min = Double.parseDouble(m.group(2));
+            double sec = Double.parseDouble(m.group(3));
+            String dir = m.group(4);
+            double decimal = deg + (min / 60.0) + (sec / 3600.0);
+            if (dir.equals("S") || dir.equals("W")) decimal *= -1;
+            return decimal;
         } catch (Exception e) {
             return 0.0;
         }
-    }
-
-    private double convertDMSToDecimal(String dms) {
-        String[] parts = dms.split("[°'\"\\s]+");
-        double degrees = Double.parseDouble(parts[0]);
-        double minutes = Double.parseDouble(parts[1]);
-        double seconds = Double.parseDouble(parts[2]);
-        String direction = parts[3];
-
-        double decimal = degrees + (minutes / 60) + (seconds / 3600);
-        if (direction.equals("S") || direction.equals("W")) {
-            decimal *= -1;
-        }
-        return decimal;
     }
 }

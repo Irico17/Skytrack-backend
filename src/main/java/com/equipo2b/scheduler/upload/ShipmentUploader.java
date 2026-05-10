@@ -157,10 +157,11 @@ public class ShipmentUploader {
             );
         }
         
-        // Validar que el cliente exista
+        // Auto-registrar cliente si no existe — los IDs de cliente vienen solo
+        // en los archivos de envíos, no hay catálogo externo de clientes.
         if (!clientRegistry.validateClientExists(clientId)) {
-            throw new IllegalArgumentException(
-                String.format("Cliente '%s' no encontrado en el registro", clientId)
+            clientRegistry.addClient(
+                new com.equipo2b.scheduler.model.AirlineClient(clientId, "Cliente " + clientId, "", "")
             );
         }
         

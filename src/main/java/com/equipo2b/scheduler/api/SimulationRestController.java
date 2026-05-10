@@ -1,6 +1,7 @@
 package com.equipo2b.scheduler.api;
 
 import com.equipo2b.scheduler.api.dto.*;
+import com.equipo2b.scheduler.service.SimulationResultExporter;
 import com.equipo2b.scheduler.service.SimulationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -19,6 +20,7 @@ import java.util.Map;
  *   GET  /api/simulations/{id}/status     — Estado actual
  *   GET  /api/simulations/{id}/solution   — Solución actual con rutas
  *   GET  /api/simulations/{id}/metrics    — Semáforos de capacidad
+ *   GET  /api/simulations/{id}/results    — Resultados finales (desde archivo JSON)
  */
 @RestController
 @RequestMapping("/api/simulations")
@@ -28,18 +30,43 @@ public class SimulationRestController {
     @Autowired
     private SimulationService simulationService;
 
+    @Autowired
+    private SimulationResultExporter resultExporter;
+
     /**
      * Inicia una nueva simulación.
-     * Body: { "scenario": "DAY_TO_DAY" | "PERIOD_SIMULATION" | "COLLAPSE_SIMULATION" }
+     * Body: { "scenario": "PERIOD_SIMULATION", "startDate": "2026-01-15" }
+     * startDate es opcional: si se omite, usa todos los datos disponibles.
      */
     @PostMapping("/start")
-    public ResponseEntity<Map<String, String>> start(@RequestBody SimulationRequestDTO req) {
+    public ResponseEntity<Map<String, Object>> start(@RequestBody SimulationRequestDTO req) {
         try {
-            String simId = simulationService.startSimulation(req.scenario());
+            String simId = simulationService.startSimulation(req.scenario(), req.startDate());
+            var scenario = com.equipo2b.scheduler.execution.ScenarioType.valueOf(req.scenario());
+
+            // Calcular hora de inicio simulada (00:00 UTC del startDate, o ahora)
+            String simStartTime;
+            if (req.startDate() != null && !req.startDate().isBlank()) {
+                simStartTime = java.time.LocalDate.parse(req.startDate())
+                    .atStartOfDay(java.time.ZoneOffset.UTC).toString();
+            } else {
+                simStartTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).toString();
+            }
+
+            // Tiempo total real: 5 días × 24 × 60 / K
+            int totalSimMinutes = 5 * 24 * 60; // 7200
+            double totalRealMinutes = (double) totalSimMinutes / scenario.getK();
+
             return ResponseEntity.ok(Map.of(
                 "simulationId", simId,
                 "message", "Simulación iniciada exitosamente",
-                "scenario", req.scenario()
+                "scenario", req.scenario(),
+                "K", scenario.getK(),
+                "Ta", scenario.getTa(),
+                "Sa", scenario.getSa(),
+                "Sc", scenario.getSc(),
+                "simStartTime", simStartTime,
+                "totalRealMinutes", totalRealMinutes
             ));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest()
@@ -47,13 +74,10 @@ public class SimulationRestController {
                     + ". Use: DAY_TO_DAY, PERIOD_SIMULATION, COLLAPSE_SIMULATION"));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
-                .body(Map.of("error", e.getMessage()));
+                .body(Map.of("error", (Object) e.getMessage()));
         }
     }
 
-    /**
-     * Detiene la simulación activa.
-     */
     @PostMapping("/{id}/stop")
     public ResponseEntity<Map<String, String>> stop(@PathVariable String id) {
         try {
@@ -64,9 +88,6 @@ public class SimulationRestController {
         }
     }
 
-    /**
-     * Pausa la simulación activa.
-     */
     @PostMapping("/{id}/pause")
     public ResponseEntity<Map<String, String>> pause(@PathVariable String id) {
         try {
@@ -77,9 +98,6 @@ public class SimulationRestController {
         }
     }
 
-    /**
-     * Reanuda la simulación pausada.
-     */
     @PostMapping("/{id}/resume")
     public ResponseEntity<Map<String, String>> resume(@PathVariable String id) {
         try {
@@ -90,9 +108,6 @@ public class SimulationRestController {
         }
     }
 
-    /**
-     * Retorna el estado actual de la simulación.
-     */
     @GetMapping("/{id}/status")
     public ResponseEntity<SimulationStatusDTO> getStatus(@PathVariable String id) {
         try {
@@ -102,9 +117,6 @@ public class SimulationRestController {
         }
     }
 
-    /**
-     * Retorna la solución actual con todas las rutas asignadas.
-     */
     @GetMapping("/{id}/solution")
     public ResponseEntity<SolutionDTO> getSolution(@PathVariable String id) {
         try {
@@ -114,15 +126,30 @@ public class SimulationRestController {
         }
     }
 
-    /**
-     * Retorna las métricas de semáforo (vuelos, almacenes, SLA).
-     */
     @GetMapping("/{id}/metrics")
     public ResponseEntity<SemaphoreDTO> getMetrics(@PathVariable String id) {
         try {
             return ResponseEntity.ok(simulationService.getSemaphores(id));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.notFound().build();
+        }
+    }
+
+    /**
+     * Retorna el resumen final de una simulación de 5 días.
+     * Lee el archivo JSON exportado al terminar la simulación.
+     */
+    @GetMapping("/{id}/results")
+    public ResponseEntity<?> getResults(@PathVariable String id) {
+        try {
+            SimulationResultsDTO results = resultExporter.readResults(id);
+            if (results == null) {
+                return ResponseEntity.notFound().build();
+            }
+            return ResponseEntity.ok(results);
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error leyendo resultados: " + e.getMessage()));
         }
     }
 }

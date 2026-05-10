@@ -224,8 +224,8 @@ public class Scheduler {
             // Ejecutar ciclo de planificación
             executePlanningCycle(currentTime);
             
-            // Avanzar tiempo en Sa minutos
-            currentTime = currentTime.plusMinutes(Sa);
+            // Avanzar tiempo simulado en Sc minutos (= Sa × K)
+            currentTime = currentTime.plusMinutes(Sc);
             
             // Verificar límite de ciclos
             if (maxCycles > 0 && cycle >= maxCycles) {

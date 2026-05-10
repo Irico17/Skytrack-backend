@@ -1,0 +1,60 @@
+{
+  "simulationId" : "ee27374e-ecdf-4aa2-8757-cdb7b9def68d",
+  "scenario" : "PERIOD_SIMULATION",
+  "startDate" : "2026-05-09",
+  "endDate" : "2026-05-14",
+  "completedAt" : "2026-05-09T20:04:01.9210536-05:00",
+  "fitness" : -174250.0,
+  "totalBatches" : 500,
+  "routedBatches" : 71,
+  "unroutableBatches" : 429,
+  "slaCompliancePercent" : 100.0,
+  "totalCycles" : 3,
+  "algorithmUsed" : "GATS",
+  "daySnapshots" : [ {
+    "day" : 1,
+    "date" : "2026-05-09",
+    "routesCompleted" : 55,
+    "batchesOnTime" : 55,
+    "batchesDelayed" : 0,
+    "batchesCritical" : 0,
+    "avgFitness" : -174250.0,
+    "collapseLevel" : "NORMAL"
+  }, {
+    "day" : 2,
+    "date" : "2026-05-10",
+    "routesCompleted" : 16,
+    "batchesOnTime" : 16,
+    "batchesDelayed" : 0,
+    "batchesCritical" : 0,
+    "avgFitness" : -174250.0,
+    "collapseLevel" : "NORMAL"
+  }, {
+    "day" : 3,
+    "date" : "2026-05-11",
+    "routesCompleted" : 0,
+    "batchesOnTime" : 0,
+    "batchesDelayed" : 0,
+    "batchesCritical" : 0,
+    "avgFitness" : -174250.0,
+    "collapseLevel" : "NORMAL"
+  }, {
+    "day" : 4,
+    "date" : "2026-05-12",
+    "routesCompleted" : 0,
+    "batchesOnTime" : 0,
+    "batchesDelayed" : 0,
+    "batchesCritical" : 0,
+    "avgFitness" : -174250.0,
+    "collapseLevel" : "NORMAL"
+  }, {
+    "day" : 5,
+    "date" : "2026-05-13",
+    "routesCompleted" : 0,
+    "batchesOnTime" : 0,
+    "batchesDelayed" : 0,
+    "batchesCritical" : 0,
+    "avgFitness" : -174250.0,
+    "collapseLevel" : "NORMAL"
+  } ]
+}

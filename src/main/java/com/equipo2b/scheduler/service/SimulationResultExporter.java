@@ -1,0 +1,151 @@
+package com.equipo2b.scheduler.service;
+
+import com.equipo2b.scheduler.api.dto.SimulationResultsDTO;
+import com.equipo2b.scheduler.execution.ScenarioType;
+import com.equipo2b.scheduler.model.AssignedRoute;
+import com.equipo2b.scheduler.model.Solution;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Exporta los resultados finales de una simulación de 5 días a un archivo JSON.
+ * Estrategia de persistencia ligera: sin BD, sin retener solución completa en RAM.
+ *
+ * Archivo generado: {data.results.dir}/sim_{simulationId}.json
+ */
+@Service
+public class SimulationResultExporter {
+
+    @Value("${data.results.dir:data/results}")
+    private String resultsDir;
+
+    private final ObjectMapper mapper;
+
+    public SimulationResultExporter() {
+        this.mapper = new ObjectMapper();
+        this.mapper.enable(SerializationFeature.INDENT_OUTPUT);
+        this.mapper.findAndRegisterModules(); // para ZonedDateTime via jackson-datatype-jsr310
+    }
+
+    /**
+     * Exporta el resumen de la simulación a disco.
+     * Llama a este método ANTES de liberar la solución de memoria.
+     *
+     * @param simId       ID único de la simulación
+     * @param scenario    Escenario ejecutado
+     * @param startDate   Fecha de inicio del rango de datos
+     * @param solution    Solución final del algoritmo
+     * @param totalBatches Total de lotes procesados
+     * @param totalCycles  Número de ciclos ejecutados
+     * @return Path del archivo generado
+     */
+    public Path exportResults(
+            String simId,
+            ScenarioType scenario,
+            ZonedDateTime startDate,
+            Solution solution,
+            int totalBatches,
+            int totalCycles
+    ) throws IOException {
+        // Crear directorio si no existe
+        Path dir = Paths.get(resultsDir);
+        Files.createDirectories(dir);
+
+        // Calcular métricas desde la solución
+        int routedBatches   = solution.getRoutes().size();
+        int unroutable      = Math.max(0, totalBatches - routedBatches);
+        long slaOk          = solution.getRoutes().values().stream()
+                                .filter(AssignedRoute::meetsSLA).count();
+        double slaCompliance = routedBatches > 0 ? (slaOk * 100.0 / routedBatches) : 0.0;
+
+        // Construir snapshots por día (agrupamos rutas por día de llegada)
+        List<SimulationResultsDTO.DaySnapshotDTO> snapshots = buildDaySnapshots(
+            solution, startDate, totalCycles
+        );
+
+        DateTimeFormatter fmt = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+        SimulationResultsDTO dto = new SimulationResultsDTO(
+            simId,
+            scenario.name(),
+            startDate != null ? startDate.toLocalDate().toString() : "N/A",
+            startDate != null ? startDate.plusDays(5).toLocalDate().toString() : "N/A",
+            ZonedDateTime.now().format(fmt),
+            solution.getFitness(),
+            totalBatches,
+            routedBatches,
+            unroutable,
+            slaCompliance,
+            totalCycles,
+            "GATS",
+            snapshots
+        );
+
+        Path file = dir.resolve("sim_" + simId + ".json");
+        mapper.writeValue(file.toFile(), dto);
+        System.out.println("✓ Resultados exportados a: " + file.toAbsolutePath());
+        return file;
+    }
+
+    /**
+     * Lee resultados previamente exportados desde disco.
+     *
+     * @param simId ID de la simulación
+     * @return DTO de resultados o null si no existe
+     */
+    public SimulationResultsDTO readResults(String simId) throws IOException {
+        Path file = Paths.get(resultsDir).resolve("sim_" + simId + ".json");
+        if (!Files.exists(file)) return null;
+        return mapper.readValue(file.toFile(), SimulationResultsDTO.class);
+    }
+
+    // ===== PRIVATE =====
+
+    private List<SimulationResultsDTO.DaySnapshotDTO> buildDaySnapshots(
+            Solution solution, ZonedDateTime startDate, int totalCycles) {
+
+        List<SimulationResultsDTO.DaySnapshotDTO> snapshots = new ArrayList<>();
+
+        for (int day = 1; day <= 5; day++) {
+            final int d = day;
+            ZonedDateTime dayStart = startDate != null ? startDate.plusDays(day - 1) : null;
+            ZonedDateTime dayEnd   = startDate != null ? startDate.plusDays(day) : null;
+
+            // Filtrar rutas cuya llegada cae dentro del día
+            long onTime  = solution.getRoutes().values().stream()
+                .filter(r -> r.meetsSLA()
+                    && (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
+                    && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
+                .count();
+            long delayed = solution.getRoutes().values().stream()
+                .filter(r -> !r.meetsSLA()
+                    && (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
+                    && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
+                .count();
+
+            String dateStr = dayStart != null ? dayStart.toLocalDate().toString() : "Day " + d;
+
+            snapshots.add(new SimulationResultsDTO.DaySnapshotDTO(
+                d,
+                dateStr,
+                (int)(onTime + delayed),   // routesCompleted
+                (int) onTime,
+                (int) delayed,
+                0,                          // critical — no tenemos ese tracking por ahora
+                solution.getFitness(),
+                "NORMAL"
+            ));
+        }
+        return snapshots;
+    }
+}
