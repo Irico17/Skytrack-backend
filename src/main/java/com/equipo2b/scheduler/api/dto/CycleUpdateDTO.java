@@ -20,6 +20,7 @@ public record CycleUpdateDTO(
     int totalBags,
     SemaphoreDTO semaphores,
     BatchSummaryDTO batchSummary,
+    OperationalMetricsDTO operationalMetrics,
     List<ActiveFlightDTO> activeFlights,      // vuelos con maletas asignadas
     List<AirportCapacityDTO> airportCapacities // ocupación actual de almacenes
 ) {
@@ -54,5 +55,21 @@ public record CycleUpdateDTO(
         int currentBags,         // maletas en almacén ahora
         int maxCapacity,         // capacidad máxima del almacén
         double occupancyRatio    // currentBags / maxCapacity (0.0 – 1.0+)
+    ) {}
+
+    /**
+     * Métricas operativas reales calculadas para el tiempo simulado actual.
+     */
+    public record OperationalMetricsDTO(
+        int totalAssignedBags,
+        int inFlightBags,
+        int storedBags,
+        int deliveredBags,
+        int pendingDeliveryBags,
+        int notDepartedBags,
+        int activeLoadedFlights,
+        int overloadedAirports,
+        String peakAirportId,
+        double peakAirportOccupancyRatio
     ) {}
 }

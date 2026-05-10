@@ -289,6 +289,7 @@ public class SimulationService implements SimulationController.SimulationListene
             solution.getTotalBags(),
             semaphores,
             new CycleUpdateDTO.BatchSummaryDTO((int) onTime, (int) delayed, unrouted),
+            buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities),
             activeFlights,
             airportCapacities
         );
@@ -303,13 +304,17 @@ public class SimulationService implements SimulationController.SimulationListene
     public void onStorageUpdated(SimulationStatus status, Solution solution) {
         if (webSocketHandler == null) return;
 
+        java.util.List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities =
+            buildAirportCapacities(solution, status.simulatedTime());
+
         StorageUpdateDTO update = new StorageUpdateDTO(
             "STORAGE_UPDATE",
             activeController.getSimulationId(),
             status.currentCycle(),
             status.simulatedTime() != null ? status.simulatedTime().toString() : null,
             activeController.getDaysElapsed(),
-            buildAirportCapacities(solution, status.simulatedTime())
+            airportCapacities,
+            buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities)
         );
 
         webSocketHandler.onStorageUpdated(update);
@@ -335,6 +340,71 @@ public class SimulationService implements SimulationController.SimulationListene
         }
 
         return airportCapacities;
+    }
+
+    private CycleUpdateDTO.OperationalMetricsDTO buildOperationalMetrics(
+            Solution solution,
+            ZonedDateTime simulatedTime,
+            java.util.List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities) {
+        if (solution == null || simulatedTime == null || solution.getRoutes().isEmpty()) {
+            return new CycleUpdateDTO.OperationalMetricsDTO(0, 0, 0, 0, 0, 0, 0, 0, null, 0.0);
+        }
+
+        int totalAssignedBags = solution.getTotalBags();
+        int inFlightBags = 0;
+        int deliveredBags = 0;
+        int notDepartedBags = 0;
+        java.util.Set<String> activeLoadedFlightIds = new java.util.HashSet<>();
+
+        for (AssignedRoute route : solution.getRoutes().values()) {
+            int quantity = route.getBatch().quantity();
+            java.util.List<com.equipo2b.scheduler.model.Flight> flights = route.getFlights();
+            if (flights.isEmpty()) continue;
+
+            ZonedDateTime firstDeparture = flights.get(0).departureTime();
+            if (simulatedTime.isBefore(firstDeparture)) {
+                notDepartedBags += quantity;
+            }
+
+            boolean currentlyFlying = flights.stream().anyMatch(f ->
+                !simulatedTime.isBefore(f.departureTime()) && simulatedTime.isBefore(f.arrivalTime())
+            );
+            if (currentlyFlying) {
+                inFlightBags += quantity;
+                flights.stream()
+                    .filter(f -> !simulatedTime.isBefore(f.departureTime()) && simulatedTime.isBefore(f.arrivalTime()))
+                    .map(com.equipo2b.scheduler.model.Flight::flightId)
+                    .forEach(activeLoadedFlightIds::add);
+            }
+
+            if (!simulatedTime.isBefore(route.getFinalArrivalTime().plusMinutes(30))) {
+                deliveredBags += quantity;
+            }
+        }
+
+        int storedBags = airportCapacities.stream()
+            .mapToInt(CycleUpdateDTO.AirportCapacityDTO::currentBags)
+            .sum();
+        int pendingDeliveryBags = Math.max(0, totalAssignedBags - deliveredBags);
+        int overloadedAirports = (int) airportCapacities.stream()
+            .filter(c -> c.occupancyRatio() >= 1.0)
+            .count();
+        CycleUpdateDTO.AirportCapacityDTO peak = airportCapacities.stream()
+            .max(java.util.Comparator.comparingDouble(CycleUpdateDTO.AirportCapacityDTO::occupancyRatio))
+            .orElse(null);
+
+        return new CycleUpdateDTO.OperationalMetricsDTO(
+            totalAssignedBags,
+            inFlightBags,
+            storedBags,
+            deliveredBags,
+            pendingDeliveryBags,
+            notDepartedBags,
+            activeLoadedFlightIds.size(),
+            overloadedAirports,
+            peak != null ? peak.airportId() : null,
+            peak != null ? peak.occupancyRatio() : 0.0
+        );
     }
 
     @Override

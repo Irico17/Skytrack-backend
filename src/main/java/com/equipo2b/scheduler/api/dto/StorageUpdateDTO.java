@@ -11,5 +11,6 @@ public record StorageUpdateDTO(
     int cycle,
     String simulatedTime,
     double daysElapsed,
-    List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities
+    List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities,
+    CycleUpdateDTO.OperationalMetricsDTO operationalMetrics
 ) {}
