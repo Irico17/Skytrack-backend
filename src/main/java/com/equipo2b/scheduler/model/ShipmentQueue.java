@@ -38,7 +38,7 @@ public class ShipmentQueue {
      * @param batch Lote de maletas a agregar
      * @throws NullPointerException si batch es null
      */
-    public void addShipment(ShipmentBatch batch) {
+    public synchronized void addShipment(ShipmentBatch batch) {
         if (batch == null) {
             throw new NullPointerException("ShipmentBatch cannot be null");
         }
@@ -63,7 +63,7 @@ public class ShipmentQueue {
      * @throws NullPointerException si start o end son null
      * @throws IllegalArgumentException si start >= end
      */
-    public List<ShipmentBatch> consumeShipments(ZonedDateTime start, ZonedDateTime end) {
+    public synchronized List<ShipmentBatch> consumeShipments(ZonedDateTime start, ZonedDateTime end) {
         if (start == null || end == null) {
             throw new NullPointerException("Start and end times cannot be null");
         }
@@ -93,7 +93,7 @@ public class ShipmentQueue {
      * 
      * @return Cantidad total de pedidos no consumidos
      */
-    public int getPendingCount() {
+    public synchronized int getPendingCount() {
         return timeIndex.values().stream()
                 .mapToInt(List::size)
                 .sum();

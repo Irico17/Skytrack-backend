@@ -252,6 +252,20 @@ public class Scheduler {
     public AlgorithmType getAlgorithmType() {
         return algorithmType;
     }
+
+    /**
+     * Agrega un nuevo lote transaccional a la cola para el próximo ciclo.
+     */
+    public void addShipment(ShipmentBatch batch) {
+        shipmentQueue.addShipment(batch);
+    }
+
+    /**
+     * Retorna la cantidad de lotes pendientes en cola.
+     */
+    public int getPendingCount() {
+        return shipmentQueue.getPendingCount();
+    }
     
     /**
      * Obtiene la solución actual del sistema.

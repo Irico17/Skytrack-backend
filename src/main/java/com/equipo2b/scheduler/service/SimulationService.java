@@ -5,16 +5,19 @@ import com.equipo2b.scheduler.api.websocket.SimulationWebSocketHandler;
 import com.equipo2b.scheduler.execution.*;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.monitoring.*;
+import com.equipo2b.scheduler.persistence.entity.SimulationEntity;
 import com.equipo2b.scheduler.persistence.repository.SimulationRepository;
 import com.equipo2b.scheduler.persistence.service.SolutionPersistenceService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Servicio principal que orquesta simulaciones logísticas.
@@ -150,7 +153,7 @@ public class SimulationService implements SimulationController.SimulationListene
     public SimulationStatusDTO getStatus(String simId) {
         validateSimId(simId);
         SimulationStatus status = activeController.getStatus();
-        int pending = currentQueue != null ? currentQueue.getPendingCount() : 0;
+        int pending = activeController != null ? activeController.getPendingCount() : 0;
 
         TrafficLightReport trafficReport = null;
         if (currentCapacityMonitor != null) {
@@ -170,6 +173,57 @@ public class SimulationService implements SimulationController.SimulationListene
         validateSimId(simId);
         Solution solution = getCurrentSolution();
         return DTOMapper.toSolutionDTO(solution);
+    }
+
+    /** Registra un lote manual en la simulación DAY_TO_DAY activa. */
+    public ShipmentDTO addShipment(String simId, ShipmentRequestDTO request) {
+        validateSimId(simId);
+        if (currentScenario != ScenarioType.DAY_TO_DAY) {
+            throw new IllegalArgumentException("Solo DAY_TO_DAY acepta carga manual de maletas");
+        }
+        if (request == null) {
+            throw new IllegalArgumentException("Request requerido");
+        }
+        if (request.originId() == null || request.originId().isBlank()) {
+            throw new IllegalArgumentException("originId es requerido");
+        }
+        if (request.destinationId() == null || request.destinationId().isBlank()) {
+            throw new IllegalArgumentException("destinationId es requerido");
+        }
+        if (request.originId().equals(request.destinationId())) {
+            throw new IllegalArgumentException("originId y destinationId deben ser diferentes");
+        }
+        if (request.quantity() <= 0) {
+            throw new IllegalArgumentException("quantity debe ser mayor que 0");
+        }
+
+        Airport origin = currentAirportManager.getAirport(request.originId());
+        Airport destination = currentAirportManager.getAirport(request.destinationId());
+        if (origin == null) {
+            throw new IllegalArgumentException("Aeropuerto origen no existe: " + request.originId());
+        }
+        if (destination == null) {
+            throw new IllegalArgumentException("Aeropuerto destino no existe: " + request.destinationId());
+        }
+
+        ZonedDateTime ingressTime = parseIngressTime(request.ingressTime());
+        String batchId = "UI-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+        String clientId = request.clientId() != null && !request.clientId().isBlank()
+            ? request.clientId()
+            : "UI";
+
+        ShipmentBatch batch = new ShipmentBatch(
+            batchId,
+            origin.id() + "-" + batchId,
+            clientId,
+            origin,
+            destination,
+            request.quantity(),
+            ingressTime
+        );
+
+        activeController.addShipment(batch);
+        return DTOMapper.toShipmentDTO(batch, "PENDING");
     }
 
     /** Retorna las métricas de semáforo. */
@@ -435,7 +489,16 @@ public class SimulationService implements SimulationController.SimulationListene
         } else if (currentScenario == ScenarioType.DAY_TO_DAY) {
             // DAY_TO_DAY: persistir en BD
             try {
+                SimulationEntity simulationEntity = buildSimulationEntity(
+                    simId, status, solution, batches, "PERSISTING"
+                );
+                simulationRepository.save(simulationEntity);
+
                 persistenceService.persistSolution(simId, solution, batches);
+
+                simulationEntity.setStatus("COMPLETED");
+                simulationEntity.setFinishedAt(LocalDateTime.now());
+                simulationRepository.save(simulationEntity);
                 System.out.println("✓ Persistencia en BD completada: " + simId);
             } catch (Exception e) {
                 System.err.println("❌ Error persistiendo en BD: " + e.getMessage());
@@ -443,6 +506,34 @@ public class SimulationService implements SimulationController.SimulationListene
             }
         }
         // COLLAPSE_SIMULATION: no persistir (descartamos)
+    }
+
+    private SimulationEntity buildSimulationEntity(
+            String simId,
+            SimulationStatus status,
+            Solution solution,
+            List<ShipmentBatch> batches,
+            String persistenceStatus) {
+        int totalBatches = batches != null ? batches.size() : 0;
+        int routedBatches = solution != null ? solution.getRoutes().size() : 0;
+        int unroutableBatches = Math.max(0, totalBatches - routedBatches);
+        long slaOk = solution != null
+            ? solution.getRoutes().values().stream().filter(AssignedRoute::meetsSLA).count()
+            : 0;
+        double slaCompliance = routedBatches > 0 ? (slaOk * 100.0 / routedBatches) : 0.0;
+
+        SimulationEntity entity = simulationRepository.findById(simId)
+            .orElseGet(() -> new SimulationEntity(simId, currentScenario.name()));
+        entity.setStatus(persistenceStatus);
+        entity.setCurrentCycle(status.currentCycle());
+        entity.setFinalFitness(solution != null ? solution.getFitness() : 0.0);
+        entity.setSlaCompliance(slaCompliance);
+        entity.setCollapseLevel(status.collapseLevel().name());
+        entity.setAlgorithmType(activeController != null ? activeController.getAlgorithmType() : "UNKNOWN");
+        entity.setTotalBatches(totalBatches);
+        entity.setRoutedBatches(routedBatches);
+        entity.setUnroutableBatches(unroutableBatches);
+        return entity;
     }
 
     // ===== INTERNAL =====
@@ -467,5 +558,17 @@ public class SimulationService implements SimulationController.SimulationListene
             System.err.println("⚠️ No se pudo parsear startDate '" + startDateStr + "': " + e.getMessage());
             return null;
         }
+    }
+
+    private ZonedDateTime parseIngressTime(String ingressTime) {
+        if (ingressTime != null && !ingressTime.isBlank()) {
+            try {
+                return ZonedDateTime.parse(ingressTime);
+            } catch (Exception e) {
+                throw new IllegalArgumentException("ingressTime debe ser ISO-8601 con zona horaria");
+            }
+        }
+        ZonedDateTime simulated = activeController != null ? activeController.getSimulatedTime() : null;
+        return simulated != null ? simulated : ZonedDateTime.now(ZoneOffset.UTC);
     }
 }

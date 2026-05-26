@@ -1,0 +1,21 @@
+.git
+.gitignore
+.gradle
+build
+bin
+out
+*.iml
+.idea
+.vscode
+
+# Local/generated data that should not be copied into the image build context.
+data/results
+experimentos-historicos
+build-cache
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Keep runtime data mounted through compose instead of baked into the image.

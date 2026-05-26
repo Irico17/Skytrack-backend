@@ -59,6 +59,20 @@ public class AlgorithmConfig {
         }
         parameters.put(key, value);
     }
+
+    /**
+     * Establece un parámetro booleano.
+     *
+     * @param key Nombre del parámetro
+     * @param value Valor booleano
+     * @throws NullPointerException si key es null
+     */
+    public void setBoolean(String key, boolean value) {
+        if (key == null) {
+            throw new NullPointerException("Key cannot be null");
+        }
+        parameters.put(key, value);
+    }
     
     /**
      * Obtiene un parámetro entero con valor por defecto.
@@ -104,6 +118,28 @@ public class AlgorithmConfig {
         Object value = parameters.get(key);
         if (value instanceof Double) {
             return (Double) value;
+        }
+        return defaultValue;
+    }
+
+    /**
+     * Obtiene un parámetro booleano con valor por defecto.
+     *
+     * <p>Si el parámetro no existe o no es booleano, retorna el valor por defecto.
+     *
+     * @param key Nombre del parámetro
+     * @param defaultValue Valor por defecto si el parámetro no existe
+     * @return Valor del parámetro o defaultValue
+     * @throws NullPointerException si key es null
+     */
+    public boolean getBoolean(String key, boolean defaultValue) {
+        if (key == null) {
+            throw new NullPointerException("Key cannot be null");
+        }
+
+        Object value = parameters.get(key);
+        if (value instanceof Boolean) {
+            return (Boolean) value;
         }
         return defaultValue;
     }

@@ -8,6 +8,9 @@ import com.equipo2b.scheduler.util.ShipmentGenerator;
 import com.equipo2b.scheduler.validation.RouteValidator;
 
 import java.time.ZonedDateTime;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.UUID;
@@ -24,6 +27,7 @@ import java.util.UUID;
  * **Validates: Requirements 21.1-21.5, 22.1-22.5, 24.1-24.5**
  */
 public class SimulationController {
+    private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
     
     // Componentes del sistema
     private final FlightPlan flightPlan;
@@ -41,6 +45,7 @@ public class SimulationController {
     private volatile Solution currentSolution;
     private TabuSearch tabuSearch;
     private RouteValidator validator;
+    private ScenarioType currentScenario;
 
     // Identificador único de la simulación activa
     private String simulationId;
@@ -91,8 +96,9 @@ public class SimulationController {
         System.out.println("INICIANDO SIMULACIÓN: " + scenario.getDescription());
         System.out.println("=".repeat(80));
         
+        this.currentScenario = scenario;
         // Preparar datos según el escenario y guardarlos para persistencia final
-        this.currentBatches = prepareData(scenario, historicalBatches);
+        this.currentBatches = new ArrayList<>(prepareData(scenario, historicalBatches));
         
         // Configurar algoritmos según el escenario
         GeneticAlgorithm ga = new GeneticAlgorithm(flightPlan, airportManager);
@@ -113,12 +119,14 @@ public class SimulationController {
         SolutionEvaluator evaluator = new SolutionEvaluator(flightPlan, airportManager);
         
         this.scheduler = SchedulerFactory.createGATSScheduler(
-            flightPlan, airportManager, queue, evaluator, validator,
+            ga, tabu, queue, evaluator, validator,
             scenario.getTa(), scenario.getSa(), scenario.getK()
         );
         
         // Inicializar estado
-        this.simulatedTime = startDate != null ? startDate : currentBatches.get(0).ingressTime();
+        this.simulatedTime = startDate != null
+            ? startDate
+            : (currentBatches.isEmpty() ? ZonedDateTime.now() : currentBatches.get(0).ingressTime());
         this.currentCycle = 0;
         this.batchesProcessed = 0;
         this.batchesFailed = 0;
@@ -128,6 +136,28 @@ public class SimulationController {
         // Ejecutar en thread separado
         simulationThread = new Thread(() -> runSimulation(scenario));
         simulationThread.start();
+    }
+
+    /**
+     * Registra un lote creado desde la operación día a día.
+     * El lote queda disponible para consumo en el siguiente ciclo de planificación.
+     */
+    public synchronized ShipmentBatch addShipment(ShipmentBatch batch) {
+        if (!running.get()) {
+            throw new IllegalStateException("No hay simulación activa");
+        }
+        if (currentScenario != ScenarioType.DAY_TO_DAY) {
+            throw new IllegalStateException("La carga transaccional de maletas solo está habilitada para DAY_TO_DAY");
+        }
+        if (scheduler == null) {
+            throw new IllegalStateException("Scheduler no inicializado");
+        }
+
+        currentBatches.add(batch);
+        scheduler.addShipment(batch);
+        System.out.printf("✓ Lote registrado desde UI: %s (%s → %s, %d maletas)%n",
+            batch.batchId(), batch.origin().id(), batch.destination().id(), batch.quantity());
+        return batch;
     }
     
     /**
@@ -354,6 +384,14 @@ public class SimulationController {
         return daysElapsed;
     }
 
+    public ZonedDateTime getSimulatedTime() {
+        return simulatedTime;
+    }
+
+    public int getPendingCount() {
+        return scheduler != null ? scheduler.getPendingCount() : 0;
+    }
+
     /**
      * Retorna los lotes actuales preparados para esta simulación.
      */
@@ -394,6 +432,7 @@ public class SimulationController {
                 // 1. Ejecutar algoritmo (hasta Ta minutos reales máximo)
                 currentSolution = scheduler.executePlanningCycle(simulatedTime);
                 long algorithmMs = System.currentTimeMillis() - cycleStartRealMs;
+                logResourceUsage(scenario, algorithmMs);
 
                 // Actualizar estadísticas
                 batchesProcessed = currentSolution.getRoutes().size();
@@ -467,6 +506,40 @@ public class SimulationController {
                     System.err.println("⚠️ Error notificando listener en finish: " + e.getMessage());
                 }
             }
+
+            releaseHeavyState(scenario);
+        }
+    }
+
+    private void logResourceUsage(ScenarioType scenario, long algorithmMs) {
+        MemoryUsage heap = MEMORY_BEAN.getHeapMemoryUsage();
+        long usedMb = heap.getUsed() / (1024 * 1024);
+        long committedMb = heap.getCommitted() / (1024 * 1024);
+        long maxMb = heap.getMax() / (1024 * 1024);
+        int routes = currentSolution != null ? currentSolution.getRoutes().size() : 0;
+        int currentBatchCount = currentBatches != null ? currentBatches.size() : 0;
+
+        System.out.printf(
+            "📊 Recursos ciclo %d [%s]: heap=%d/%d MB committed=%d MB, rutas=%d, lotes=%d, algoritmo=%.1fs%n",
+            currentCycle,
+            scenario.name(),
+            usedMb,
+            maxMb,
+            committedMb,
+            routes,
+            currentBatchCount,
+            algorithmMs / 1000.0
+        );
+    }
+
+    private void releaseHeavyState(ScenarioType scenario) {
+        if (scenario == ScenarioType.PERIOD_SIMULATION || scenario == ScenarioType.DAY_TO_DAY) {
+            currentBatches = Collections.emptyList();
+            currentSolution = new Solution();
+            scheduler = null;
+            tabuSearch = null;
+            validator = null;
+            System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name());
         }
     }
     
@@ -518,17 +591,19 @@ public class SimulationController {
                 gaConfig.setInt("populationSize", 20);
                 gaConfig.setInt("generations", 15);
                 gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setBoolean("parallelEnabled", false);
                 tabuConfig.setInt("maxIterations", 50);
                 tabuConfig.setInt("tabuTenure", 10);
                 tabuConfig.setInt("neighborhoodSize", 15);
                 break;
                 
             case PERIOD_SIMULATION:
-                // Configuración balanceada
+                // Configuración ajustada para VM 2 CPU / 2 GB
                 gaConfig.setInt("populationSize", 30);
-                gaConfig.setInt("generations", 20);
+                gaConfig.setInt("generations", 15);
                 gaConfig.setDouble("mutationRate", 0.1);
-                tabuConfig.setInt("maxIterations", 100);
+                gaConfig.setBoolean("parallelEnabled", false);
+                tabuConfig.setInt("maxIterations", 80);
                 tabuConfig.setInt("tabuTenure", 12);
                 tabuConfig.setInt("neighborhoodSize", 20);
                 break;
@@ -538,6 +613,9 @@ public class SimulationController {
                 gaConfig.setInt("populationSize", 40);
                 gaConfig.setInt("generations", 25);
                 gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setBoolean("parallelEnabled", true);
+                gaConfig.setInt("parallelMinProcessors", 3);
+                gaConfig.setInt("parallelPopulationThreshold", 40);
                 tabuConfig.setInt("maxIterations", 150);
                 tabuConfig.setInt("tabuTenure", 15);
                 tabuConfig.setInt("neighborhoodSize", 25);

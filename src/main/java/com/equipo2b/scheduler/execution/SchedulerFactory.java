@@ -47,25 +47,38 @@ public class SchedulerFactory {
             RouteValidator validator,
             int Ta, int Sa, int K) {
         
-        // Crear algoritmos
         GeneticAlgorithm ga = new GeneticAlgorithm(flightPlan, airportManager);
         TabuSearch tabu = new TabuSearch(flightPlan, airportManager);
         
-        // Configurar parámetros balanceados con paralelización
-        // Con paralelización, podemos usar más evaluaciones sin penalización de tiempo
         AlgorithmConfig gaConfig = new AlgorithmConfig();
-        gaConfig.setInt("populationSize", 40);      // Balanceado: más que optimizado (30), menos que original (50)
-        gaConfig.setInt("generations", 80);         // Balanceado: más que optimizado (50), menos que original (100)
+        gaConfig.setInt("populationSize", 40);
+        gaConfig.setInt("generations", 80);
         gaConfig.setDouble("mutationRate", 0.1);
         gaConfig.setInt("tournamentSize", 4);
         gaConfig.setInt("eliteCount", 2);
         ga.configure(gaConfig);
         
         AlgorithmConfig tabuConfig = new AlgorithmConfig();
-        tabuConfig.setInt("maxIterations", 150);    // Balanceado: más que optimizado (100), menos que original (200)
+        tabuConfig.setInt("maxIterations", 150);
         tabuConfig.setInt("tabuTenure", 15);
         tabuConfig.setInt("neighborhoodSize", 20);
         tabu.configure(tabuConfig);
+
+        return createGATSScheduler(
+            ga, tabu, shipmentQueue, evaluator, validator, Ta, Sa, K
+        );
+    }
+
+    /**
+     * Crea Scheduler GATS reutilizando algoritmos ya configurados.
+     */
+    public static Scheduler createGATSScheduler(
+            GeneticAlgorithm ga,
+            TabuSearch tabu,
+            ShipmentQueue shipmentQueue,
+            SolutionEvaluator evaluator,
+            RouteValidator validator,
+            int Ta, int Sa, int K) {
         
         return new Scheduler(
             ga,                      // primaryAlgorithm = GA

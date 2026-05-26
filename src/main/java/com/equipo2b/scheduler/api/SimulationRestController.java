@@ -126,6 +126,20 @@ public class SimulationRestController {
         }
     }
 
+    @PostMapping("/{id}/shipments")
+    public ResponseEntity<?> addShipment(
+            @PathVariable String id,
+            @RequestBody ShipmentRequestDTO req) {
+        try {
+            return ResponseEntity.ok(simulationService.addShipment(id, req));
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error registrando envío: " + e.getMessage()));
+        }
+    }
+
     @GetMapping("/{id}/metrics")
     public ResponseEntity<SemaphoreDTO> getMetrics(@PathVariable String id) {
         try {

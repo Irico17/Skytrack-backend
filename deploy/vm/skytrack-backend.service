@@ -1,0 +1,25 @@
+[Unit]
+Description=Skytrack Scheduling Backend
+After=network-online.target mysql.service
+Wants=network-online.target
+Requires=mysql.service
+
+[Service]
+Type=simple
+User=skytrack
+Group=skytrack
+WorkingDirectory=/opt/skytrack/backend
+EnvironmentFile=/etc/skytrack/backend.env
+ExecStart=/bin/sh -c 'exec /usr/bin/java $JAVA_OPTS -jar /opt/skytrack/backend/scheduling-core.jar'
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5
+MemoryMax=1500M
+CPUQuota=180%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/skytrack/backend /tmp
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,83 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: scheduling-mysql
+    restart: unless-stopped
+    command:
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=25
+      - --performance-schema=OFF
+      - --skip-log-bin
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-scheduling_db}
+      MYSQL_USER: ${MYSQL_USER:-scheduling_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-scheduling_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 512m
+    cpus: 0.5
+    networks:
+      - scheduling
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scheduling-core:local
+    container_name: scheduling-backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: container
+      SERVER_PORT: 8080
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-scheduling_db}?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-scheduling_user}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-scheduling_password}
+      DATA_AIRPORTS_PATH: /app/data/c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt
+      DATA_FLIGHTS_PATH: /app/data/planes_vuelo.txt
+      DATA_SHIPMENTS_DIR: /app/data/_envios_preliminar_
+      DATA_RESULTS_DIR: /app/data/results
+      LOGGING_LEVEL_COM_EQUIPO2B: INFO
+      LOGGING_LEVEL_SPRING_WEB_SOCKET: INFO
+      JAVA_TOOL_OPTIONS: >-
+        -Xms256m -Xmx768m
+        -XX:+UseG1GC
+        -XX:ActiveProcessorCount=2
+        -XX:ParallelGCThreads=2
+        -XX:ConcGCThreads=1
+        -Dfile.encoding=UTF-8
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    volumes:
+      - ./data/c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt:/app/data/c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt:ro
+      - ./data/planes_vuelo.txt:/app/data/planes_vuelo.txt:ro
+      - ./data/_envios_preliminar_:/app/data/_envios_preliminar_:ro
+      - ./data/results:/app/data/results:rw
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    mem_limit: 1152m
+    cpus: 1.5
+    networks:
+      - scheduling
+
+volumes:
+  mysql-data:
+
+networks:
+  scheduling:
+    driver: bridge

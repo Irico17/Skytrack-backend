@@ -8,6 +8,7 @@ import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 /**
  * Implementación del Algoritmo Genético para planificación masiva.
@@ -40,6 +41,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private int tournamentSize = 4;
     private int eliteCount = 2;
     private int stagnationLimit = 15;  // Early stopping: max generations sin mejora
+    private boolean parallelEnabled = true;
+    private int parallelMinProcessors = 3;
+    private int parallelPopulationThreshold = 32;
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -63,14 +67,15 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
     
     /**
-     * Inicializa la población con soluciones candidatas (PARALELIZADO).
+    * Inicializa la población con soluciones candidatas.
      * 
      * <p>Para cada solución en la población, genera rutas factibles para todos
      * los lotes usando RouteGenerator. Para introducir diversidad, procesa los
      * lotes en orden aleatorio para cada individuo.
      * 
-     * <p>PARALELIZACIÓN: Usa IntStream.parallel() para crear individuos en paralelo.
-     * ThreadLocalRandom garantiza thread-safety sin sincronización.
+    * <p>La paralelización se habilita solo cuando la configuración y los CPUs
+    * disponibles lo justifican. En VMs pequeñas, el costo de ForkJoinPool suele
+    * superar la ganancia.
      * 
      * <p><strong>Validates: Requirement 10.1</strong>
      * 
@@ -80,9 +85,12 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private List<Solution> initializePopulation(List<ShipmentBatch> batches) {
         Set<String> unroutableBatches = Collections.synchronizedSet(new HashSet<>());
         
-        List<Solution> population = IntStream.range(0, populationSize)
-            .parallel()
-            .mapToObj(i -> {
+        Stream<Integer> populationIndexes = IntStream.range(0, populationSize).boxed();
+        if (shouldUseParallelism()) {
+            populationIndexes = populationIndexes.parallel();
+        }
+
+        List<Solution> population = populationIndexes.map(i -> {
                 Solution solution = new Solution();
                 
                 // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
@@ -119,25 +127,35 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
     
     /**
-     * Evalúa el fitness de cada solución no evaluada en la población (PARALELIZADO).
+    * Evalúa el fitness de cada solución no evaluada en la población.
      * 
      * <p>Usa SolutionEvaluator para calcular el fitness y marca las soluciones
      * como evaluadas para evitar recálculos innecesarios.
      * 
-     * <p>PARALELIZACIÓN: Usa parallelStream() para evaluar múltiples soluciones
-     * simultáneamente. SolutionEvaluator es thread-safe (stateless).
+    * <p>La evaluación paralela se usa solo cuando hay suficientes CPUs y población.
+    * SolutionEvaluator es thread-safe (stateless).
      * 
      * <p><strong>Validates: Requirement 10.2</strong>
      * 
      * @param population Población de soluciones a evaluar
      */
     private void evaluatePopulation(List<Solution> population) {
-        population.parallelStream()
+        Stream<Solution> stream = shouldUseParallelism()
+            ? population.parallelStream()
+            : population.stream();
+
+        stream
             .filter(solution -> !solution.isEvaluated())
             .forEach(solution -> {
                 double fitness = evaluator.evaluate(solution);
                 solution.setFitness(fitness);
             });
+    }
+
+    private boolean shouldUseParallelism() {
+        return parallelEnabled
+            && Runtime.getRuntime().availableProcessors() >= parallelMinProcessors
+            && populationSize >= parallelPopulationThreshold;
     }
     
     /**
@@ -344,6 +362,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      *   <li>mutationRate: Tasa de mutación (default: 0.1)</li>
      *   <li>tournamentSize: Tamaño del torneo (default: 4)</li>
      *   <li>eliteCount: Número de élites a preservar (default: 2)</li>
+    *   <li>parallelEnabled: Habilita paralelismo si la VM tiene CPUs suficientes</li>
+    *   <li>parallelMinProcessors: CPUs mínimos para paralelizar (default: 3)</li>
+    *   <li>parallelPopulationThreshold: población mínima para paralelizar (default: 32)</li>
      * </ul>
      * 
      * <p>NOTA: randomSeed ya no es configurable. Se usa ThreadLocalRandom
@@ -366,5 +387,8 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.tournamentSize = config.getInt("tournamentSize", 4);
         this.eliteCount = config.getInt("eliteCount", 2);
         this.stagnationLimit = config.getInt("stagnationLimit", 15);
+        this.parallelEnabled = config.getBoolean("parallelEnabled", true);
+        this.parallelMinProcessors = config.getInt("parallelMinProcessors", 3);
+        this.parallelPopulationThreshold = config.getInt("parallelPopulationThreshold", 32);
     }
 }

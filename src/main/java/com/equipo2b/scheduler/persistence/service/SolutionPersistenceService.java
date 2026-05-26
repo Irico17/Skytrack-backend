@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -32,18 +33,24 @@ public class SolutionPersistenceService {
     @Transactional
     public void persistSolution(String simulationId, Solution solution, 
                                List<ShipmentBatch> allBatches) {
+        if (solution == null || allBatches == null || allBatches.isEmpty()) {
+            return;
+        }
+
         // 1. Persistir todos los lotes
+        List<ShipmentBatchEntity> batchEntities = new ArrayList<>();
         for (ShipmentBatch batch : allBatches) {
             boolean hasRoute = solution.getRoute(batch.batchId()) != null;
             ShipmentBatchEntity batchEntity = ShipmentBatchEntity.from(
                 simulationId, batch, hasRoute
             );
-            batchRepository.save(batchEntity);
+            batchEntities.add(batchEntity);
         }
         
+        List<ShipmentBatchEntity> savedBatchEntities = batchRepository.saveAll(batchEntities);
+
         // 1.5. Construir mapa para lookup O(1) de batchId a entity ID
-        Map<String, Long> batchIdToEntityId = batchRepository
-            .findBySimulationId(simulationId)
+        Map<String, Long> batchIdToEntityId = savedBatchEntities
             .stream()
             .collect(Collectors.toMap(
                 ShipmentBatchEntity::getBatchId, 
@@ -51,6 +58,7 @@ public class SolutionPersistenceService {
             ));
         
         // 2. Persistir rutas asignadas y sus segmentos
+        List<RouteFlightSegmentEntity> segmentEntities = new ArrayList<>();
         for (AssignedRoute route : solution.getRoutes().values()) {
             // Buscar el ID del entity persistido en O(1)
             Long batchEntityId = batchIdToEntityId.get(route.getBatch().batchId());
@@ -82,8 +90,10 @@ public class SolutionPersistenceService {
                 RouteFlightSegmentEntity segmentEntity = RouteFlightSegmentEntity.from(
                     routeEntity.getId(), flight, i + 1, layoverMinutes
                 );
-                segmentRepository.save(segmentEntity);
+                segmentEntities.add(segmentEntity);
             }
         }
+
+        segmentRepository.saveAll(segmentEntities);
     }
 }
