@@ -55,6 +55,13 @@ sudo ./install-dependencies.sh
 sudo ./deploy-artifacts.sh
 ```
 
+For a demo-only deployment without MySQL, use:
+
+```bash
+sudo ./install-demo-no-db.sh
+sudo ./deploy-artifacts.sh
+```
+
 ## 4. Verify
 
 On the VM:

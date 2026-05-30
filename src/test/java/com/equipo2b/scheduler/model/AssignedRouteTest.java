@@ -215,26 +215,34 @@ class AssignedRouteTest {
         
         List<StorageEvent> events = route.getStorageEvents();
         
-        // Debe haber 3 eventos: ARRIVAL en CDG, DEPARTURE de CDG, ARRIVAL en NRT
-        assertEquals(3, events.size());
+        // Debe haber 5 eventos: ingreso/salida en origen, escala y llegada final
+        assertEquals(5, events.size());
         
-        // Primer evento: ARRIVAL en CDG
+        // Primer evento: ARRIVAL en origen al ingresar al sistema
         assertEquals(StorageEventType.ARRIVAL, events.get(0).type());
-        assertEquals(cdg, events.get(0).airport());
-        assertEquals(flight1.arrivalTime(), events.get(0).timestamp());
+        assertEquals(jfk, events.get(0).airport());
+        assertEquals(batchToNrt.ingressTime(), events.get(0).timestamp());
         assertEquals(50, events.get(0).quantity());
         
-        // Segundo evento: DEPARTURE de CDG
+        // Segundo evento: DEPARTURE de origen al cargar el primer vuelo
         assertEquals(StorageEventType.DEPARTURE, events.get(1).type());
-        assertEquals(cdg, events.get(1).airport());
-        assertEquals(flight2.departureTime(), events.get(1).timestamp());
+        assertEquals(jfk, events.get(1).airport());
+        assertEquals(flight1.departureTime(), events.get(1).timestamp());
         assertEquals(50, events.get(1).quantity());
         
-        // Tercer evento: ARRIVAL en NRT
         assertEquals(StorageEventType.ARRIVAL, events.get(2).type());
-        assertEquals(nrt, events.get(2).airport());
-        assertEquals(flight2.arrivalTime(), events.get(2).timestamp());
-        assertEquals(50, events.get(2).quantity());
+        assertEquals(cdg, events.get(2).airport());
+        assertEquals(flight1.arrivalTime(), events.get(2).timestamp());
+
+        assertEquals(StorageEventType.DEPARTURE, events.get(3).type());
+        assertEquals(cdg, events.get(3).airport());
+        assertEquals(flight2.departureTime(), events.get(3).timestamp());
+
+        // Ultimo evento: ARRIVAL en NRT; no se genera salida artificial del destino final
+        assertEquals(StorageEventType.ARRIVAL, events.get(4).type());
+        assertEquals(nrt, events.get(4).airport());
+        assertEquals(flight2.arrivalTime(), events.get(4).timestamp());
+        assertEquals(50, events.get(4).quantity());
     }
     
     @Test
@@ -245,11 +253,19 @@ class AssignedRouteTest {
         
         List<StorageEvent> events = route.getStorageEvents();
         
-        // Debe haber solo 1 evento: ARRIVAL en destino final
-        assertEquals(1, events.size());
+        // Debe haber 3 eventos: ingreso/salida en origen y llegada final
+        assertEquals(3, events.size());
         assertEquals(StorageEventType.ARRIVAL, events.get(0).type());
-        assertEquals(cdg, events.get(0).airport());
-        assertEquals(flight1.arrivalTime(), events.get(0).timestamp());
+        assertEquals(jfk, events.get(0).airport());
+        assertEquals(batch.ingressTime(), events.get(0).timestamp());
+
+        assertEquals(StorageEventType.DEPARTURE, events.get(1).type());
+        assertEquals(jfk, events.get(1).airport());
+        assertEquals(flight1.departureTime(), events.get(1).timestamp());
+
+        assertEquals(StorageEventType.ARRIVAL, events.get(2).type());
+        assertEquals(cdg, events.get(2).airport());
+        assertEquals(flight1.arrivalTime(), events.get(2).timestamp());
     }
     
     @Test

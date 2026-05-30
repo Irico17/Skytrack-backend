@@ -1,8 +1,7 @@
 [Unit]
 Description=Skytrack Scheduling Backend
-After=network-online.target mysql.service
+After=network-online.target
 Wants=network-online.target
-Requires=mysql.service
 
 [Service]
 Type=simple
