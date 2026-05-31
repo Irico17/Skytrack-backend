@@ -31,6 +31,19 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int maxIterations = 200;
     private int tabuTenure = 15;
     private int neighborhoodSize = 20;
+
+    private int effectiveMaxIterations(int routeCount) {
+        if (routeCount >= 3_000) return 0;
+        if (routeCount >= 1_500) return Math.min(maxIterations, 6);
+        if (routeCount >= 800) return Math.min(maxIterations, 12);
+        return maxIterations;
+    }
+
+    private int effectiveNeighborhoodSize(int routeCount) {
+        if (routeCount >= 1_500) return Math.min(neighborhoodSize, 4);
+        if (routeCount >= 800) return Math.min(neighborhoodSize, 6);
+        return neighborhoodSize;
+    }
     
     /**
      * Constructor que inicializa Búsqueda Tabú con dependencias.
@@ -64,18 +77,28 @@ public class TabuSearch implements OptimizationAlgorithm {
         currentSolution.setFitness(evaluator.evaluate(currentSolution));
         
         Solution bestSolution = new Solution(currentSolution);
+        int effectiveMaxIterations = effectiveMaxIterations(currentSolution.getRoutes().size());
+        int effectiveNeighborhoodSize = effectiveNeighborhoodSize(currentSolution.getRoutes().size());
+
+        if (effectiveMaxIterations == 0) {
+            System.out.printf(
+                "Carga alta (%d rutas): se omite Tabú puro para respetar tiempo de ciclo%n",
+                currentSolution.getRoutes().size()
+            );
+            return bestSolution;
+        }
         
         // Lista tabú: contiene batch IDs de rutas modificadas recientemente
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
         
         // Iterar durante maxIterations iteraciones
-        for (int iter = 0; iter < maxIterations; iter++) {
+        for (int iter = 0; iter < effectiveMaxIterations; iter++) {
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
             
             // Explorar vecindario
-            for (int n = 0; n < neighborhoodSize; n++) {
+            for (int n = 0; n < effectiveNeighborhoodSize; n++) {
                 Move move = generateMove(currentSolution, batches);
                 Solution neighbor = move.solution();
                 neighbor.setFitness(evaluator.evaluate(neighbor));
@@ -128,16 +151,34 @@ public class TabuSearch implements OptimizationAlgorithm {
         }
         
         Solution bestSolution = new Solution(currentSolution);
+        int routeCount = currentSolution.getRoutes().size();
+        int effectiveMaxIterations = effectiveMaxIterations(routeCount);
+        int effectiveNeighborhoodSize = effectiveNeighborhoodSize(routeCount);
+
+        if (effectiveMaxIterations == 0) {
+            System.out.printf(
+                "Carga alta (%d rutas): se omite refinamiento Tabú para respetar tiempo de ciclo%n",
+                routeCount
+            );
+            return bestSolution;
+        }
+
+        if (effectiveMaxIterations != maxIterations || effectiveNeighborhoodSize != neighborhoodSize) {
+            System.out.printf(
+                "Carga alta (%d rutas): Tabú adaptativo iteraciones=%d, vecindario=%d%n",
+                routeCount, effectiveMaxIterations, effectiveNeighborhoodSize
+            );
+        }
         
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
         
-        for (int iter = 0; iter < maxIterations; iter++) {
+        for (int iter = 0; iter < effectiveMaxIterations; iter++) {
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
             
             // Explorar vecindario generando variaciones de rutas individuales
-            for (int n = 0; n < neighborhoodSize; n++) {
+            for (int n = 0; n < effectiveNeighborhoodSize; n++) {
                 Move move = generateMoveFromSolution(currentSolution);
                 Solution neighbor = move.solution();
                 neighbor.setFitness(evaluator.evaluate(neighbor));

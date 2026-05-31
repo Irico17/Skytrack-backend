@@ -1,395 +1,202 @@
-# 🛫 Skytrack Backend
+# Skytrack Scheduling Core
 
-> Sistema inteligente de optimización de rutas para transporte aéreo de equipajes usando algoritmos metaheurísticos
+Sistema backend de planificacion de rutas para transporte aereo de equipajes, integrado con un frontend React/Vite ubicado como proyecto hermano en `../Skytrack-Frontend`.
 
-[![Java](https://img.shields.io/badge/Java-17+-orange.svg)](https://www.oracle.com/java/)
-[![Gradle](https://img.shields.io/badge/Gradle-9.3+-green.svg)](https://gradle.org/)
-[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.x-brightgreen.svg)](https://spring.io/projects/spring-boot)
-[![License](https://img.shields.io/badge/License-Academic-blue.svg)]()
+Este README describe el estado actual del sistema para humanos y agentes que necesiten continuar el trabajo sin redescubrir la arquitectura.
 
-## 📋 Descripción
+## Estado Actual
 
-**Skytrack** es un sistema de planificación y optimización de rutas para el transporte aéreo de equipajes extraviados entre aeropuertos de América, Asia y Europa. Utiliza algoritmos metaheurísticos avanzados (Algoritmo Genético + Búsqueda Tabú) para encontrar rutas óptimas que cumplan con restricciones de capacidad, plazos de entrega (SLA) y escalas.
+- Backend: Java 17, Spring Boot 3.3, Gradle, REST, WebSocket, JPA/Flyway.
+- Frontend: React 18, Vite, Tailwind, `VITE_API_BASE` con valor por defecto `/api`.
+- Perfil local por defecto: `dev`, con H2 en memoria y sin Flyway.
+- Perfil VM/contenedor: `container`, con MySQL local y Flyway.
+- El backend sigue usando archivos `.txt` como fuente operativa para aeropuertos, plan de vuelos y envios preliminares.
+- MySQL guarda persistencia de simulaciones `DAY_TO_DAY` y tablas de referencia importadas desde los archivos.
+- La simulacion de 5 dias exporta resultados finales a JSON en `data/results`.
+- La ocupacion de aeropuerto se calcula desde eventos de almacenamiento; al llegar al destino final las maletas permanecen en el inventario del aeropuerto.
 
-### 🎯 Problema de Negocio
+## Estructura Relevante
 
-Las aerolíneas necesitan transportar equipaje extraviado entre aeropuertos cumpliendo estrictos plazos de entrega:
-- **Mismo continente**: 12 horas máximo
-- **Diferentes continentes**: 24 horas máximo
-
-El sistema debe:
-- ✅ Planificar rutas óptimas minimizando costos y tiempos
-- ✅ Respetar capacidades de vuelos (150-400 maletas) y almacenes (400-480 maletas)
-- ✅ Replanificar dinámicamente ante cancelaciones de vuelos
-- ✅ Monitorear capacidad del sistema en tiempo real
-- ✅ Detectar puntos de colapso operacional
-
----
-
-## 🏗️ Arquitectura
-
-### Stack Tecnológico
-
-- **Backend**: Java 17, Spring Boot 3.x
-- **Build**: Gradle 9.3+
-- **Algoritmos**: Genetic Algorithm (paralelizado), Tabu Search
-- **API**: REST (Spring Web)
-- **Persistencia**: En memoria (futuro: PostgreSQL)
-
-### Arquitectura en Capas
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    API REST Layer                       │
-│  SimulationRestController | CancellationRestController  │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────┴────────────────────────────────┐
-│                   Service Layer                         │
-│  SimulationService | CancellationService | MetricsService│
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────┴────────────────────────────────┐
-│                  Execution Layer                        │
-│  Scheduler | SimulationController | Replanner           │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────┴────────────────────────────────┐
-│                 Algorithm Layer                         │
-│  GeneticAlgorithm | TabuSearch | RouteGenerator         │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────┴────────────────────────────────┐
-│                   Domain Model                          │
-│  Airport | Flight | ShipmentBatch | Solution            │
-└─────────────────────────────────────────────────────────┘
+```text
+scheduling-core/
+  src/main/java/com/equipo2b/scheduler/
+    api/                 REST controllers y WebSocket
+    api/dto/             DTOs de REST/WebSocket
+    service/             Orquestacion de simulaciones y carga de datos
+    execution/           SimulationController, Scheduler, Replanner
+    algorithm/           GeneticAlgorithm, TabuSearch
+    logic/               RouteGenerator, SolutionEvaluator
+    model/               Airport, Flight, ShipmentBatch, AssignedRoute, Solution
+    monitoring/          CapacityMonitor, StorageInventoryService, semaforos
+    persistence/         Entidades, repositorios, importacion y persistencia MySQL/H2
+    upload/              Parsers de archivos .txt
+  src/main/resources/
+    application.properties
+    application-dev.properties
+    application-container.properties
+    db/migration/mysql/
+  data/
+    c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt
+    planes_vuelo.txt
+    _envios_preliminar_/
+    results/
+  deploy/vm/
 ```
 
----
+## Datos Estaticos
 
-## 🧬 Algoritmos de Optimización
+Los datos usados por las simulaciones salen de estas propiedades:
 
-### GATS (Genetic Algorithm + Tabu Search)
-
-Algoritmo híbrido que combina exploración global con refinamiento local.
-
-**Fase 1 - Algoritmo Genético:**
-- Población: 50 individuos
-- Generaciones: 100 (early stopping: 15 sin mejora)
-- Mutación: 15%
-- Selección: Torneo (tamaño 4)
-- Elitismo: 2 mejores soluciones
-- **Paralelización**: `parallelStream()` en evaluación e inicialización
-
-**Fase 2 - Refinamiento Tabu Search:**
-- Iteraciones: 200
-- Tabu tenure: 15
-- Vecindario: 20 soluciones
-
-**Rendimiento:**
-- Tiempo promedio: 144s (54% carga), 273s (93% carga)
-- 2-3% mejor fitness que Tabu en operación normal
-- 8.7% mejor fitness en condiciones de colapso
-
-### Tabu Search Puro
-
-Búsqueda local con memoria de movimientos prohibidos.
-
-**Configuración:**
-- Iteraciones: 200
-- Tabu tenure: 15
-- Vecindario: 20 soluciones
-
-**Rendimiento:**
-- Tiempo promedio: 50s (constante)
-- 3x más rápido que GATS
-- Menor uso de recursos
-
----
-
-## 📊 Resultados Experimentales
-
-### Capacidad del Sistema
-
-| Carga | Maletas/día | Fitness GATS | Violaciones | Estado |
-|-------|-------------|--------------|-------------|--------|
-| 54% | 6,971 | -1,545,740 | 0% | ✅ Normal |
-| 69% | 8,962 | -1,614,195 | 0% | ✅ Normal |
-| 78% | 10,045 | -1,863,880 | 0% | ✅ Normal |
-| 93% | 11,964 | +27,619,035 | 78.9% | ❌ **COLAPSO** |
-
-**Conclusión**: El sistema opera sin violaciones hasta **78% de capacidad** (~10,000 maletas/día). El colapso ocurre entre 78-93%.
-
-### GATS vs Tabu Search
-
-| Métrica | GATS | Tabu | Diferencia |
-|---------|------|------|------------|
-| Fitness (54%) | -1,545,740 | -1,510,945 | +2.30% |
-| Fitness (93%) | +27,619,035 | +30,256,920 | +8.72% |
-| Tiempo (54%) | 144s | 51s | 3x más lento |
-| Robustez | Alta | Media | GATS mejor bajo estrés |
-
----
-
-## 🚀 Inicio Rápido
-
-### Prerrequisitos
-
-```bash
-Java 17+
-Gradle 9.3+
-8 GB RAM (16 GB recomendado)
-4+ núcleos CPU (8+ para paralelización óptima)
+```properties
+DATA_AIRPORTS_PATH=data/c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt
+DATA_FLIGHTS_PATH=data/planes_vuelo.txt
+DATA_SHIPMENTS_DIR=data/_envios_preliminar_
+DATA_RESULTS_DIR=data/results
 ```
 
-### Instalación
+Formatos esperados:
 
-```bash
-# Clonar repositorio
-git clone https://github.com/Irico17/Skytrack-backend.git
-cd Skytrack-backend
+- Aeropuertos: archivo de catedra con secciones de continente y lineas de aeropuerto.
+- Planes de vuelo: `ORIGEN-DESTINO-HH:mm-HH:mm-CAPACIDAD`.
+- Envios preliminares: archivos `_envios_XXXX_.txt` con lineas `ID-YYYYMMDD-HH-MM-DESTINO-CANTIDAD-CLIENTE`.
 
-# Compilar
-./gradlew build
+El endpoint `POST /api/data/static` reemplaza el dataset activo. Recibe `multipart/form-data` con:
 
-# Ejecutar tests
-./gradlew test
-```
+- `airports`: archivo de aeropuertos.
+- `flights`: archivo de planes de vuelo.
+- `shipments`: multiples archivos `_envios_*.txt`.
 
-### Ejecución
+El backend valida todo en una carpeta temporal antes de tocar los archivos activos. Si la validacion pasa, reemplaza aeropuertos, vuelos y borra/recrea `_envios_preliminar_`. Luego importa aeropuertos y vuelos a la BD configurada. Los nuevos datos se usan al iniciar la siguiente simulacion.
 
-**Experimento por fecha específica:**
-```bash
-java -cp "build/classes/java/main" com.equipo2b.scheduler.RunExperimentByDate 2026-09-25
-```
+## Modos de Simulacion
 
-**Análisis de capacidad del sistema:**
-```bash
-java -cp "build/classes/java/main" com.equipo2b.scheduler.CalculateSystemCapacity
-```
+### Operacion Dia a Dia
 
-**Simulación hasta colapso:**
-```bash
-java -cp "build/classes/java/main" com.equipo2b.scheduler.RunNumericalExperiment
-```
+- Frontend mode: `realtime`.
+- Backend scenario: `DAY_TO_DAY`.
+- Permite registrar maletas con `POST /api/simulations/{id}/shipments`.
+- Permite cancelar vuelos con `POST /api/simulations/{id}/flights/{flightId}/cancel`.
+- Al terminar, persiste simulacion, lotes y rutas en BD.
 
----
+### Simulacion 5 Dias
 
-## 📁 Estructura del Proyecto
+- Frontend mode: `5day`.
+- Backend scenario: `PERIOD_SIMULATION`.
+- Carga todos los envios preliminares filtrados por ventana `[startDateTime, startDateTime + 5 dias)`.
+- La fecha/hora de inicio se selecciona desde el frontend y se envia como `startDateTime`.
+- Emite `CYCLE_UPDATE` y `STORAGE_UPDATE` por WebSocket.
+- Exporta resultados finales a JSON con `SimulationResultExporter`.
 
-```
-skytrack-backend/
-├── src/main/java/com/equipo2b/scheduler/
-│   ├── algorithm/              # Algoritmos de optimización
-│   │   ├── GeneticAlgorithm.java
-│   │   ├── TabuSearch.java
-│   │   ├── OptimizationAlgorithm.java
-│   │   └── AlgorithmConfig.java
-│   ├── api/                    # REST Controllers
-│   │   ├── SimulationRestController.java
-│   │   ├── CancellationRestController.java
-│   │   └── dto/                # Data Transfer Objects
-│   ├── service/                # Servicios de aplicación
-│   │   ├── SimulationService.java
-│   │   ├── CancellationService.java
-│   │   └── MetricsService.java
-│   ├── execution/              # Orquestación
-│   │   ├── Scheduler.java
-│   │   ├── SimulationController.java
-│   │   ├── SimulationRunner.java
-│   │   └── Replanner.java
-│   ├── logic/                  # Lógica de negocio
-│   │   ├── RouteGenerator.java
-│   │   ├── SolutionEvaluator.java
-│   │   └── RouteValidator.java
-│   ├── model/                  # Modelo de dominio
-│   │   ├── Airport.java
-│   │   ├── Flight.java
-│   │   ├── ShipmentBatch.java
-│   │   ├── AssignedRoute.java
-│   │   └── Solution.java
-│   ├── monitoring/             # Monitoreo y métricas
-│   │   ├── CapacityMonitor.java
-│   │   ├── CollapseDetector.java
-│   │   └── TrafficLightIndicator.java
-│   └── validation/             # Validación de restricciones
-│       ├── RouteValidator.java
-│       └── ValidationReport.java
-├── data/                       # Datos de entrada
-│   ├── aeropuertos.txt
-│   ├── planes_vuelo.txt
-│   └── _envios_preliminar_/
-├── documentos/                 # Documentación técnica
-├── experimentos-historicos/    # Resultados de experimentos
-└── diagrama_clases_sistema.puml  # Diagrama UML
-```
+### Colapso
 
----
+- Backend scenario disponible: `COLLAPSE_SIMULATION`.
+- El frontend actual conserva una visualizacion local de estres/colapso.
+- El boton de carga de datos estaticos esta disponible antes de simular para mantener el dataset backend preparado.
 
-## 🔧 API REST (En desarrollo)
+## API Principal
 
-### Endpoints Principales
-
-**Simulaciones:**
 ```http
-POST   /api/simulations              # Iniciar simulación
-GET    /api/simulations/{id}/status  # Consultar estado
-POST   /api/simulations/{id}/pause   # Pausar simulación
-POST   /api/simulations/{id}/resume  # Reanudar simulación
-DELETE /api/simulations/{id}         # Detener simulación
+GET  /api/data/airports
+GET  /api/data/flights?startDateTime=YYYY-MM-DDTHH:mm&days=5
+GET  /api/data/flights/stats
+POST /api/data/import
+POST /api/data/static
+
+POST /api/simulations/start
+POST /api/simulations/{id}/stop
+POST /api/simulations/{id}/pause
+POST /api/simulations/{id}/resume
+GET  /api/simulations/{id}/status
+GET  /api/simulations/{id}/solution
+GET  /api/simulations/{id}/metrics
+GET  /api/simulations/{id}/results
+POST /api/simulations/{id}/shipments
+POST /api/simulations/{id}/flights/{flightId}/cancel
+
+WS   /ws/simulation
 ```
 
-**Cancelaciones:**
-```http
-POST   /api/simulations/{id}/flights/{flightId}/cancel  # Cancelar vuelo
+## Ejecutar Local
+
+Backend:
+
+```powershell
+cd C:\Users\Irico\Documents\DP1\scheduling-core
+.\gradlew.bat bootRun
 ```
 
-**Métricas:**
-```http
-GET    /api/simulations/{id}/metrics     # Métricas en tiempo real
-GET    /api/simulations/{id}/semaphores  # Semáforos de capacidad
+Frontend:
+
+```powershell
+cd C:\Users\Irico\Documents\DP1\Skytrack-Frontend
+npm run dev
 ```
 
-**Datos:**
-```http
-GET    /api/airports        # Lista de aeropuertos
-GET    /api/flights/stats   # Estadísticas de vuelos
+Abrir `http://localhost:5173`. Vite proxya `/api` y `/ws` al backend en `localhost:8080`.
+
+## Build y Verificacion
+
+Backend:
+
+```powershell
+.\gradlew.bat bootJar -x test
+.\gradlew.bat test
 ```
 
----
+Frontend:
 
-## 📈 Monitoreo y Métricas
+```powershell
+cd C:\Users\Irico\Documents\DP1\Skytrack-Frontend
+npm run build
+```
 
-### Sistema de Semáforos
+## Deploy VM
 
-El sistema utiliza un indicador tipo semáforo para monitorear capacidad:
+La guia operativa esta en `deploy/vm/README_VM_DEPLOY.md`.
 
-- 🟢 **Verde** (<70% ocupación): Operación normal
-- 🟡 **Ámbar** (70-85% ocupación): Precaución
-- 🔴 **Rojo** (>85% ocupación): Crítico
+Resumen:
 
-### Detección de Colapso
+```powershell
+cd C:\Users\Irico\Documents\DP1\scheduling-core
+.\deploy\vm\package-local.ps1
+scp deploy\skytrack-vm-deploy.tar.gz 1inf54.981.2b@200.16.7.142:~/skytrack-vm-deploy.tar.gz
+```
 
-**Umbrales:**
-- **Colapso**: >95% ocupación o >50% lotes no ruteables
-- **Crítico**: >85% ocupación o >30% lotes no ruteables
-- **Warning**: >70% ocupación o >15% lotes no ruteables
+Redeploy automatico desde Windows:
 
-### Métricas Clave
+```powershell
+.\deploy\vm\redeploy-vm.ps1
+```
 
-- Fitness de la solución
-- Porcentaje de lotes no ruteables
-- Ocupación promedio de vuelos
-- Ocupación de almacenes por aeropuerto
-- Violaciones de SLA
-- Tiempo de ejecución del algoritmo
+Para sobrescribir tambien los datos estaticos de `/opt/skytrack/backend/data` con los incluidos en el paquete:
 
----
+```powershell
+.\deploy\vm\redeploy-vm.ps1 -OverwriteData
+```
 
-## 🧪 Testing
+En la VM:
 
 ```bash
-# Ejecutar todos los tests
-./gradlew test
-
-# Tests de integración
-./gradlew integrationTest
-
-# Tests de algoritmos
-./gradlew test --tests "com.equipo2b.scheduler.algorithm.*"
-
-# Coverage report
-./gradlew jacocoTestReport
+mkdir -p ~/skytrack-deploy
+rm -rf ~/skytrack-deploy/current
+mkdir -p ~/skytrack-deploy/current
+tar -xzf ~/skytrack-vm-deploy.tar.gz -C ~/skytrack-deploy/current
+cd ~/skytrack-deploy/current/deploy/vm
+chmod +x *.sh
+sudo ./install-dependencies.sh
+sudo ./deploy-artifacts.sh
 ```
 
----
+Si MySQL root requiere password:
 
-## 📚 Documentación Adicional
+```bash
+MYSQL_ROOT_PASSWORD='password-root-mysql' sudo -E ./install-dependencies.sh
+```
 
-- **[Diagrama de Clases UML](diagrama_clases_sistema.puml)**: Arquitectura completa del sistema
-- **[Arquitectura del Sistema](documentos/ARQUITECTURA_SISTEMA_COMPLETO.md)**: Documentación técnica detallada
-- **[Arquitectura de Simulación](documentos/ARQUITECTURA_SIMULACION_TIEMPO_REAL.md)**: Explicación de simulación acelerada
+## Notas Para Agentes
 
----
-
-## 🗺️ Roadmap
-
-### ✅ Fase 1: Core Backend (Completado)
-- [x] Implementación de algoritmos GATS y Tabu Search
-- [x] Sistema de planificación y replanificación
-- [x] Validación de restricciones
-- [x] Monitoreo de capacidad
-- [x] Detección de colapso
-- [x] Paralelización de algoritmos
-
-### 🚧 Fase 2: API REST (En desarrollo)
-- [x] Controladores REST básicos
-- [ ] WebSockets para actualizaciones en tiempo real
-- [ ] Autenticación y autorización
-- [ ] Rate limiting
-- [ ] Documentación OpenAPI/Swagger
-
-### 📋 Fase 3: Persistencia (Pendiente)
-- [ ] Integración con PostgreSQL
-- [ ] Repositorios JPA
-- [ ] Migraciones con Flyway
-- [ ] Cache con Redis
-
-### 🎨 Fase 4: Frontend (Pendiente)
-- [ ] Dashboard de visualización
-- [ ] Mapa interactivo de rutas
-- [ ] Panel de control de simulaciones
-- [ ] Registro de envíos
-- [ ] Monitoreo en tiempo real
-
-### ⚡ Fase 5: Optimizaciones (Futuro)
-- [ ] Algoritmos adaptativos
-- [ ] Machine Learning para predicción de demanda
-- [ ] Optimización de memoria
-- [ ] Clustering para escalabilidad horizontal
-
----
-
-## 👨‍💻 Autor
-
-**Irico** - [GitHub](https://github.com/Irico17)
-
----
-
-## 🤝 Contribuciones
-
-Este es un proyecto académico, pero las sugerencias y mejoras son bienvenidas. Si encuentras un bug o tienes una idea:
-
-1. Abre un **Issue** describiendo el problema o mejora
-2. Haz un **Fork** del proyecto
-3. Crea una **rama** para tu feature (`git checkout -b feature/AmazingFeature`)
-4. **Commit** tus cambios (`git commit -m 'Add some AmazingFeature'`)
-5. **Push** a la rama (`git push origin feature/AmazingFeature`)
-6. Abre un **Pull Request**
-
----
-
-## 📄 Licencia
-
-Este proyecto fue desarrollado con fines académicos para la Pontificia Universidad Católica del Perú.
-
----
-
-## 🙏 Agradecimientos
-
-- Pontificia Universidad Católica del Perú
-- Curso de Ingeniería de Software (2026-1)
-- Equipo 2B
-
----
-
-## 📞 Contacto
-
-Para consultas sobre el proyecto:
-- GitHub: [@Irico17](https://github.com/Irico17)
-- Repositorio: [Skytrack-backend](https://github.com/Irico17/Skytrack-backend)
-
----
-
-**⭐ Si este proyecto te resulta útil, considera darle una estrella en GitHub!**
-
+- No asumir que MySQL es necesario para desarrollo local; el perfil `dev` usa H2.
+- No cambiar rutas de datos sin revisar `deploy/vm/*.sh`, Nginx y `application.properties`.
+- `deploy-artifacts.sh` preserva datasets ya subidos en `/opt/skytrack/backend/data`; usar `SKYTRACK_OVERWRITE_DATA=true` para restaurar los defaults del paquete.
+- El frontend de colapso no esta completamente conectado al backend de colapso; evitar afirmar que todo ese modo usa datos backend.
+- Para cambios visuales, revisar `../Skytrack-Frontend/src/app/hooks/useSimulation.ts`, `App.tsx` y los componentes de paneles.

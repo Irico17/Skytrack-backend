@@ -57,8 +57,9 @@ public class SimulationService implements SimulationController.SimulationListene
      * Inicia una nueva simulación del escenario indicado.
      *
      * @param scenarioName "DAY_TO_DAY", "PERIOD_SIMULATION" o "COLLAPSE_SIMULATION"
-     * @param startDateStr Fecha de inicio del rango de datos (yyyy-MM-dd). Null = todos los datos.
-     *                     Para PERIOD_SIMULATION filtra [startDate, startDate+5días].
+    * @param startDateStr Fecha/hora de inicio del rango de datos. Acepta yyyy-MM-dd,
+    *                     yyyy-MM-dd'T'HH:mm o ISO-8601 con zona horaria. Null = todos los datos.
+    *                     Para PERIOD_SIMULATION filtra [inicio, inicio+5días].
      * @return simulationId único de la simulación iniciada
      */
     public synchronized String startSimulation(String scenarioName, String startDateStr) {
@@ -86,10 +87,12 @@ public class SimulationService implements SimulationController.SimulationListene
             ClientRegistry clientRegistry = dataService.createClientRegistry(airports);
             currentFlightPlan = dataService.loadFlightPlan(currentAirportManager);
 
-            // 2. Cargar envíos — filtrar por rango si es simulación de 5 días
+            // 2. Cargar envíos — filtrar por ventana real si aplica
             List<ShipmentBatch> batches;
-            if (scenario == ScenarioType.PERIOD_SIMULATION && currentStartDate != null) {
-                ZonedDateTime endDate = currentStartDate.plusDays(5);
+            if ((scenario == ScenarioType.PERIOD_SIMULATION || scenario == ScenarioType.DAY_TO_DAY)
+                    && currentStartDate != null) {
+                int windowDays = scenario == ScenarioType.PERIOD_SIMULATION ? 5 : 1;
+                ZonedDateTime endDate = currentStartDate.plusDays(windowDays);
                 batches = dataService.loadShipmentsInRange(
                     currentAirportManager, clientRegistry, currentStartDate, endDate
                 );
@@ -551,11 +554,21 @@ public class SimulationService implements SimulationController.SimulationListene
 
     private ZonedDateTime parseStartDate(String startDateStr) {
         if (startDateStr == null || startDateStr.isBlank()) return null;
+        String value = startDateStr.trim();
         try {
-            LocalDate date = LocalDate.parse(startDateStr, DateTimeFormatter.ISO_LOCAL_DATE);
+            return ZonedDateTime.parse(value);
+        } catch (Exception ignored) {
+            // Intentar formatos sin zona horaria abajo.
+        }
+        try {
+            if (value.contains("T")) {
+                return LocalDateTime.parse(value, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+                    .atZone(ZoneOffset.UTC);
+            }
+            LocalDate date = LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE);
             return date.atStartOfDay(ZoneOffset.UTC);
         } catch (Exception e) {
-            System.err.println("⚠️ No se pudo parsear startDate '" + startDateStr + "': " + e.getMessage());
+            System.err.println("⚠️ No se pudo parsear startDate/startDateTime '" + startDateStr + "': " + e.getMessage());
             return null;
         }
     }

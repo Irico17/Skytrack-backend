@@ -1,48 +1,49 @@
-# Skytrack VM deploy
+# Skytrack VM Deploy
 
-This deploy does not require Docker or Git on the VM.
+Deploy sin Docker ni Git en la VM. La VM publica Nginx en `80/443`, sirve el frontend desde `/var/www/skytrack` y proxy `/api` + `/ws` al backend Spring Boot en `127.0.0.1:8081`.
 
-Architecture:
-- Nginx listens on public port 80.
-- React/Vite build is served from `/var/www/skytrack`.
-- Spring Boot runs as `skytrack-backend.service` on `127.0.0.1:8081`.
-- Nginx proxies `/api/` and `/ws/` to the backend.
-- MySQL runs locally and is used by the Spring `container` profile.
-- Existing Tomcat on port 8080 is not touched.
+## Arquitectura VM
 
-## 1. Build the deployment zip locally
+- Dominio: `1inf54-981-2b.inf.pucp.edu.pe`.
+- IP: `200.16.7.142`.
+- Usuario SSH: `1inf54.981.2b`.
+- Backend: `skytrack-backend.service`.
+- Backend home: `/opt/skytrack/backend`.
+- Frontend: `/var/www/skytrack`.
+- Config: `/etc/skytrack/backend.env`.
+- Perfil recomendado: `container` con MySQL local.
+- Perfil alternativo demo: `dev` con H2 en memoria.
 
-From `C:\Users\Irico\Documents\DP1\scheduling-core`:
+## Build Local
+
+Desde `C:\Users\Irico\Documents\DP1\scheduling-core`:
 
 ```powershell
 .\deploy\vm\package-local.ps1
 ```
 
-This creates:
+Genera:
 
 ```text
 deploy\skytrack-vm-deploy.tar.gz
 ```
 
-## 2. Upload to the VM
+El paquete incluye:
 
-Use the VM password only when SSH/SCP asks for it. Do not paste it into shared chats or scripts.
+- `backend/scheduling-core.jar`
+- `backend/data/` con dataset default
+- `frontend/dist/`
+- `deploy/vm/*.sh`
+
+## Upload
 
 ```powershell
 scp deploy\skytrack-vm-deploy.tar.gz 1inf54.981.2b@200.16.7.142:~/skytrack-vm-deploy.tar.gz
 ```
 
-If Windows asks whether to trust the host fingerprint, type `yes` after verifying it is the university VM.
+## Primer Deploy Con MySQL
 
-## 3. Install packages and deploy on the VM
-
-Connect:
-
-```powershell
-ssh 1inf54.981.2b@200.16.7.142
-```
-
-Then on the VM:
+En la VM:
 
 ```bash
 mkdir -p ~/skytrack-deploy
@@ -55,16 +56,123 @@ sudo ./install-dependencies.sh
 sudo ./deploy-artifacts.sh
 ```
 
-For a demo-only deployment without MySQL, use:
+`install-dependencies.sh` instala Java 17, Nginx, MySQL, unzip y curl. Tambien crea:
+
+- Base de datos: `scheduling_db`.
+- Usuario de app: `scheduling_user`.
+- Password de app aleatoria, guardada en `/etc/skytrack/backend.env`.
+
+Si MySQL root pide password:
+
+```bash
+MYSQL_ROOT_PASSWORD='password-root-mysql' sudo -E ./install-dependencies.sh
+```
+
+Si quieres fijar tambien la password del usuario `scheduling_user`:
+
+```bash
+MYSQL_ROOT_PASSWORD='password-root-mysql' SKYTRACK_DB_PASSWORD='password-app' sudo -E ./install-dependencies.sh
+```
+
+Usa una password fuerte para `SKYTRACK_DB_PASSWORD`. En MySQL con `validate_password.policy=MEDIUM`, la password debe tener al menos 8 caracteres, mayuscula, minuscula, numero y caracter especial. Ejemplo:
+
+```bash
+SKYTRACK_DB_PASSWORD='SkyApp@Secure2026' MYSQL_ROOT_PASSWORD='password-root-mysql' sudo -E ./install-dependencies.sh
+```
+
+Este paso se hace solo en el primer deploy con MySQL o cuando quieras regenerar `/etc/skytrack/backend.env` y credenciales. Para redeploys normales de nueva version basta con `deploy-artifacts.sh`.
+
+## MySQL Root Password Perdida
+
+Primero intenta entrar con socket local:
+
+```bash
+sudo mysql
+```
+
+Si no entra y conoces la password, usa `MYSQL_ROOT_PASSWORD`. Si no la conoces, sigue el procedimiento oficial de MySQL para resetear privilegios. Version corta para Ubuntu/MySQL 8:
+
+```bash
+sudo systemctl stop mysql
+sudo mkdir -p /var/run/mysqld
+sudo chown mysql:mysql /var/run/mysqld
+sudo mysqld_safe --skip-grant-tables --skip-networking &
+mysql -uroot
+```
+
+Dentro de MySQL:
+
+```sql
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED BY 'nueva-password-root';
+EXIT;
+```
+
+Luego:
+
+```bash
+sudo pkill mysqld_safe || true
+sudo pkill mysqld || true
+sudo systemctl start mysql
+mysql -u root -p'nueva-password-root' -e "SELECT 1;"
+SKYTRACK_DB_PASSWORD='password-fuerte-app' MYSQL_ROOT_PASSWORD='nueva-password-root' sudo -E ./install-dependencies.sh
+```
+
+Referencias oficiales: `default-privileges` y `resetting-permissions` de MySQL 8.0.
+
+## Deploy Demo Sin MySQL
+
+Solo para demo temporal:
 
 ```bash
 sudo ./install-demo-no-db.sh
 sudo ./deploy-artifacts.sh
 ```
 
-## 4. Verify
+Esto escribe `SPRING_PROFILES_ACTIVE=dev` y usa H2 en memoria. No conserva persistencia tras reiniciar backend.
 
-On the VM:
+## Redeploy De Nueva Version
+
+Desde local:
+
+```powershell
+cd C:\Users\Irico\Documents\DP1\scheduling-core
+.\deploy\vm\package-local.ps1
+scp deploy\skytrack-vm-deploy.tar.gz 1inf54.981.2b@200.16.7.142:~/skytrack-vm-deploy.tar.gz
+```
+
+O en una sola corrida desde local:
+
+```powershell
+.\deploy\vm\redeploy-vm.ps1
+```
+
+Si quieres restaurar los datos default incluidos en el paquete:
+
+```powershell
+.\deploy\vm\redeploy-vm.ps1 -OverwriteData
+```
+
+En la VM:
+
+```bash
+rm -rf ~/skytrack-deploy/current
+mkdir -p ~/skytrack-deploy/current
+tar -xzf ~/skytrack-vm-deploy.tar.gz -C ~/skytrack-deploy/current
+cd ~/skytrack-deploy/current/deploy/vm
+chmod +x *.sh
+sudo ./deploy-artifacts.sh
+```
+
+Por defecto, `deploy-artifacts.sh` preserva los datos estaticos actuales en `/opt/skytrack/backend/data`. Esto evita perder datasets subidos desde el frontend.
+
+Para restaurar los datos default empaquetados:
+
+```bash
+SKYTRACK_OVERWRITE_DATA=true sudo -E ./deploy-artifacts.sh
+```
+
+## Verificacion
 
 ```bash
 curl http://127.0.0.1:8081/actuator/health
@@ -72,57 +180,50 @@ curl -I http://127.0.0.1/
 systemctl status skytrack-backend --no-pager
 ```
 
-From your browser:
+Desde navegador:
 
 ```text
 http://1inf54-981-2b.inf.pucp.edu.pe/
 http://200.16.7.142/
 ```
 
-## 5. Useful operations
+## HTTPS
 
-Restart backend:
-
-```bash
-sudo systemctl restart skytrack-backend
-```
-
-View backend logs:
-
-```bash
-sudo journalctl -u skytrack-backend -n 200 --no-pager
-```
-
-Reload Nginx:
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-Redeploy a new version:
-
-```bash
-rm -rf ~/skytrack-deploy/current
-mkdir -p ~/skytrack-deploy/current
-tar -xzf ~/skytrack-vm-deploy.tar.gz -C ~/skytrack-deploy/current
-cd ~/skytrack-deploy/current/deploy/vm
-sudo ./deploy-artifacts.sh
-```
-
-## 6. Optional TLS
-
-After HTTP works and DNS resolves correctly:
+Despues de verificar HTTP y DNS:
 
 ```bash
 sudo apt-get install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d 1inf54-981-2b.inf.pucp.edu.pe
 ```
 
-## 7. Security checklist
+Si no quieres registrar email:
 
-- Change the VM password after deployment because it was shared in chat.
-- Keep backend bound to `127.0.0.1`; do not expose port 8081 publicly.
-- Only ports 22, 80 and 443 should be externally reachable.
-- Store DB credentials only in `/etc/skytrack/backend.env` with permissions `0640`.
-- Update packages periodically with `sudo apt-get update && sudo apt-get upgrade`.
+```bash
+sudo certbot --nginx -d 1inf54-981-2b.inf.pucp.edu.pe --register-unsafely-without-email
+```
+
+Elige redirect HTTP -> HTTPS cuando Certbot lo pregunte.
+
+## Operaciones Utiles
+
+```bash
+sudo systemctl restart skytrack-backend
+sudo journalctl -u skytrack-backend -n 200 --no-pager
+sudo nginx -t
+sudo systemctl reload nginx
+sudo cat /etc/skytrack/backend.env
+```
+
+Importar manualmente aeropuertos/vuelos actuales a BD:
+
+```bash
+curl -X POST http://127.0.0.1:8081/api/data/import
+```
+
+## Seguridad
+
+- No publicar `/etc/skytrack/backend.env`; contiene credenciales.
+- Backend debe seguir en `127.0.0.1:8081`, no expuesto publicamente.
+- Exponer solo 22, 80 y 443.
+- Mantener `client_max_body_size 128m` para la carga de datasets.
+- Cambiar passwords si se compartieron por chat.

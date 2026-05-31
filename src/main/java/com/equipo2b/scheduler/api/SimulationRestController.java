@@ -35,20 +35,20 @@ public class SimulationRestController {
 
     /**
      * Inicia una nueva simulación.
-     * Body: { "scenario": "PERIOD_SIMULATION", "startDate": "2026-01-15" }
-     * startDate es opcional: si se omite, usa todos los datos disponibles.
+     * Body: { "scenario": "PERIOD_SIMULATION", "startDateTime": "2026-01-15T08:00" }
+     * startDate/startDateTime es opcional: si se omite, usa todos los datos disponibles.
      */
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> start(@RequestBody SimulationRequestDTO req) {
         try {
-            String simId = simulationService.startSimulation(req.scenario(), req.startDate());
+            String requestedStart = req.effectiveStartDateTime();
+            String simId = simulationService.startSimulation(req.scenario(), requestedStart);
             var scenario = com.equipo2b.scheduler.execution.ScenarioType.valueOf(req.scenario());
 
-            // Calcular hora de inicio simulada (00:00 UTC del startDate, o ahora)
+            // Calcular hora de inicio simulada, o ahora si no se especificó
             String simStartTime;
-            if (req.startDate() != null && !req.startDate().isBlank()) {
-                simStartTime = java.time.LocalDate.parse(req.startDate())
-                    .atStartOfDay(java.time.ZoneOffset.UTC).toString();
+            if (requestedStart != null && !requestedStart.isBlank()) {
+                simStartTime = parseStartDateTime(requestedStart).toString();
             } else {
                 simStartTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).toString();
             }
@@ -76,6 +76,21 @@ public class SimulationRestController {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", (Object) e.getMessage()));
         }
+    }
+
+    private static java.time.ZonedDateTime parseStartDateTime(String value) {
+        String trimmed = value.trim();
+        try {
+            return java.time.ZonedDateTime.parse(trimmed);
+        } catch (Exception ignored) {
+            // Intentar formatos sin zona horaria abajo.
+        }
+        if (trimmed.contains("T")) {
+            return java.time.LocalDateTime.parse(trimmed, java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+                .atZone(java.time.ZoneOffset.UTC);
+        }
+        return java.time.LocalDate.parse(trimmed, java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
+            .atStartOfDay(java.time.ZoneOffset.UTC);
     }
 
     @PostMapping("/{id}/stop")

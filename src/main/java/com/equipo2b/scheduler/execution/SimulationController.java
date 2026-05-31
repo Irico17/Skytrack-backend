@@ -554,14 +554,9 @@ public class SimulationController {
                 return historical.subList(0, numBatches);
                 
             case PERIOD_SIMULATION:
-                // Generar datos futuros con factor de crecimiento moderado
-                ShipmentGenerator generator = new ShipmentGenerator();
-                List<ShipmentBatch> futureBatches = generator.generateFutureShipments(
-                    historical, scenario.getK(), 1.20
-                );
-                List<ShipmentBatch> allBatches = new ArrayList<>(historical);
-                allBatches.addAll(futureBatches);
-                return allBatches.subList(0, Math.min(500, allBatches.size()));
+                // Usar todos los lotes reales cargados para la ventana seleccionada.
+                // El filtrado por fecha/hora se realiza antes, en SimulationService.
+                return historical;
                 
             case COLLAPSE_SIMULATION:
                 // Generar datos futuros con factor de crecimiento alto

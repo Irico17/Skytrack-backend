@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="/etc/skytrack/backend.env"
 DB_NAME="scheduling_db"
 DB_USER="scheduling_user"
+MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -34,16 +35,41 @@ if [ -f "$ENV_FILE" ]; then
   DB_PASS="$(grep '^SPRING_DATASOURCE_PASSWORD=' "$ENV_FILE" | cut -d= -f2- || true)"
 fi
 if [ -z "$DB_PASS" ]; then
-  DB_PASS="$(openssl rand -base64 24 | tr -d '\n')"
+  # Generates a password that satisfies MySQL validate_password MEDIUM policy:
+  # uppercase, lowercase, digit, special char + 24 random hex chars
+  DB_PASS="${SKYTRACK_DB_PASSWORD:-Sky@$(openssl rand -hex 12 | tr -d '\n')1A}"
 fi
 
-mysql <<SQL
+SQL_FILE="$(mktemp)"
+DB_PASS_SQL="$(printf "%s" "$DB_PASS" | sed "s/'/''/g")"
+cat > "$SQL_FILE" <<SQL
 CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
-ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS_SQL}';
+ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS_SQL}';
 GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
+
+run_mysql_root_script() {
+  if [ -n "$MYSQL_ROOT_PASSWORD" ]; then
+    MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot < "$SQL_FILE"
+    return $?
+  fi
+
+  mysql -uroot < "$SQL_FILE" 2>/tmp/skytrack-mysql.err && return 0
+  mysql < "$SQL_FILE" 2>/tmp/skytrack-mysql.err && return 0
+  return 1
+}
+
+if ! run_mysql_root_script; then
+  echo "Could not connect to MySQL as root."
+  echo "If you know the MySQL root password, run: MYSQL_ROOT_PASSWORD='your-password' sudo -E ./install-dependencies.sh"
+  echo "If the password is unknown, reset it following the official MySQL procedure, then rerun this script."
+  cat /tmp/skytrack-mysql.err 2>/dev/null || true
+  rm -f "$SQL_FILE"
+  exit 1
+fi
+rm -f "$SQL_FILE"
 
 cat > "$ENV_FILE" <<EOF
 SPRING_PROFILES_ACTIVE=container
@@ -56,6 +82,8 @@ DATA_AIRPORTS_PATH=/opt/skytrack/backend/data/c.1inf54.26.1.v1.Aeropuerto.husos.
 DATA_FLIGHTS_PATH=/opt/skytrack/backend/data/planes_vuelo.txt
 DATA_SHIPMENTS_DIR=/opt/skytrack/backend/data/_envios_preliminar_
 DATA_RESULTS_DIR=/opt/skytrack/backend/data/results
+MAX_UPLOAD_FILE_SIZE=25MB
+MAX_UPLOAD_REQUEST_SIZE=128MB
 JPA_SHOW_SQL=false
 LOGGING_LEVEL_COM_EQUIPO2B=INFO
 JAVA_OPTS=-Xms256m -Xmx1200m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError

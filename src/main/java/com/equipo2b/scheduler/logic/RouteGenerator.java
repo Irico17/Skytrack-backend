@@ -4,6 +4,8 @@ import com.equipo2b.scheduler.model.*;
 
 import java.time.Duration;
 import java.time.ZonedDateTime;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.*;
 
 /**
@@ -22,8 +24,10 @@ import java.util.*;
 public class RouteGenerator {
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
+    private final Map<RouteCacheKey, List<List<Flight>>> routePathCache = new ConcurrentHashMap<>();
     
     private static final int MAX_ATTEMPTS = 20;
+    private static final int MAX_CACHED_VARIANTS = 4;
     private static final int MAX_HOPS = 3;  // Máximo de escalas
 
     /**
@@ -163,12 +167,38 @@ public class RouteGenerator {
      */
     public AssignedRoute generateFeasibleRoute(ShipmentBatch batch, List<Flight> allowedFlights) {
         Objects.requireNonNull(batch, "Batch cannot be null");
-        
         Duration sla = batch.calculateSLA();
+
+        if (allowedFlights == null) {
+            RouteCacheKey key = RouteCacheKey.from(batch, sla);
+            List<List<Flight>> cachedPaths = routePathCache.computeIfAbsent(
+                key,
+                ignored -> findCandidatePaths(batch, sla, null, MAX_CACHED_VARIANTS)
+            );
+
+            if (!cachedPaths.isEmpty()) {
+                List<Flight> path = cachedPaths.get(ThreadLocalRandom.current().nextInt(cachedPaths.size()));
+                try {
+                    return new AssignedRoute(batch, path);
+                } catch (IllegalArgumentException ex) {
+                    routePathCache.remove(key);
+                }
+            }
+            return null;
+        }
+
+        return generateFeasibleRouteUncached(batch, sla, allowedFlights, MAX_ATTEMPTS);
+    }
+
+    private AssignedRoute generateFeasibleRouteUncached(
+            ShipmentBatch batch,
+            Duration sla,
+            List<Flight> allowedFlights,
+            int maxAttempts) {
         
         // Intentar generar ruta hasta MAX_ATTEMPTS veces
         // Cada intento usa un orden aleatorio de vuelos para generar rutas diferentes
-        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
             try {
                 // Buscar secuencia de vuelos usando BFS con aleatoriedad
                 // IMPORTANTE: Siempre usar randomización para generar diversidad en GA
@@ -212,9 +242,60 @@ public class RouteGenerator {
         return null;
     }
 
+    private List<List<Flight>> findCandidatePaths(
+            ShipmentBatch batch,
+            Duration sla,
+            List<Flight> allowedFlights,
+            int maxCandidates) {
+        Map<String, List<Flight>> uniquePaths = new LinkedHashMap<>();
+
+        for (int attempt = 0; attempt < MAX_ATTEMPTS && uniquePaths.size() < maxCandidates; attempt++) {
+            try {
+                List<Flight> flightPath = findPath(
+                    batch.origin(),
+                    batch.destination(),
+                    batch.ingressTime(),
+                    sla,
+                    allowedFlights,
+                    true
+                );
+
+                if (flightPath == null || flightPath.isEmpty()) {
+                    continue;
+                }
+
+                AssignedRoute route = new AssignedRoute(batch, flightPath);
+                if (!route.meetsSLA()) {
+                    continue;
+                }
+
+                String signature = flightPath.stream()
+                    .map(Flight::flightId)
+                    .reduce((a, b) -> a + ">" + b)
+                    .orElse("");
+                uniquePaths.putIfAbsent(signature, List.copyOf(flightPath));
+            } catch (IllegalArgumentException e) {
+                // Intentar otro candidato
+            }
+        }
+
+        return List.copyOf(uniquePaths.values());
+    }
+
     /**
      * Nodo de búsqueda para BFS.
      * Representa un estado en la búsqueda de rutas.
      */
     private record SearchNode(Airport airport, ZonedDateTime currentTime, List<Flight> path) {}
+
+    private record RouteCacheKey(String originId, String destinationId, long ingressMinute, long slaMinutes) {
+        private static RouteCacheKey from(ShipmentBatch batch, Duration sla) {
+            return new RouteCacheKey(
+                batch.origin().id(),
+                batch.destination().id(),
+                batch.ingressTime().toInstant().getEpochSecond() / 60,
+                sla.toMinutes()
+            );
+        }
+    }
 }

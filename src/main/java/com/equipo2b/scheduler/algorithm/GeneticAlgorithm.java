@@ -82,11 +82,11 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @param batches Lista de lotes para los cuales generar rutas
      * @return Población inicial de soluciones
      */
-    private List<Solution> initializePopulation(List<ShipmentBatch> batches) {
+    private List<Solution> initializePopulation(List<ShipmentBatch> batches, int effectivePopulationSize) {
         Set<String> unroutableBatches = Collections.synchronizedSet(new HashSet<>());
         
-        Stream<Integer> populationIndexes = IntStream.range(0, populationSize).boxed();
-        if (shouldUseParallelism()) {
+        Stream<Integer> populationIndexes = IntStream.range(0, effectivePopulationSize).boxed();
+        if (shouldUseParallelism(effectivePopulationSize)) {
             populationIndexes = populationIndexes.parallel();
         }
 
@@ -139,8 +139,8 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * 
      * @param population Población de soluciones a evaluar
      */
-    private void evaluatePopulation(List<Solution> population) {
-        Stream<Solution> stream = shouldUseParallelism()
+    private void evaluatePopulation(List<Solution> population, int effectivePopulationSize) {
+        Stream<Solution> stream = shouldUseParallelism(effectivePopulationSize)
             ? population.parallelStream()
             : population.stream();
 
@@ -152,10 +152,30 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             });
     }
 
-    private boolean shouldUseParallelism() {
+    private boolean shouldUseParallelism(int effectivePopulationSize) {
         return parallelEnabled
             && Runtime.getRuntime().availableProcessors() >= parallelMinProcessors
-            && populationSize >= parallelPopulationThreshold;
+            && effectivePopulationSize >= parallelPopulationThreshold;
+    }
+
+    private int effectivePopulationSize(int batchCount) {
+        if (batchCount >= 4_000) return Math.min(populationSize, 8);
+        if (batchCount >= 2_000) return Math.min(populationSize, 10);
+        if (batchCount >= 1_000) return Math.min(populationSize, 14);
+        return populationSize;
+    }
+
+    private int effectiveGenerations(int batchCount) {
+        if (batchCount >= 4_000) return Math.min(generations, 4);
+        if (batchCount >= 2_000) return Math.min(generations, 5);
+        if (batchCount >= 1_000) return Math.min(generations, 8);
+        return generations;
+    }
+
+    private int effectiveStagnationLimit(int batchCount, int effectiveGenerations) {
+        if (batchCount >= 4_000) return Math.min(stagnationLimit, 3);
+        if (batchCount >= 2_000) return Math.min(stagnationLimit, 4);
+        return Math.min(stagnationLimit, effectiveGenerations);
     }
     
     /**
@@ -290,18 +310,28 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         
         // Configurar evaluador con cantidad esperada de lotes
         evaluator.setExpectedBatchCount(batches.size());
+        int effectivePopulationSize = effectivePopulationSize(batches.size());
+        int effectiveGenerations = effectiveGenerations(batches.size());
+        int effectiveStagnationLimit = effectiveStagnationLimit(batches.size(), effectiveGenerations);
+
+        if (effectivePopulationSize != populationSize || effectiveGenerations != generations) {
+            System.out.printf(
+                "Carga alta (%d lotes): GA adaptativo población=%d, generaciones=%d%n",
+                batches.size(), effectivePopulationSize, effectiveGenerations
+            );
+        }
         
         // 1. Inicializar población con rutas factibles
-        List<Solution> population = initializePopulation(batches);
+        List<Solution> population = initializePopulation(batches, effectivePopulationSize);
         
         // Variables para early stopping
         double bestFitnessSoFar = Double.MAX_VALUE;
         int stagnationCounter = 0;
         
         // 2. Evolucionar durante N generaciones (con early stopping)
-        for (int gen = 0; gen < generations; gen++) {
+        for (int gen = 0; gen < effectiveGenerations; gen++) {
             // Evaluar fitness de toda la población
-            evaluatePopulation(population);
+            evaluatePopulation(population, effectivePopulationSize);
             
             // Ordenar por fitness (menor es mejor)
             population.sort(Comparator.comparingDouble(Solution::getFitness));
@@ -315,9 +345,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 stagnationCounter++;
             }
             
-            if (stagnationCounter >= stagnationLimit) {
+            if (stagnationCounter >= effectiveStagnationLimit) {
                 System.out.printf("Early stopping at generation %d (no improvement for %d generations)%n", 
-                                gen, stagnationLimit);
+                                gen, effectiveStagnationLimit);
                 break;
             }
             
@@ -325,12 +355,13 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             List<Solution> nextGeneration = new ArrayList<>();
             
             // Elitismo: preservar mejores soluciones
-            for (int i = 0; i < eliteCount && i < population.size(); i++) {
+            int effectiveEliteCount = Math.min(eliteCount, Math.max(1, effectivePopulationSize / 8));
+            for (int i = 0; i < effectiveEliteCount && i < population.size(); i++) {
                 nextGeneration.add(new Solution(population.get(i)));
             }
             
             // Generar resto de la población
-            while (nextGeneration.size() < populationSize) {
+            while (nextGeneration.size() < effectivePopulationSize) {
                 Solution parent1 = tournamentSelection(population);
                 Solution parent2 = tournamentSelection(population);
                 Solution child = crossover(parent1, parent2);
@@ -346,7 +377,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         }
         
         // Evaluar población final y retornar mejor
-        evaluatePopulation(population);
+        evaluatePopulation(population, effectivePopulationSize);
         population.sort(Comparator.comparingDouble(Solution::getFitness));
         return population.get(0);
     }

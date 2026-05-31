@@ -92,10 +92,12 @@ public class FlightPlan {
         List<Flight> adjustedFlights = new ArrayList<>();
         
         // Calcular cuántos días necesitamos proyectar los vuelos
-        long daysDiff = java.time.temporal.ChronoUnit.DAYS.between(
-            baseFlights.isEmpty() ? start : baseFlights.get(0).departureTime().toLocalDate(),
-            start.toLocalDate()
-        );
+        long daysDiff = baseFlights.isEmpty()
+            ? 0
+            : java.time.temporal.ChronoUnit.DAYS.between(
+                baseFlights.get(0).departureTime().toLocalDate(),
+                start.toLocalDate()
+            );
         
         // Para cada vuelo base, crear instancias ajustadas que caigan en la ventana temporal
         for (Flight baseFlight : baseFlights) {

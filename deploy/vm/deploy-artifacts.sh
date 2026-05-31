@@ -36,7 +36,16 @@ install -m 0644 "$JAR_SRC" /opt/skytrack/backend/scheduling-core.jar
 rm -rf /var/www/skytrack/*
 cp -a "$FRONTEND_SRC/." /var/www/skytrack/
 
-cp -a "$DATA_SRC/." /opt/skytrack/backend/data/
+if [ "${SKYTRACK_OVERWRITE_DATA:-false}" = "true" ] \
+  || [ ! -f /opt/skytrack/backend/data/c.1inf54.26.1.v1.Aeropuerto.husos.v1.20250818__estudiantes.txt ] \
+  || [ ! -f /opt/skytrack/backend/data/planes_vuelo.txt ] \
+  || [ ! -d /opt/skytrack/backend/data/_envios_preliminar_ ]; then
+  rm -rf /opt/skytrack/backend/data/_envios_preliminar_
+  cp -a "$DATA_SRC/." /opt/skytrack/backend/data/
+else
+  echo "Preserving existing static data in /opt/skytrack/backend/data."
+  echo "Set SKYTRACK_OVERWRITE_DATA=true to restore bundled defaults."
+fi
 install -d -m 0755 /opt/skytrack/backend/data/results
 
 chown -R skytrack:skytrack /opt/skytrack
@@ -48,13 +57,14 @@ systemctl restart skytrack-backend
 nginx -t
 systemctl reload nginx
 
-for i in $(seq 1 30); do
+echo "Waiting for backend to start (up to 90s)..."
+for i in $(seq 1 90); do
   if curl -fsS http://127.0.0.1:8081/actuator/health >/dev/null; then
-    echo "Backend health OK"
+    echo "Backend health OK (${i}s)"
     break
   fi
-  if [ "$i" -eq 30 ]; then
-    echo "Backend health check failed. Logs: journalctl -u skytrack-backend -n 120 --no-pager"
+  if [ "$i" -eq 90 ]; then
+    echo "Backend health check failed after 90s. Logs: journalctl -u skytrack-backend -n 120 --no-pager"
     exit 1
   fi
   sleep 1

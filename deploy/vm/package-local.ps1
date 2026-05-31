@@ -48,6 +48,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $BundleRoot 'backend\data\r
 
 Copy-Item (Join-Path $FrontendRoot 'dist') (Join-Path $BundleRoot 'frontend\dist') -Recurse -Force
 Copy-Item (Join-Path $BackendRoot 'deploy\vm') (Join-Path $BundleRoot 'deploy\vm') -Recurse -Force
+$BundleDeploySsh = Join-Path $BundleRoot 'deploy\vm\.ssh'
+if (Test-Path $BundleDeploySsh) {
+  Remove-Item $BundleDeploySsh -Recurse -Force
+}
 
 if (Test-Path $TarPath) {
   Remove-Item $TarPath -Force
@@ -56,6 +60,7 @@ tar -czf $TarPath -C $BundleRoot .
 if ($LASTEXITCODE -ne 0) {
   throw 'tar failed while creating deploy archive'
 }
+Remove-Item $BundleRoot -Recurse -Force
 
 Write-Host "Created package: $TarPath"
 Write-Host 'Upload it with:'

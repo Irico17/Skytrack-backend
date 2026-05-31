@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -103,6 +104,7 @@ public class DataLoadingService {
         try (Stream<Path> files = Files.list(dir)) {
             files.filter(p -> p.getFileName().toString().startsWith("_envios_")
                                && p.getFileName().toString().endsWith("_.txt"))
+                 .sorted(Comparator.comparing(p -> p.getFileName().toString()))
                  .forEach(file -> {
                      try {
                          List<ShipmentBatch> batches = shipmentUploader.loadShipments(
@@ -124,6 +126,8 @@ public class DataLoadingService {
                      }
                  });
         }
+
+        all.sort(Comparator.comparing(ShipmentBatch::ingressTime));
 
         String rangeMsg = (start != null)
             ? String.format(" [%s → %s]", start.toLocalDate(), end != null ? end.toLocalDate() : "∞")
