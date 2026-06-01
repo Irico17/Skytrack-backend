@@ -25,17 +25,21 @@ public enum ScenarioType {
     ),
     
     /**
-     * Escenario 2: Simulación de Período (K=14).
-     * - Simula 3-5 días de operación
-     * - 500 lotes aproximadamente
+     * Escenario 2: Simulación de Período (K=120).
+     * - Simula 5 días de operación
      * - Configuración balanceada de algoritmos
-     * - Debe completarse en 30-90 minutos reales
+     * - Debe completarse en ~60 minutos reales
+     *
+     * <p>Timing: Sc = Sa×K = 3×120 = 360 min (6h de datos por ciclo). Cada ciclo
+     * consume la mitad de datos que antes (antes 12h) para reducir la carga pico del
+     * GATS por ejecución y mantener el algoritmo dentro de su ventana en la VM (2 CPU).
+     * 5 días = 7200 min / 360 = 20 ciclos × 3 min reales ≈ 60 min reales totales.
      */
     PERIOD_SIMULATION(
-        120,  // K: Factor de aceleración — Sc=6×120=720min(12h). 5 días = 10 ciclos ≈ 60 min reales
-        3,    // Ta: Tiempo máximo de algoritmo (minutos)
-        6,    // Sa: Salto entre ejecuciones (minutos)
-        "Escenario 2: Simulación 5 Días (K=120, Ta=3, Sa=6)"
+        120,  // K: Factor de aceleración (1 min real = 120 min simulados)
+        2,    // Ta: Tiempo máximo de algoritmo (minutos reales)
+        3,    // Sa: Salto entre ejecuciones (minutos reales) — Sc=3×120=360min(6h)
+        "Escenario 2: Simulación 5 Días (K=120, Ta=2, Sa=3)"
     ),
     
     /**

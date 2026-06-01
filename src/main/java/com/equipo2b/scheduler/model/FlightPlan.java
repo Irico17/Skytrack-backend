@@ -3,6 +3,7 @@ package com.equipo2b.scheduler.model;
 import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Gestiona el plan maestro de vuelos.
@@ -18,6 +19,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class FlightPlan {
     private final List<Flight> allFlights;
     private final Map<String, List<Flight>> flightsByOrigin;  // Índice para búsqueda rápida por Airport ID
+    private final Map<FlightQueryKey, List<Flight>> projectedFlightsCache = new ConcurrentHashMap<>();
+    private static final int MAX_PROJECTED_FLIGHT_CACHE_ENTRIES = 60_000;
 
     /**
      * Set thread-safe de IDs de vuelos cancelados durante la simulación.
@@ -25,6 +28,7 @@ public class FlightPlan {
      * Persistido solo en memoria durante la simulación activa.
      */
     private final Set<String> cancelledFlightIds = ConcurrentHashMap.newKeySet();
+    private final AtomicLong cancellationRevision = new AtomicLong(0);
 
     /**
      * Constructor vacío que inicializa estructuras de datos.
@@ -88,6 +92,16 @@ public class FlightPlan {
     public List<Flight> getFlightsFromAirport(Airport origin, 
                                               ZonedDateTime start, 
                                               ZonedDateTime end) {
+        FlightQueryKey queryKey = FlightQueryKey.from(origin, start, end, cancellationRevision.get());
+        List<Flight> cachedFlights = projectedFlightsCache.get(queryKey);
+        if (cachedFlights != null) {
+            return cachedFlights;
+        }
+
+        if (projectedFlightsCache.size() > MAX_PROJECTED_FLIGHT_CACHE_ENTRIES) {
+            projectedFlightsCache.clear();
+        }
+
         List<Flight> baseFlights = flightsByOrigin.getOrDefault(origin.id(), Collections.emptyList());
         List<Flight> adjustedFlights = new ArrayList<>();
         
@@ -129,8 +143,15 @@ public class FlightPlan {
                 }
             }
         }
+
+        adjustedFlights.sort(Comparator
+            .comparing(Flight::departureTime)
+            .thenComparing(Flight::arrivalTime)
+            .thenComparing(Flight::flightId));
         
-        return adjustedFlights;
+        List<Flight> immutableFlights = List.copyOf(adjustedFlights);
+        List<Flight> existingFlights = projectedFlightsCache.putIfAbsent(queryKey, immutableFlights);
+        return existingFlights != null ? existingFlights : immutableFlights;
     }
 
     /**
@@ -200,6 +221,8 @@ public class FlightPlan {
      */
     public void cancelFlight(String adjustedFlightId) {
         cancelledFlightIds.add(adjustedFlightId);
+        cancellationRevision.incrementAndGet();
+        projectedFlightsCache.clear();
     }
 
     /**
@@ -224,5 +247,18 @@ public class FlightPlan {
      */
     public void clearCancellations() {
         cancelledFlightIds.clear();
+        cancellationRevision.incrementAndGet();
+        projectedFlightsCache.clear();
+    }
+
+    private record FlightQueryKey(String originId, long startEpochSecond, long endEpochSecond, long cancellationRevision) {
+        private static FlightQueryKey from(Airport origin, ZonedDateTime start, ZonedDateTime end, long revision) {
+            return new FlightQueryKey(
+                origin.id(),
+                start.toInstant().getEpochSecond(),
+                end.toInstant().getEpochSecond(),
+                revision
+            );
+        }
     }
 }

@@ -26,6 +26,7 @@ public record SimulationResultsDTO(
         int day,
         String date,
         int routesCompleted,
+        int totalBags,
         int batchesOnTime,
         int batchesDelayed,
         int batchesCritical,

@@ -12,6 +12,7 @@ import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -32,6 +33,8 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
     private final ObjectMapper mapper;
 
     private volatile String activeSimId = "N/A";
+    private volatile String lastCycleUpdateJson;
+    private volatile String lastStorageUpdateJson;
 
     public SimulationWebSocketHandler(ObjectMapper mapper) {
         this.mapper = mapper;
@@ -48,6 +51,7 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
             "message", "Conectado al stream de simulación",
             "simulationId", activeSimId
         ))));
+        sendSnapshot(session);
     }
 
     @Override
@@ -63,7 +67,9 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
      */
     public void onCycleCompleted(SimulationStatus status, Solution solution, CycleUpdateDTO update) {
         try {
-            broadcast(mapper.writeValueAsString(update));
+            String json = mapper.writeValueAsString(update);
+            lastCycleUpdateJson = json;
+            broadcast(json);
         } catch (Exception e) {
             System.err.println("⚠️ Error serializando CYCLE_UPDATE: " + e.getMessage());
         }
@@ -71,7 +77,9 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
 
     public void onStorageUpdated(StorageUpdateDTO update) {
         try {
-            broadcast(mapper.writeValueAsString(update));
+            String json = mapper.writeValueAsString(update);
+            lastStorageUpdateJson = json;
+            broadcast(json);
         } catch (Exception e) {
             System.err.println("⚠️ Error serializando STORAGE_UPDATE: " + e.getMessage());
         }
@@ -119,12 +127,56 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
     }
 
     @Override
+    public void onSimulationError(SimulationStatus status, String errorMessage) {
+        try {
+            String safeMessage = errorMessage != null && !errorMessage.isBlank()
+                ? errorMessage
+                : "La simulación terminó por un error interno";
+            Map<String, Object> msg = Map.of(
+                "type", "SIMULATION_ERROR",
+                "simulationId", activeSimId,
+                "simulationComplete", false,
+                "message", safeMessage,
+                "currentCycle", status.currentCycle(),
+                "batchesProcessed", status.batchesProcessed(),
+                "collapseLevel", status.collapseLevel().name()
+            );
+            broadcast(mapper.writeValueAsString(msg));
+        } catch (Exception e) {
+            System.err.println("⚠️ Error serializando error WebSocket: " + e.getMessage());
+        }
+    }
+
+    @Override
     public void onStorageUpdated(SimulationStatus status, Solution solution) {
         // SimulationService construye el DTO completo; este fallback se mantiene vacio.
     }
 
     public void setActiveSimId(String simId) {
+        if (!Objects.equals(this.activeSimId, simId)) {
+            lastCycleUpdateJson = null;
+            lastStorageUpdateJson = null;
+        }
         this.activeSimId = simId;
+    }
+
+    private void sendSnapshot(WebSocketSession session) {
+        sendIfOpen(session, lastCycleUpdateJson);
+        sendIfOpen(session, lastStorageUpdateJson);
+    }
+
+    private void sendIfOpen(WebSocketSession session, String json) {
+        if (json == null || !session.isOpen()) return;
+        try {
+            synchronized (session) {
+                if (session.isOpen()) {
+                    session.sendMessage(new TextMessage(json));
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ Error enviando snapshot WebSocket a " + session.getId()
+                + ": " + e.getMessage());
+        }
     }
 
     private void broadcast(String json) {

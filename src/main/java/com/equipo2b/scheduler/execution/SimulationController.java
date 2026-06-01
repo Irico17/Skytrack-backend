@@ -28,6 +28,7 @@ import java.util.UUID;
  */
 public class SimulationController {
     private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
+    private static final long STORAGE_UPDATE_INTERVAL_MS = 250L;
     
     // Componentes del sistema
     private final FlightPlan flightPlan;
@@ -46,6 +47,10 @@ public class SimulationController {
     private TabuSearch tabuSearch;
     private RouteValidator validator;
     private ScenarioType currentScenario;
+    private volatile ZonedDateTime simulatedClockHorizon;
+    private volatile Thread storageUpdateThread;
+    private volatile String lastErrorMessage;
+    private volatile boolean completedNaturally;
 
     // Identificador único de la simulación activa
     private String simulationId;
@@ -127,6 +132,10 @@ public class SimulationController {
         this.simulatedTime = startDate != null
             ? startDate
             : (currentBatches.isEmpty() ? ZonedDateTime.now() : currentBatches.get(0).ingressTime());
+        this.simulatedClockHorizon = this.simulatedTime;
+        this.storageUpdateThread = null;
+        this.lastErrorMessage = null;
+        this.completedNaturally = false;
         this.currentCycle = 0;
         this.batchesProcessed = 0;
         this.batchesFailed = 0;
@@ -241,11 +250,10 @@ public class SimulationController {
      * 
      * **Validates: Requirements 24.1, 24.4, 24.5, 12.1-12.6, 25.1-25.4**
      */
-    public void registerCancellation(String flightId) {
+    public ReplanResult registerCancellation(String flightId) {
         // 1. Validar que hay simulación activa
         if (!running.get()) {
-            System.out.println("⚠️  No hay simulación activa");
-            return;
+            throw new IllegalStateException("No hay simulación activa");
         }
         
         System.out.println("\n" + "=".repeat(80));
@@ -257,7 +265,7 @@ public class SimulationController {
         if (cancelledFlight == null) {
             System.out.println("❌ Error: Vuelo no encontrado: " + flightId);
             System.out.println("=".repeat(80));
-            return;
+            throw new IllegalArgumentException("Vuelo no encontrado: " + flightId);
         }
         
         System.out.println("✓ Vuelo encontrado:");
@@ -271,7 +279,7 @@ public class SimulationController {
             System.out.println("  Tiempo simulado: " + simulatedTime);
             System.out.println("  Hora de salida: " + cancelledFlight.departureTime());
             System.out.println("=".repeat(80));
-            return;
+            throw new IllegalArgumentException("No se puede cancelar: el vuelo ya despegó");
         }
         
         System.out.println("✓ Vuelo puede ser cancelado (no ha despegado)");
@@ -287,6 +295,7 @@ public class SimulationController {
         // 6. Actualizar solución en Scheduler
         scheduler.updateSolution(result.updatedSolution());
         this.currentSolution = result.updatedSolution();
+        this.batchesProcessed = currentSolution.getRoutes().size();
         
         // 7. Logging de resultados
         System.out.println("\n📊 RESULTADO DE REPLANIFICACIÓN:");
@@ -313,6 +322,16 @@ public class SimulationController {
         
         System.out.println("\n✓ Replanificación completada exitosamente");
         System.out.println("=".repeat(80));
+
+        if (listener != null) {
+            try {
+                listener.onCycleCompleted(getStatus(), currentSolution);
+            } catch (Exception e) {
+                System.err.println("⚠️ Error notificando replanificación: " + e.getMessage());
+            }
+        }
+
+        return result;
     }
     
     /**
@@ -322,8 +341,34 @@ public class SimulationController {
      * @return Vuelo encontrado o null si no existe
      */
     private Flight findFlightById(String flightId) {
+        String baseId = flightId;
+        Long dayOffset = null;
+
+        int suffixIndex = flightId.lastIndexOf("-D");
+        if (suffixIndex > 0 && suffixIndex + 2 < flightId.length()) {
+            String candidateOffset = flightId.substring(suffixIndex + 2);
+            try {
+                dayOffset = Long.parseLong(candidateOffset);
+                baseId = flightId.substring(0, suffixIndex);
+            } catch (NumberFormatException ignored) {
+                dayOffset = null;
+                baseId = flightId;
+            }
+        }
+
         for (Flight flight : flightPlan.getAllFlights()) {
-            if (flight.flightId().equals(flightId)) {
+            if (flight.flightId().equals(baseId)) {
+                if (dayOffset != null) {
+                    return new Flight(
+                        flightId,
+                        flight.origin(),
+                        flight.destination(),
+                        flight.departureTime().plusDays(dayOffset),
+                        flight.arrivalTime().plusDays(dayOffset),
+                        flight.capacity(),
+                        flight.type()
+                    );
+                }
                 return flight;
             }
         }
@@ -415,6 +460,13 @@ public class SimulationController {
         try {
             long simStartRealMs = System.currentTimeMillis();
             long simStartSimMs = simulatedTime.toInstant().toEpochMilli();
+            ZonedDateTime planningCursor = simulatedTime;
+            ZonedDateTime simulationEndTime = scenario == ScenarioType.PERIOD_SIMULATION
+                ? planningCursor.plusDays(5)
+                : null;
+
+            simulatedClockHorizon = planningCursor;
+            startStorageUpdateLoop(simStartRealMs, simStartSimMs, scenario);
 
             while (running.get()) {
                 // Esperar si está pausado
@@ -428,14 +480,20 @@ public class SimulationController {
                 currentCycle++;
                 long cycleStartRealMs = System.currentTimeMillis();
                 System.out.println("\n--- CICLO " + currentCycle + " ---");
+                ZonedDateTime cyclePlanningTime = planningCursor;
+                ZonedDateTime cycleHorizon = cyclePlanningTime.plusMinutes(scenario.getSc());
+                simulatedClockHorizon = cycleHorizon;
                 
-                // 1. Ejecutar algoritmo (hasta Ta minutos reales máximo)
-                currentSolution = scheduler.executePlanningCycle(simulatedTime);
+                // 1. Ejecutar algoritmo sobre una ventana de consumo discreta y secuencial.
+                //    Si el algoritmo se demora, el siguiente ciclo no salta datos: continúa
+                //    desde cycleHorizon, no desde el reloj de pared.
+                currentSolution = scheduler.executePlanningCycle(cyclePlanningTime);
                 long algorithmMs = System.currentTimeMillis() - cycleStartRealMs;
+                planningCursor = cycleHorizon;
                 logResourceUsage(scenario, algorithmMs);
 
                 // Actualizar estadísticas
-                batchesProcessed = currentSolution.getRoutes().size();
+                updateBatchCounters(planningCursor);
 
                 // 2. Avanzar tiempo simulado: basado en tiempo real transcurrido × K
                 //    Esto asegura que el reloj del backend coincida con el del frontend
@@ -456,19 +514,40 @@ public class SimulationController {
                     }
                 }
 
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION
+                        && algorithmMs > scenario.getTa() * 60_000L) {
+                    System.out.println("\n⚠️  COLAPSO POR COMPLEJIDAD ALGORÍTMICA - tiempo de ciclo excedió Ta="
+                        + scenario.getTa() + " min");
+                    completedNaturally = true;
+                    break;
+                }
+
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION && isWarehouseNetworkCollapsed()) {
+                    System.out.println("\n⚠️  COLAPSO POR SATURACIÓN DE ALMACENES - más del 50% de aeropuertos críticos");
+                    completedNaturally = true;
+                    break;
+                }
+
                 if (collapseStatus.isCollapsed()) {
                     if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
                         System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
+                        completedNaturally = true;
                         break;
                     } else {
                         System.out.println("⚠️  Alerta de colapso (informativo) - la simulación continúa");
                     }
                 }
                 
-                // 5. Condición de parada natural para simulación de 5 días
-                if (scenario == ScenarioType.PERIOD_SIMULATION && daysElapsed >= 5.0) {
+                // 5. Condición de parada natural para simulación de 5 días.
+                //    Usa el cursor planificado para completar toda la ventana sin saltos
+                //    aunque la VM tarde más que Sa en algún ciclo.
+                if (simulationEndTime != null && !planningCursor.isBefore(simulationEndTime)) {
+                    simulatedClockHorizon = simulationEndTime;
+                    simulatedTime = simulationEndTime;
+                    daysElapsed = 5.0;
                     System.out.println("\n✅ Simulación de 5 días completada (días transcurridos: " 
                         + String.format("%.2f", daysElapsed) + ")");
+                    completedNaturally = true;
                     break;
                 }
 
@@ -481,7 +560,7 @@ public class SimulationController {
                 if (remainingMs > 0) {
                     System.out.printf("⏳ Algoritmo terminó en %.1fs — esperando %.1fs hasta el siguiente ciclo (Sa=%d min)%n",
                         algorithmMs / 1000.0, remainingMs / 1000.0, scenario.getSa());
-                    sleepUntilNextCycle(remainingMs, simStartRealMs, simStartSimMs, scenario);
+                    sleepUntilNextCycle(remainingMs);
                 } else {
                     System.out.printf("⚠️ Algoritmo tardó %.1fs (> Sa=%d min) — siguiente ciclo inmediato%n",
                         algorithmMs / 1000.0, scenario.getSa());
@@ -491,9 +570,17 @@ public class SimulationController {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             System.out.println("⚠️  Simulación interrumpida");
+        } catch (Exception e) {
+            lastErrorMessage = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            System.err.println("❌ Simulación falló: " + lastErrorMessage);
+            e.printStackTrace();
         } finally {
             running.set(false);
             paused.set(false);
+            if (storageUpdateThread != null) {
+                storageUpdateThread.interrupt();
+                storageUpdateThread = null;
+            }
             state = SimulationState.STOPPED;
             System.out.println("\n✓ Simulación finalizada");
             printFinalSummary();
@@ -501,7 +588,13 @@ public class SimulationController {
             // Notificar listener (WebSocket) al terminar
             if (listener != null) {
                 try {
-                    listener.onSimulationFinished(getStatus());
+                    if (lastErrorMessage != null) {
+                        listener.onSimulationError(getStatus(), lastErrorMessage);
+                    } else if (completedNaturally) {
+                        listener.onSimulationFinished(getStatus());
+                    } else {
+                        System.out.println("✓ Simulación detenida antes de completarse; no se exportan resultados finales");
+                    }
                 } catch (Exception e) {
                     System.err.println("⚠️ Error notificando listener en finish: " + e.getMessage());
                 }
@@ -532,14 +625,48 @@ public class SimulationController {
         );
     }
 
+    private void updateBatchCounters(ZonedDateTime plannedUntil) {
+        int routed = currentSolution != null ? currentSolution.getRoutes().size() : 0;
+        long delayed = currentSolution != null
+            ? currentSolution.getRoutes().values().stream().filter(route -> !route.meetsSLA()).count()
+            : 0;
+        long released = currentBatches != null
+            ? currentBatches.stream()
+                .filter(batch -> !batch.ingressTime().isAfter(plannedUntil))
+                .count()
+            : routed;
+        long releasedWithoutRoute = Math.max(0, released - routed);
+
+        batchesProcessed = routed;
+        batchesFailed = Math.toIntExact(Math.min(Integer.MAX_VALUE, delayed + releasedWithoutRoute));
+    }
+
+    private boolean isWarehouseNetworkCollapsed() {
+        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
+            return false;
+        }
+
+        StorageInventoryService inventoryService = new StorageInventoryService(airportManager);
+        Map<Airport, Integer> currentBags = inventoryService.calculateCurrentBags(currentSolution, simulatedTime, currentBatches);
+        if (currentBags.isEmpty()) {
+            return false;
+        }
+
+        long criticalAirports = currentBags.entrySet().stream()
+            .filter(entry -> entry.getKey().storageCapacity() > 0
+                && entry.getValue() >= entry.getKey().storageCapacity() * 0.90)
+            .count();
+        return criticalAirports * 2 > currentBags.size();
+    }
+
     private void releaseHeavyState(ScenarioType scenario) {
         if (scenario == ScenarioType.PERIOD_SIMULATION || scenario == ScenarioType.DAY_TO_DAY) {
             currentBatches = Collections.emptyList();
-            currentSolution = new Solution();
             scheduler = null;
             tabuSearch = null;
             validator = null;
-            System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name());
+            System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name()
+                + "; última solución preservada para consulta REST");
         }
     }
     
@@ -594,13 +721,18 @@ public class SimulationController {
                 
             case PERIOD_SIMULATION:
                 // Configuración ajustada para VM 2 CPU / 2 GB
-                gaConfig.setInt("populationSize", 30);
-                gaConfig.setInt("generations", 15);
+                gaConfig.setInt("populationSize", 20);
+                gaConfig.setInt("generations", 10);
                 gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setInt("stagnationLimit", 4);
                 gaConfig.setBoolean("parallelEnabled", false);
-                tabuConfig.setInt("maxIterations", 80);
+                gaConfig.setInt("routeSearchAttempts", 10);
+                gaConfig.setInt("routeCachedVariants", 3);
+                tabuConfig.setInt("maxIterations", 32);
                 tabuConfig.setInt("tabuTenure", 12);
-                tabuConfig.setInt("neighborhoodSize", 20);
+                tabuConfig.setInt("neighborhoodSize", 8);
+                tabuConfig.setInt("routeSearchAttempts", 8);
+                tabuConfig.setInt("routeCachedVariants", 2);
                 break;
                 
             case COLLAPSE_SIMULATION:
@@ -685,6 +817,11 @@ public class SimulationController {
         void onStorageUpdated(SimulationStatus status, Solution solution);
 
         /**
+         * Llamado cuando la simulación termina por un error no recuperable.
+         */
+        void onSimulationError(SimulationStatus status, String errorMessage);
+
+        /**
          * Llamado cuando la simulación termina (por fin de datos, colapso o stop manual).
          * @param status Estado final
          */
@@ -710,38 +847,53 @@ public class SimulationController {
         }
     }
 
-    private void sleepUntilNextCycle(
-            long totalMs,
-            long simStartRealMs,
-            long simStartSimMs,
-            ScenarioType scenario) throws InterruptedException {
-        long remaining = totalMs;
-        while (remaining > 0 && running.get()) {
-            while (paused.get() && running.get()) {
-                Thread.sleep(100);
-            }
-            if (!running.get()) return;
+    private void sleepUntilNextCycle(long totalMs) throws InterruptedException {
+        sleepInterruptibly(totalMs);
+    }
 
-            long chunk = Math.min(remaining, 1000);
-            Thread.sleep(chunk);
-            remaining -= chunk;
-
-            updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
-            if (listener != null) {
+    private void startStorageUpdateLoop(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {
+        storageUpdateThread = new Thread(() -> {
+            while (running.get()) {
                 try {
-                    listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
-                } catch (Exception e) {
-                    System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
+                    while (paused.get() && running.get()) {
+                        Thread.sleep(100);
+                    }
+                    if (!running.get()) return;
+
+                    updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
+                    notifyStorageUpdated();
+                    Thread.sleep(STORAGE_UPDATE_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
+        }, "simulation-storage-updates-" + simulationId);
+        storageUpdateThread.setDaemon(true);
+        storageUpdateThread.start();
+    }
+
+    private void notifyStorageUpdated() {
+        if (listener == null) return;
+        try {
+            listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
+        } catch (Exception e) {
+            System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
         }
     }
 
     private void updateSimulatedClock(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {
         long realElapsedMs = System.currentTimeMillis() - simStartRealMs;
         long simElapsedMs = realElapsedMs * scenario.getK();
-        simulatedTime = java.time.Instant.ofEpochMilli(simStartSimMs + simElapsedMs)
+        ZonedDateTime wallClockTime = java.time.Instant.ofEpochMilli(simStartSimMs + simElapsedMs)
             .atZone(startDate != null ? startDate.getZone() : java.time.ZoneOffset.UTC);
+
+        ZonedDateTime horizon = simulatedClockHorizon;
+        if (horizon != null && wallClockTime.isAfter(horizon)) {
+            wallClockTime = horizon;
+        }
+
+        simulatedTime = wallClockTime;
 
         if (startDate != null) {
             long minutesElapsed = java.time.Duration.between(startDate, simulatedTime).toMinutes();

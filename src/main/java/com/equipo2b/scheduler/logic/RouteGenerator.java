@@ -16,7 +16,7 @@ import java.util.*;
  * - Capacidad de vuelos
  * - Capacidad de almacenes
  * - Tiempos de escala (mínimo 10 minutos)
- * - SLA (24h mismo continente, 48h diferentes continentes)
+ * - SLA (12h mismo continente, 24h diferentes continentes)
  * - Conexiones válidas entre vuelos
  * 
  * **Validates: Requirements 14.1, 14.6**
@@ -26,8 +26,9 @@ public class RouteGenerator {
     private final AirportManager airportManager;
     private final Map<RouteCacheKey, List<List<Flight>>> routePathCache = new ConcurrentHashMap<>();
     
-    private static final int MAX_ATTEMPTS = 20;
-    private static final int MAX_CACHED_VARIANTS = 4;
+    private int maxAttempts = 12;
+    private int maxCachedVariants = 3;
+    private static final int MAX_ROUTE_CACHE_ENTRIES = 20_000;
     private static final int MAX_HOPS = 3;  // Máximo de escalas
 
     /**
@@ -39,6 +40,12 @@ public class RouteGenerator {
     public RouteGenerator(FlightPlan flightPlan, AirportManager airportManager) {
         this.flightPlan = Objects.requireNonNull(flightPlan, "FlightPlan cannot be null");
         this.airportManager = Objects.requireNonNull(airportManager, "AirportManager cannot be null");
+    }
+
+    public void configureSearchEffort(int maxAttempts, int maxCachedVariants) {
+        this.maxAttempts = Math.max(1, maxAttempts);
+        this.maxCachedVariants = Math.max(1, maxCachedVariants);
+        routePathCache.clear();
     }
 
     /**
@@ -68,7 +75,7 @@ public class RouteGenerator {
         Set<String> visited = new HashSet<>();
         
         // Random para shufflear vuelos (si randomize = true)
-        Random random = randomize ? new Random() : null;
+        Random random = randomize ? ThreadLocalRandom.current() : null;
         
         while (!queue.isEmpty()) {
             SearchNode node = queue.poll();
@@ -102,6 +109,11 @@ public class RouteGenerator {
             // IMPORTANTE: Shufflear vuelos para generar rutas diferentes
             if (randomize && random != null) {
                 Collections.shuffle(availableFlights, random);
+            } else {
+                availableFlights.sort(Comparator
+                    .comparing(Flight::departureTime)
+                    .thenComparing(Flight::arrivalTime)
+                    .thenComparing(Flight::flightId));
             }
             
             for (Flight flight : availableFlights) {
@@ -140,7 +152,7 @@ public class RouteGenerator {
 
     /**
      * Genera una ruta factible para un lote de maletas.
-     * Intenta hasta MAX_ATTEMPTS veces encontrar una ruta válida.
+    * Intenta según el esfuerzo configurado encontrar una ruta válida.
      * 
      * @param batch Lote de maletas para el cual generar la ruta
      * @return AssignedRoute factible o null si no se encuentra ruta
@@ -151,9 +163,34 @@ public class RouteGenerator {
         return generateFeasibleRoute(batch, null);
     }
 
+    public AssignedRoute generateEarliestFeasibleRoute(ShipmentBatch batch) {
+        Objects.requireNonNull(batch, "Batch cannot be null");
+        Duration sla = batch.calculateSLA();
+
+        try {
+            List<Flight> flightPath = findPath(
+                batch.origin(),
+                batch.destination(),
+                batch.ingressTime(),
+                sla,
+                null,
+                false
+            );
+
+            if (flightPath == null || flightPath.isEmpty()) {
+                return null;
+            }
+
+            AssignedRoute route = new AssignedRoute(batch, flightPath);
+            return route.meetsSLA() ? route : null;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     /**
      * Genera una ruta factible para un lote de maletas usando solo vuelos permitidos.
-     * Intenta hasta MAX_ATTEMPTS veces encontrar una ruta válida.
+    * Intenta según el esfuerzo configurado encontrar una ruta válida.
      * 
      * IMPORTANTE: Introduce aleatoriedad shuffleando vuelos disponibles para generar
      * rutas diferentes en cada intento. Esto es crucial para que el Algoritmo Genético
@@ -170,10 +207,13 @@ public class RouteGenerator {
         Duration sla = batch.calculateSLA();
 
         if (allowedFlights == null) {
+            if (routePathCache.size() > MAX_ROUTE_CACHE_ENTRIES) {
+                routePathCache.clear();
+            }
             RouteCacheKey key = RouteCacheKey.from(batch, sla);
             List<List<Flight>> cachedPaths = routePathCache.computeIfAbsent(
                 key,
-                ignored -> findCandidatePaths(batch, sla, null, MAX_CACHED_VARIANTS)
+                ignored -> findCandidatePaths(batch, sla, null, maxCachedVariants)
             );
 
             if (!cachedPaths.isEmpty()) {
@@ -187,7 +227,7 @@ public class RouteGenerator {
             return null;
         }
 
-        return generateFeasibleRouteUncached(batch, sla, allowedFlights, MAX_ATTEMPTS);
+        return generateFeasibleRouteUncached(batch, sla, allowedFlights, maxAttempts);
     }
 
     private AssignedRoute generateFeasibleRouteUncached(
@@ -196,8 +236,28 @@ public class RouteGenerator {
             List<Flight> allowedFlights,
             int maxAttempts) {
         
-        // Intentar generar ruta hasta MAX_ATTEMPTS veces
+        // Intentar generar ruta hasta el máximo configurado
         // Cada intento usa un orden aleatorio de vuelos para generar rutas diferentes
+        try {
+            List<Flight> deterministicPath = findPath(
+                batch.origin(),
+                batch.destination(),
+                batch.ingressTime(),
+                sla,
+                allowedFlights,
+                false
+            );
+
+            if (deterministicPath != null && !deterministicPath.isEmpty()) {
+                AssignedRoute route = new AssignedRoute(batch, deterministicPath);
+                if (route.meetsSLA()) {
+                    return route;
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            // Continuar con variantes aleatorias
+        }
+
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             try {
                 // Buscar secuencia de vuelos usando BFS con aleatoriedad
@@ -238,7 +298,7 @@ public class RouteGenerator {
             }
         }
         
-        // No se pudo generar ruta factible después de MAX_ATTEMPTS intentos
+        // No se pudo generar ruta factible después de los intentos configurados
         return null;
     }
 
@@ -249,7 +309,31 @@ public class RouteGenerator {
             int maxCandidates) {
         Map<String, List<Flight>> uniquePaths = new LinkedHashMap<>();
 
-        for (int attempt = 0; attempt < MAX_ATTEMPTS && uniquePaths.size() < maxCandidates; attempt++) {
+        try {
+            List<Flight> deterministicPath = findPath(
+                batch.origin(),
+                batch.destination(),
+                batch.ingressTime(),
+                sla,
+                allowedFlights,
+                false
+            );
+
+            if (deterministicPath != null && !deterministicPath.isEmpty()) {
+                AssignedRoute route = new AssignedRoute(batch, deterministicPath);
+                if (route.meetsSLA()) {
+                    String signature = deterministicPath.stream()
+                        .map(Flight::flightId)
+                        .reduce((a, b) -> a + ">" + b)
+                        .orElse("");
+                    uniquePaths.putIfAbsent(signature, List.copyOf(deterministicPath));
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            // Intentar candidatos aleatorios
+        }
+
+        for (int attempt = 0; attempt < maxAttempts && uniquePaths.size() < maxCandidates; attempt++) {
             try {
                 List<Flight> flightPath = findPath(
                     batch.origin(),

@@ -16,6 +16,7 @@ import java.nio.file.Paths;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -71,15 +72,20 @@ public class SimulationResultExporter {
 
         // Construir snapshots por día (agrupamos rutas por día de llegada)
         List<SimulationResultsDTO.DaySnapshotDTO> snapshots = buildDaySnapshots(
-            solution, startDate, totalCycles
+            solution, startDate, scenario
         );
+
+        int daysCovered = snapshots.stream()
+            .mapToInt(SimulationResultsDTO.DaySnapshotDTO::day)
+            .max()
+            .orElse(scenario == ScenarioType.PERIOD_SIMULATION ? 5 : 1);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
         SimulationResultsDTO dto = new SimulationResultsDTO(
             simId,
             scenario.name(),
             startDate != null ? startDate.toLocalDate().toString() : "N/A",
-            startDate != null ? startDate.plusDays(5).toLocalDate().toString() : "N/A",
+            startDate != null ? startDate.plusDays(daysCovered).toLocalDate().toString() : "N/A",
             ZonedDateTime.now().format(fmt),
             solution.getFitness(),
             totalBatches,
@@ -112,11 +118,12 @@ public class SimulationResultExporter {
     // ===== PRIVATE =====
 
     private List<SimulationResultsDTO.DaySnapshotDTO> buildDaySnapshots(
-            Solution solution, ZonedDateTime startDate, int totalCycles) {
+            Solution solution, ZonedDateTime startDate, ScenarioType scenario) {
 
         List<SimulationResultsDTO.DaySnapshotDTO> snapshots = new ArrayList<>();
+        int daysToExport = calculateDaysToExport(solution, startDate, scenario);
 
-        for (int day = 1; day <= 5; day++) {
+        for (int day = 1; day <= daysToExport; day++) {
             final int d = day;
             ZonedDateTime dayStart = startDate != null ? startDate.plusDays(day - 1) : null;
             ZonedDateTime dayEnd   = startDate != null ? startDate.plusDays(day) : null;
@@ -132,6 +139,11 @@ public class SimulationResultExporter {
                     && (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
                     && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
                 .count();
+            int totalBags = solution.getRoutes().values().stream()
+                .filter(r -> (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
+                    && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
+                .mapToInt(r -> r.getBatch().quantity())
+                .sum();
 
             String dateStr = dayStart != null ? dayStart.toLocalDate().toString() : "Day " + d;
 
@@ -139,6 +151,7 @@ public class SimulationResultExporter {
                 d,
                 dateStr,
                 (int)(onTime + delayed),   // routesCompleted
+                totalBags,
                 (int) onTime,
                 (int) delayed,
                 0,                          // critical — no tenemos ese tracking por ahora
@@ -147,5 +160,21 @@ public class SimulationResultExporter {
             ));
         }
         return snapshots;
+    }
+
+    private int calculateDaysToExport(Solution solution, ZonedDateTime startDate, ScenarioType scenario) {
+        if (scenario == ScenarioType.PERIOD_SIMULATION) {
+            return 5;
+        }
+        if (startDate == null || solution.getRoutes().isEmpty()) {
+            return 1;
+        }
+
+        ZonedDateTime lastArrival = solution.getRoutes().values().stream()
+            .map(AssignedRoute::getFinalArrivalTime)
+            .max(Comparator.naturalOrder())
+            .orElse(startDate.plusDays(1));
+        long minutes = java.time.Duration.between(startDate, lastArrival).toMinutes();
+        return Math.max(1, (int) Math.ceil(minutes / (24.0 * 60.0)));
     }
 }

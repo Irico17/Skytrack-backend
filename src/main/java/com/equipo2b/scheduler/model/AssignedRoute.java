@@ -19,6 +19,13 @@ import java.util.Objects;
  * - Tiempo de escala mínimo de 10 minutos entre vuelos
  */
 public final class AssignedRoute {
+    /**
+     * Ventana de recojo en el destino final: tiempo que las maletas permanecen
+     * en el almacén del aeropuerto destino antes de ser recogidas por el cliente.
+     * Pasada esta ventana, las maletas liberan el almacén (dejan de ocupar capacidad).
+     */
+    private static final Duration FINAL_PICKUP_WINDOW = Duration.ofHours(2);
+
     private final ShipmentBatch batch;
     private final List<Flight> flights;
     private final List<StorageEvent> storageEvents;
@@ -108,11 +115,16 @@ public final class AssignedRoute {
     
     /**
      * Calcula los eventos de almacenamiento (llegadas y salidas) para esta ruta.
-     * 
+    *
      * Para cada vuelo:
      * - Se genera un evento ARRIVAL cuando las maletas llegan al aeropuerto destino
     * - Se genera un evento DEPARTURE solo cuando las maletas salen hacia el siguiente vuelo
-     * 
+    *
+     * <p>En el destino final, además del ARRIVAL, se genera un evento DEPARTURE tras la
+     * ventana de recojo ({@link #FINAL_PICKUP_WINDOW}): las maletas entregadas son recogidas
+     * por el cliente y liberan el almacén, evitando que el aeropuerto se sature de forma
+     * permanente con equipaje ya entregado.
+    *
      * @return Lista de eventos de almacenamiento ordenados cronológicamente
      */
     private List<StorageEvent> calculateStorageEvents() {
@@ -149,6 +161,15 @@ public final class AssignedRoute {
                 events.add(new StorageEvent(
                     flight.destination(),
                     nextFlight.departureTime(),
+                    batch.quantity(),
+                    StorageEventType.DEPARTURE
+                ));
+            } else {
+                // Destino final: las maletas son recogidas tras la ventana de recojo
+                // y liberan el almacén (no ocupan capacidad de forma permanente).
+                events.add(new StorageEvent(
+                    flight.destination(),
+                    flight.arrivalTime().plus(FINAL_PICKUP_WINDOW),
                     batch.quantity(),
                     StorageEventType.DEPARTURE
                 ));

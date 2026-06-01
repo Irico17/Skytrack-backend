@@ -16,6 +16,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -89,10 +90,10 @@ public class SimulationService implements SimulationController.SimulationListene
 
             // 2. Cargar envíos — filtrar por ventana real si aplica
             List<ShipmentBatch> batches;
-            if ((scenario == ScenarioType.PERIOD_SIMULATION || scenario == ScenarioType.DAY_TO_DAY)
-                    && currentStartDate != null) {
-                int windowDays = scenario == ScenarioType.PERIOD_SIMULATION ? 5 : 1;
-                ZonedDateTime endDate = currentStartDate.plusDays(windowDays);
+            if (scenario == ScenarioType.DAY_TO_DAY) {
+                batches = new ArrayList<>();
+            } else if (scenario == ScenarioType.PERIOD_SIMULATION && currentStartDate != null) {
+                ZonedDateTime endDate = currentStartDate.plusDays(5);
                 batches = dataService.loadShipmentsInRange(
                     currentAirportManager, clientRegistry, currentStartDate, endDate
                 );
@@ -295,9 +296,14 @@ public class SimulationService implements SimulationController.SimulationListene
         // Calcular batch summary
         long onTime  = solution.getRoutes().values().stream().filter(AssignedRoute::meetsSLA).count();
         long delayed = solution.getRoutes().values().stream().filter(r -> !r.meetsSLA()).count();
-        int  unrouted = Math.max(0, (activeController.getCurrentBatches() != null
-                        ? activeController.getCurrentBatches().size() : 0)
-                        - solution.getRoutes().size());
+        List<ShipmentBatch> currentBatchesSnapshot = getCurrentBatchesSnapshot();
+        long released = status.simulatedTime() != null
+            ? currentBatchesSnapshot.stream()
+                .filter(batch -> !batch.ingressTime().isAfter(status.simulatedTime()))
+                .count()
+            : solution.getRoutes().size();
+        int unrouted = Math.toIntExact(Math.min(Integer.MAX_VALUE,
+            Math.max(0, released - solution.getRoutes().size())));
 
         // Construir vuelos activos para animación (deduplicado por flightId)
         java.util.Map<String, CycleUpdateDTO.ActiveFlightDTO> flightMap = new java.util.LinkedHashMap<>();
@@ -385,7 +391,7 @@ public class SimulationService implements SimulationController.SimulationListene
         }
 
         java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> currentBags =
-            currentStorageInventoryService.calculateCurrentBags(solution, simulatedTime);
+            currentStorageInventoryService.calculateCurrentBags(solution, simulatedTime, getCurrentBatchesSnapshot());
 
         for (var entry : currentBags.entrySet()) {
             com.equipo2b.scheduler.model.Airport ap = entry.getKey();
@@ -397,6 +403,16 @@ public class SimulationService implements SimulationController.SimulationListene
         }
 
         return airportCapacities;
+    }
+
+    private List<ShipmentBatch> getCurrentBatchesSnapshot() {
+        if (activeController == null) {
+            return List.of();
+        }
+        synchronized (activeController) {
+            List<ShipmentBatch> batches = activeController.getCurrentBatches();
+            return batches == null ? List.of() : new ArrayList<>(batches);
+        }
     }
 
     private CycleUpdateDTO.OperationalMetricsDTO buildOperationalMetrics(
@@ -434,7 +450,7 @@ public class SimulationService implements SimulationController.SimulationListene
                     .forEach(activeLoadedFlightIds::add);
             }
 
-            if (!simulatedTime.isBefore(route.getFinalArrivalTime().plusMinutes(30))) {
+            if (!simulatedTime.isBefore(route.getFinalArrivalTime())) {
                 deliveredBags += quantity;
             }
         }
@@ -466,18 +482,13 @@ public class SimulationService implements SimulationController.SimulationListene
 
     @Override
     public void onSimulationFinished(SimulationStatus status) {
-        // Notificar WebSocket que terminó
-        if (webSocketHandler != null) {
-            webSocketHandler.onSimulationFinished(status);
-        }
-
         if (activeController == null) return;
         String simId = activeController.getSimulationId();
         Solution solution = activeController.getCurrentSolution();
         List<ShipmentBatch> batches = activeController.getCurrentBatches();
 
-        // Para PERIOD_SIMULATION: exportar a JSON, NO a BD
-        if (currentScenario == ScenarioType.PERIOD_SIMULATION) {
+        // Para PERIOD_SIMULATION y COLLAPSE_SIMULATION: exportar a JSON, NO a BD
+        if (currentScenario == ScenarioType.PERIOD_SIMULATION || currentScenario == ScenarioType.COLLAPSE_SIMULATION) {
             try {
                 resultExporter.exportResults(
                     simId, currentScenario, currentStartDate,
@@ -485,7 +496,7 @@ public class SimulationService implements SimulationController.SimulationListene
                     batches != null ? batches.size() : 0,
                     status.currentCycle()
                 );
-                System.out.println("✓ Resultados de simulación 5 días exportados a archivo JSON");
+                System.out.println("✓ Resultados de simulación exportados a archivo JSON");
             } catch (Exception e) {
                 System.err.println("❌ Error exportando resultados: " + e.getMessage());
             }
@@ -508,7 +519,18 @@ public class SimulationService implements SimulationController.SimulationListene
                 e.printStackTrace();
             }
         }
-        // COLLAPSE_SIMULATION: no persistir (descartamos)
+
+        // Notificar WebSocket que terminó después de dejar el archivo disponible para /results.
+        if (webSocketHandler != null) {
+            webSocketHandler.onSimulationFinished(status);
+        }
+    }
+
+    @Override
+    public void onSimulationError(SimulationStatus status, String errorMessage) {
+        if (webSocketHandler != null) {
+            webSocketHandler.onSimulationError(status, errorMessage);
+        }
     }
 
     private SimulationEntity buildSimulationEntity(

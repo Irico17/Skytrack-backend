@@ -33,6 +33,19 @@ install -d -m 0755 /var/www/skytrack
 
 install -m 0644 "$JAR_SRC" /opt/skytrack/backend/scheduling-core.jar
 
+if [ -f "$SCRIPT_DIR/skytrack-backend.service" ]; then
+  install -m 0644 "$SCRIPT_DIR/skytrack-backend.service" /etc/systemd/system/skytrack-backend.service
+fi
+
+if [ -f /etc/skytrack/backend.env ]; then
+  SKYTRACK_JAVA_OPTS='JAVA_OPTS=-Xms192m -Xmx1024m -XX:ActiveProcessorCount=2 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+ExitOnOutOfMemoryError'
+  if grep -q '^JAVA_OPTS=' /etc/skytrack/backend.env; then
+    sed -i "s|^JAVA_OPTS=.*|$SKYTRACK_JAVA_OPTS|" /etc/skytrack/backend.env
+  else
+    printf '\n%s\n' "$SKYTRACK_JAVA_OPTS" >> /etc/skytrack/backend.env
+  fi
+fi
+
 rm -rf /var/www/skytrack/*
 cp -a "$FRONTEND_SRC/." /var/www/skytrack/
 

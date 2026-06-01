@@ -44,6 +44,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private boolean parallelEnabled = true;
     private int parallelMinProcessors = 3;
     private int parallelPopulationThreshold = 32;
+    private int largeVolumeBatchThreshold = 2_500;
+    private int routeSearchAttempts = 12;
+    private int routeCachedVariants = 3;
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -93,13 +96,21 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         List<Solution> population = populationIndexes.map(i -> {
                 Solution solution = new Solution();
                 
-                // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
-                // ThreadLocalRandom es thread-safe sin sincronización
                 List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
-                Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
+                if (i == 0) {
+                    shuffledBatches.sort(Comparator
+                        .comparing(ShipmentBatch::ingressTime)
+                        .thenComparing(ShipmentBatch::batchId));
+                } else {
+                    // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
+                    // ThreadLocalRandom es thread-safe sin sincronización
+                    Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
+                }
                 
                 for (ShipmentBatch batch : shuffledBatches) {
-                    AssignedRoute route = routeGenerator.generateFeasibleRoute(batch);
+                    AssignedRoute route = i == 0
+                        ? routeGenerator.generateEarliestFeasibleRoute(batch)
+                        : routeGenerator.generateFeasibleRoute(batch);
                     if (route != null) {
                         solution.addRoute(route);
                     } else {
@@ -159,23 +170,65 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
 
     private int effectivePopulationSize(int batchCount) {
-        if (batchCount >= 4_000) return Math.min(populationSize, 8);
-        if (batchCount >= 2_000) return Math.min(populationSize, 10);
-        if (batchCount >= 1_000) return Math.min(populationSize, 14);
+        if (batchCount >= 4_000) return Math.min(populationSize, 6);
+        if (batchCount >= 2_000) return Math.min(populationSize, 8);
+        if (batchCount >= 1_000) return Math.min(populationSize, 10);
+        if (batchCount >= 500) return Math.min(populationSize, 14);
         return populationSize;
     }
 
     private int effectiveGenerations(int batchCount) {
-        if (batchCount >= 4_000) return Math.min(generations, 4);
-        if (batchCount >= 2_000) return Math.min(generations, 5);
-        if (batchCount >= 1_000) return Math.min(generations, 8);
+        if (batchCount >= 4_000) return Math.min(generations, 3);
+        if (batchCount >= 2_000) return Math.min(generations, 4);
+        if (batchCount >= 1_000) return Math.min(generations, 5);
+        if (batchCount >= 500) return Math.min(generations, 7);
         return generations;
     }
 
     private int effectiveStagnationLimit(int batchCount, int effectiveGenerations) {
         if (batchCount >= 4_000) return Math.min(stagnationLimit, 3);
-        if (batchCount >= 2_000) return Math.min(stagnationLimit, 4);
+        if (batchCount >= 500) return Math.min(stagnationLimit, 4);
         return Math.min(stagnationLimit, effectiveGenerations);
+    }
+
+    private Solution buildHeuristicSolution(List<ShipmentBatch> batches) {
+        Solution solution = new Solution();
+        List<ShipmentBatch> orderedBatches = new ArrayList<>(batches);
+        orderedBatches.sort(Comparator.comparing(ShipmentBatch::ingressTime));
+
+        int unroutable = 0;
+        for (ShipmentBatch batch : orderedBatches) {
+            AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(batch);
+            if (route != null) {
+                solution.addRoute(route);
+            } else {
+                unroutable++;
+            }
+        }
+
+        if (unroutable > 0) {
+            System.err.printf("Warning: %d batches could not be routed in large-volume mode%n", unroutable);
+        }
+        return solution;
+    }
+
+    private Solution optimizeLargeVolume(List<ShipmentBatch> batches) {
+        long startMs = System.currentTimeMillis();
+        System.out.printf(
+            "Carga masiva (%d lotes): usando planificación heurística cacheada para respetar CPU/RAM%n",
+            batches.size()
+        );
+
+        Solution solution = buildHeuristicSolution(batches);
+        evaluator.evaluate(solution);
+
+        System.out.printf(
+            "Planificación masiva completada en %.1fs: rutas=%d, fitness=%.2f%n",
+            (System.currentTimeMillis() - startMs) / 1000.0,
+            solution.getRoutes().size(),
+            solution.getFitness()
+        );
+        return solution;
     }
     
     /**
@@ -310,6 +363,11 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         
         // Configurar evaluador con cantidad esperada de lotes
         evaluator.setExpectedBatchCount(batches.size());
+
+        if (batches.size() >= largeVolumeBatchThreshold) {
+            return optimizeLargeVolume(batches);
+        }
+
         int effectivePopulationSize = effectivePopulationSize(batches.size());
         int effectiveGenerations = effectiveGenerations(batches.size());
         int effectiveStagnationLimit = effectiveStagnationLimit(batches.size(), effectiveGenerations);
@@ -421,5 +479,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.parallelEnabled = config.getBoolean("parallelEnabled", true);
         this.parallelMinProcessors = config.getInt("parallelMinProcessors", 3);
         this.parallelPopulationThreshold = config.getInt("parallelPopulationThreshold", 32);
+        this.largeVolumeBatchThreshold = config.getInt("largeVolumeBatchThreshold", 2_500);
+        this.routeSearchAttempts = config.getInt("routeSearchAttempts", 12);
+        this.routeCachedVariants = config.getInt("routeCachedVariants", 3);
+        this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
 }

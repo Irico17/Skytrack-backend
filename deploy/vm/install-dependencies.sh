@@ -86,7 +86,7 @@ MAX_UPLOAD_FILE_SIZE=25MB
 MAX_UPLOAD_REQUEST_SIZE=128MB
 JPA_SHOW_SQL=false
 LOGGING_LEVEL_COM_EQUIPO2B=INFO
-JAVA_OPTS=-Xms256m -Xmx1200m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError
+JAVA_OPTS=-Xms192m -Xmx1024m -XX:ActiveProcessorCount=2 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+ExitOnOutOfMemoryError
 EOF
 chown root:skytrack "$ENV_FILE"
 chmod 0640 "$ENV_FILE"

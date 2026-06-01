@@ -3,17 +3,14 @@ package com.equipo2b.scheduler.service;
 import com.equipo2b.scheduler.api.dto.ReplanResultDTO;
 import com.equipo2b.scheduler.api.dto.DTOMapper;
 import com.equipo2b.scheduler.execution.ReplanResult;
-import com.equipo2b.scheduler.execution.Replanner;
 import com.equipo2b.scheduler.execution.SimulationController;
 import com.equipo2b.scheduler.model.*;
-import com.equipo2b.scheduler.validation.RouteValidator;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.util.List;
 
 /**
  * Servicio de cancelación de vuelos durante una simulación activa.
@@ -64,18 +61,7 @@ public class CancellationService {
         // registerCancellation busca el vuelo en el plan, identifica lotes afectados
         // y ejecuta Replanner con TabuSearch
         SimulationController controller = simulationService.getActiveController();
-        controller.registerCancellation(adjustedFlightId);
-
-        // 5. Construir ReplanResultDTO
-        // registerCancellation no retorna ReplanResult directamente, pero actualiza la solución.
-        // Retornamos un resultado básico con la solución actualizada.
-        Solution updatedSolution = controller.getCurrentSolution();
-        ReplanResult syntheticResult = new ReplanResult(
-            updatedSolution,
-            List.of(),        // replanned - registerCancellation ya los procesó internamente
-            List.of()         // unreplannable - ídem
-        );
-
-        return DTOMapper.toReplanResultDTO(adjustedFlightId, syntheticResult);
+        ReplanResult result = controller.registerCancellation(adjustedFlightId);
+        return DTOMapper.toReplanResultDTO(adjustedFlightId, result);
     }
 }

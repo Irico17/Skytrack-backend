@@ -93,6 +93,37 @@ El backend valida todo en una carpeta temporal antes de tocar los archivos activ
 - El frontend actual conserva una visualizacion local de estres/colapso.
 - El boton de carga de datos estaticos esta disponible antes de simular para mantener el dataset backend preparado.
 
+## SLA Operativo
+
+El modelo usa estos limites para decidir si una maleta fue entregada a tiempo:
+
+- Mismo continente: 12 horas desde el ingreso del lote.
+- Continentes diferentes: 24 horas desde el ingreso del lote.
+
+Estos valores son los que alimentan `ShipmentBatch.calculateSLA()`, `AssignedRoute.meetsSLA()` y el conteo de rutas con/sin SLA en WebSocket.
+
+## Optimizacion Para Volumen Alto
+
+La VM objetivo es pequena, usualmente 2 CPU y entre 2 GB y 4 GB de RAM. Por eso el backend evita ejecutar una metaheuristica completa cuando un ciclo trae miles de lotes.
+
+Cambios vigentes:
+
+- `RouteGenerator` cachea variantes de rutas factibles por origen, destino, minuto de ingreso y SLA. Esto evita repetir BFS para miles de lotes equivalentes.
+- La cache de rutas se limita a 20,000 entradas para no crecer sin control en corridas grandes.
+- `GeneticAlgorithm` mantiene GA normal en volumen pequeno/medio, pero usa modo masivo desde 2,500 lotes por ciclo.
+- En modo masivo, el GA arma una solucion heuristica ordenada por hora de ingreso, reutiliza la cache de rutas y hace una evaluacion final. Esto prioriza terminar dentro del ciclo real sobre explorar muchas generaciones.
+- Para volumen medio, GA reduce poblacion, generaciones y limite de estancamiento de forma adaptativa.
+- `TabuSearch` reduce iteraciones y vecindario cuando hay muchas rutas. Desde 3,000 rutas omite refinamiento Tabu para evitar miles de copias profundas de soluciones.
+- La suite legacy de tests fue eliminada porque no estaba alineada con el modelo actual ni con los datos reales del caso.
+
+Limites de VM configurados en `deploy/vm`:
+
+- `JAVA_OPTS`: `-Xms192m -Xmx1024m -XX:ActiveProcessorCount=2 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1`.
+- `skytrack-backend.service`: `MemoryMax=1300M`, `CPUQuota=160%`, `Nice=5`.
+- `deploy-artifacts.sh` actualiza el unit file y `JAVA_OPTS` durante redeploy normal, sin requerir reinstalar dependencias.
+
+Trade-off importante: en volumen masivo se reduce busqueda global para proteger tiempo de respuesta y RAM. Si se necesita calidad maxima offline, conviene correr experimentos separados con mas poblacion/generaciones fuera de la VM compartida.
+
 ## API Principal
 
 ```http
@@ -140,8 +171,9 @@ Backend:
 
 ```powershell
 .\gradlew.bat bootJar -x test
-.\gradlew.bat test
 ```
+
+No hay suite activa de tests en este snapshot; los tests legacy fueron eliminados.
 
 Frontend:
 

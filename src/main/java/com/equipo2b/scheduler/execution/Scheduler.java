@@ -5,6 +5,7 @@ import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.validation.RouteValidator;
 import com.equipo2b.scheduler.validation.ValidationReport;
+import com.equipo2b.scheduler.validation.ViolationType;
 
 import java.time.ZonedDateTime;
 import java.time.Duration;
@@ -152,27 +153,28 @@ public class Scheduler {
         }
         
         // 5. ACUMULAR rutas nuevas a la solución existente (PLANIFICACIÓN INCREMENTAL)
-        int routesBeforeAccumulation = currentSolution.getRoutes().size();
+        Solution accumulatedSolution = new Solution(currentSolution);
+        int routesBeforeAccumulation = accumulatedSolution.getRoutes().size();
         int newRoutesCount = finalSolution.getRoutes().size();
         
         System.out.println("\n=== ACUMULACIÓN DE RUTAS ===");
         System.out.println("Rutas existentes: " + routesBeforeAccumulation);
         System.out.println("Rutas nuevas generadas: " + newRoutesCount);
         
-        // Acumular cada ruta nueva a la solución actual
+        // Acumular cada ruta nueva sobre una copia estable de la solución actual
         for (AssignedRoute route : finalSolution.getRoutes().values()) {
-            currentSolution.addRoute(route);  // Agrega o reemplaza por batchId
+            accumulatedSolution.addRoute(route);  // Agrega o reemplaza por batchId
         }
         
-        int routesAfterAccumulation = currentSolution.getRoutes().size();
+        int routesAfterAccumulation = accumulatedSolution.getRoutes().size();
         System.out.println("Rutas totales acumuladas: " + routesAfterAccumulation);
         
         // 6. Re-evaluar fitness de la solución completa
-        evaluator.evaluate(currentSolution);
-        System.out.println("Fitness de solución acumulada: " + String.format("%.2f", currentSolution.getFitness()));
+        evaluator.evaluate(accumulatedSolution);
+        System.out.println("Fitness de solución acumulada: " + String.format("%.2f", accumulatedSolution.getFitness()));
         
         // 7. Validar solución acumulada usando RouteValidator
-        ValidationReport validationReport = validator.validate(currentSolution);
+        ValidationReport validationReport = validator.validate(accumulatedSolution);
         
         if (validationReport.isValid()) {
             System.out.println("✓ Solución acumulada válida");
@@ -180,6 +182,8 @@ public class Scheduler {
             System.out.println("⚠ Solución acumulada con violaciones:");
             System.out.println(validationReport.getSummary());
         }
+
+        logQualityMetrics(batches, finalSolution, accumulatedSolution, validationReport);
         
         // 8. Registrar tiempo de ejecución y verificar que sea <= Ta
         long totalTime = primaryTime + refinementTime;
@@ -191,7 +195,55 @@ public class Scheduler {
             System.out.println("⚠ ADVERTENCIA: Tiempo excedido");
         }
         
+        currentSolution = accumulatedSolution;
         return currentSolution;
+    }
+
+    private void logQualityMetrics(
+            List<ShipmentBatch> cycleBatches,
+            Solution cycleSolution,
+            Solution accumulatedSolution,
+            ValidationReport validationReport) {
+        int cycleBatchCount = cycleBatches.size();
+        int cycleRoutes = cycleSolution.getRoutes().size();
+        double assignmentRate = cycleBatchCount > 0 ? cycleRoutes * 100.0 / cycleBatchCount : 100.0;
+
+        long accumulatedRoutes = accumulatedSolution.getRoutes().size();
+        long accumulatedSlaOk = accumulatedSolution.getRoutes().values().stream()
+            .filter(AssignedRoute::meetsSLA)
+            .count();
+        double slaRate = accumulatedRoutes > 0 ? accumulatedSlaOk * 100.0 / accumulatedRoutes : 100.0;
+
+        double avgLegs = accumulatedSolution.getRoutes().values().stream()
+            .mapToInt(route -> route.getFlights().size())
+            .average()
+            .orElse(0.0);
+
+        long flightViolations = validationReport.getViolations().stream()
+            .filter(v -> v.type() == ViolationType.FLIGHT_CAPACITY)
+            .count();
+        long storageViolations = validationReport.getViolations().stream()
+            .filter(v -> v.type() == ViolationType.STORAGE_CAPACITY)
+            .count();
+        long slaViolations = validationReport.getViolations().stream()
+            .filter(v -> v.type() == ViolationType.SLA_VIOLATION)
+            .count();
+        long layoverViolations = validationReport.getViolations().stream()
+            .filter(v -> v.type() == ViolationType.LAYOVER_VIOLATION)
+            .count();
+
+        System.out.printf(
+            "📈 Calidad ciclo: asignación=%.1f%% (%d/%d), SLA acumulado=%.1f%%, vuelos/ruta=%.2f, violaciones [vuelo=%d, almacén=%d, SLA=%d, escala=%d]%n",
+            assignmentRate,
+            cycleRoutes,
+            cycleBatchCount,
+            slaRate,
+            avgLegs,
+            flightViolations,
+            storageViolations,
+            slaViolations,
+            layoverViolations
+        );
     }
     
     /**

@@ -47,8 +47,8 @@ public class ShipmentQueue {
     }
     
     /**
-     * Consume pedidos en ventana temporal [start, end).
-     * Retorna todos los pedidos con ingressTime en el rango especificado.
+    * Consume pedidos acumulados hasta el fin de la ventana temporal.
+    * Retorna todos los pedidos con ingressTime anterior a end.
      * Los pedidos consumidos se eliminan de la cola.
      * 
      * <p>Este método es idempotente para la misma ventana temporal:
@@ -73,9 +73,8 @@ public class ShipmentQueue {
         
         List<ShipmentBatch> consumed = new ArrayList<>();
         
-        // Obtener submap de timestamps en la ventana [start, end)
-        // fromKey inclusive, toKey exclusive
-        var windowMap = timeIndex.subMap(start, true, end, false);
+        // Consumir también pedidos rezagados por pequeña deriva de reloj/red.
+        var windowMap = timeIndex.headMap(end, false);
         
         // Recolectar todos los batches en la ventana
         for (List<ShipmentBatch> batches : windowMap.values()) {

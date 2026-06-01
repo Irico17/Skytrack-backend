@@ -31,17 +31,19 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int maxIterations = 200;
     private int tabuTenure = 15;
     private int neighborhoodSize = 20;
+    private int routeSearchAttempts = 8;
+    private int routeCachedVariants = 2;
 
     private int effectiveMaxIterations(int routeCount) {
-        if (routeCount >= 3_000) return 0;
-        if (routeCount >= 1_500) return Math.min(maxIterations, 6);
-        if (routeCount >= 800) return Math.min(maxIterations, 12);
+        if (routeCount >= 2_000) return 0;
+        if (routeCount >= 1_000) return Math.min(maxIterations, 4);
+        if (routeCount >= 500) return Math.min(maxIterations, 8);
         return maxIterations;
     }
 
     private int effectiveNeighborhoodSize(int routeCount) {
-        if (routeCount >= 1_500) return Math.min(neighborhoodSize, 4);
-        if (routeCount >= 800) return Math.min(neighborhoodSize, 6);
+        if (routeCount >= 1_000) return Math.min(neighborhoodSize, 3);
+        if (routeCount >= 500) return Math.min(neighborhoodSize, 4);
         return neighborhoodSize;
     }
     
@@ -523,6 +525,9 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.maxIterations = config.getInt("maxIterations", 200);
         this.tabuTenure = config.getInt("tabuTenure", 15);
         this.neighborhoodSize = config.getInt("neighborhoodSize", 20);
+        this.routeSearchAttempts = config.getInt("routeSearchAttempts", 8);
+        this.routeCachedVariants = config.getInt("routeCachedVariants", 2);
+        this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
     
     /**
