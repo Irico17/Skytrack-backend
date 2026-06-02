@@ -5,7 +5,7 @@ package com.equipo2b.scheduler.execution;
  * 
  * Cada escenario tiene diferentes parámetros de aceleración (K) y configuración:
  * - DAY_TO_DAY: Operación en tiempo real (K=1)
- * - PERIOD_SIMULATION: Simulación de 3-5 días (K=14-23)
+ * - PERIOD_SIMULATION: Simulación de 3-5 días (K=240)
  * - COLLAPSE_SIMULATION: Simulación hasta colapso (K=75)
  * 
  * **Validates: Requirements 21.1-21.3**
@@ -25,21 +25,19 @@ public enum ScenarioType {
     ),
     
     /**
-     * Escenario 2: Simulación de Período (K=120).
+     * Escenario 2: Simulación de Período (K=240).
      * - Simula 5 días de operación
      * - Configuración balanceada de algoritmos
-     * - Debe completarse en ~60 minutos reales
+     * - Debe completarse en ~30 minutos reales
      *
-     * <p>Timing: Sc = Sa×K = 3×120 = 360 min (6h de datos por ciclo). Cada ciclo
-     * consume la mitad de datos que antes (antes 12h) para reducir la carga pico del
-     * GATS por ejecución y mantener el algoritmo dentro de su ventana en la VM (2 CPU).
-     * 5 días = 7200 min / 360 = 20 ciclos × 3 min reales ≈ 60 min reales totales.
+     * <p>Timing: Sc = Sa×K = 3×240 = 720 min (12h de datos por ciclo).
+     * 5 días = 7200 min / 720 = 10 ciclos × 3 min reales ≈ 30 min reales totales.
      */
     PERIOD_SIMULATION(
-        120,  // K: Factor de aceleración (1 min real = 120 min simulados)
+        240,  // K: Factor de aceleración (1 min real = 240 min simulados)
         2,    // Ta: Tiempo máximo de algoritmo (minutos reales)
-        3,    // Sa: Salto entre ejecuciones (minutos reales) — Sc=3×120=360min(6h)
-        "Escenario 2: Simulación 5 Días (K=120, Ta=2, Sa=3)"
+        3,    // Sa: Salto entre ejecuciones (minutos reales) — Sc=3×240=720min(12h)
+        "Escenario 2: Simulación 5 Días (K=240, Ta=2, Sa=3)"
     ),
     
     /**
