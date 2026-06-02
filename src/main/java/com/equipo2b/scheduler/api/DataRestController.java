@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * API REST para consulta de datos de referencia (aeropuertos, vuelos)
@@ -39,6 +40,8 @@ public class DataRestController {
 
     @Autowired
     private StaticDataStorageService staticDataStorageService;
+
+    private final Map<String, Map<String, Object>> projectedFlightsCache = new ConcurrentHashMap<>();
 
 
     /**
@@ -89,12 +92,17 @@ public class DataRestController {
                 ));
             }
 
+            ZonedDateTime windowStart = parseStartDateTime(requestedStart);
+            ZonedDateTime windowEnd = windowStart.plusDays(days);
+            String cacheKey = windowStart.toInstant() + ":" + days;
+            Map<String, Object> cached = projectedFlightsCache.get(cacheKey);
+            if (cached != null) {
+                return ResponseEntity.ok(cached);
+            }
+
             List<Airport> airports = dataService.loadAirports();
             AirportManager manager = dataService.createAirportManager(airports);
             FlightPlan flightPlan = dataService.loadFlightPlan(manager);
-
-            ZonedDateTime windowStart = parseStartDateTime(requestedStart);
-            ZonedDateTime windowEnd = windowStart.plusDays(days);
 
             // Proyectar todos los vuelos en un solo pase (eficiente)
             List<Flight> projected = flightPlan.getAllFlightsProjected(windowStart, windowEnd);
@@ -111,12 +119,14 @@ public class DataRestController {
                 ));
             }
 
-            return ResponseEntity.ok(Map.of(
+            Map<String, Object> response = Map.of(
                 "flights", result,
                 "totalFlights", result.size(),
                 "startDateTime", windowStart.toString(),
                 "days", days
-            ));
+            );
+            projectedFlightsCache.put(cacheKey, response);
+            return ResponseEntity.ok(response);
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Error proyectando vuelos: " + e.getMessage()));
@@ -192,6 +202,8 @@ public class DataRestController {
                 flightsFile,
                 Arrays.asList(shipmentFiles)
             );
+            dataService.invalidateCaches();
+            projectedFlightsCache.clear();
             var imported = dataImportService.replaceReferenceData();
 
             return ResponseEntity.ok(new StaticDataUploadDTO(

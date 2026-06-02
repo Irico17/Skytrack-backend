@@ -35,9 +35,24 @@ public class DataLoadingService {
     private final FlightPlanUploader flightUploader = new FlightPlanUploader();
     private final ShipmentUploader shipmentUploader = new ShipmentUploader();
 
+    private final Object cacheLock = new Object();
+    private volatile List<Airport> cachedAirports;
+    private volatile List<Flight> cachedBaseFlights;
+    private volatile List<ShipmentBatch> cachedShipments;
+
     /** Carga todos los aeropuertos desde el archivo configurado. */
     public List<Airport> loadAirports() throws IOException {
-        return airportUploader.loadAirports(airportsPath);
+        List<Airport> cached = cachedAirports;
+        if (cached != null) {
+            return cached;
+        }
+
+        synchronized (cacheLock) {
+            if (cachedAirports == null) {
+                cachedAirports = List.copyOf(airportUploader.loadAirports(airportsPath));
+            }
+            return cachedAirports;
+        }
     }
 
     /** Crea un AirportManager a partir de la lista de aeropuertos. */
@@ -58,7 +73,28 @@ public class DataLoadingService {
 
     /** Carga el plan de vuelos usando los aeropuertos ya cargados. */
     public FlightPlan loadFlightPlan(AirportManager airportManager) throws IOException {
-        return flightUploader.loadFlights(flightsPath, airportManager);
+        List<Flight> cached = cachedBaseFlights;
+        if (cached == null) {
+            synchronized (cacheLock) {
+                if (cachedBaseFlights == null) {
+                    cachedBaseFlights = List.copyOf(
+                        flightUploader.loadFlights(flightsPath, airportManager).getAllFlights()
+                    );
+                }
+                cached = cachedBaseFlights;
+            }
+        }
+
+        return new FlightPlan(cached);
+    }
+
+    /** Invalida datos de referencia tras reemplazar archivos estaticos. */
+    public void invalidateCaches() {
+        synchronized (cacheLock) {
+            cachedAirports = null;
+            cachedBaseFlights = null;
+            cachedShipments = null;
+        }
     }
 
     /**
@@ -94,6 +130,37 @@ public class DataLoadingService {
                                                         ClientRegistry clientRegistry,
                                                         ZonedDateTime start,
                                                         ZonedDateTime end) throws IOException {
+        List<ShipmentBatch> all = cachedShipments;
+        if (all == null) {
+            synchronized (cacheLock) {
+                if (cachedShipments == null) {
+                    cachedShipments = List.copyOf(loadShipmentsFromDisk(airportManager, clientRegistry));
+                }
+                all = cachedShipments;
+            }
+        }
+
+        List<ShipmentBatch> filtered = all;
+        if (start != null || end != null) {
+            filtered = all.stream()
+                .filter(b -> {
+                    ZonedDateTime t = b.ingressTime();
+                    if (start != null && t.isBefore(start)) return false;
+                    if (end != null && !t.isBefore(end)) return false;
+                    return true;
+                })
+                .toList();
+        }
+
+        String rangeMsg = (start != null)
+            ? String.format(" [%s → %s]", start.toLocalDate(), end != null ? end.toLocalDate() : "∞")
+            : " (todos)";
+        System.out.printf("✓ Cargados %,d lotes%s desde cache%n", filtered.size(), rangeMsg);
+        return filtered;
+    }
+
+    private List<ShipmentBatch> loadShipmentsFromDisk(AirportManager airportManager,
+                                                       ClientRegistry clientRegistry) throws IOException {
         List<ShipmentBatch> all = new ArrayList<>();
         Path dir = Paths.get(shipmentsDir);
 
@@ -109,17 +176,6 @@ public class DataLoadingService {
                      try {
                          List<ShipmentBatch> batches = shipmentUploader.loadShipments(
                              file.toString(), airportManager, clientRegistry);
-                         // Filtrar por rango si se especificó
-                         if (start != null || end != null) {
-                             batches = batches.stream()
-                                 .filter(b -> {
-                                     ZonedDateTime t = b.ingressTime();
-                                     if (start != null && t.isBefore(start)) return false;
-                                     if (end != null && !t.isBefore(end)) return false;
-                                     return true;
-                                 })
-                                 .toList();
-                         }
                          all.addAll(batches);
                      } catch (Exception e) {
                          System.err.println("⚠️ Error cargando " + file.getFileName() + ": " + e.getMessage());
@@ -128,11 +184,7 @@ public class DataLoadingService {
         }
 
         all.sort(Comparator.comparing(ShipmentBatch::ingressTime));
-
-        String rangeMsg = (start != null)
-            ? String.format(" [%s → %s]", start.toLocalDate(), end != null ? end.toLocalDate() : "∞")
-            : " (todos)";
-        System.out.printf("✓ Cargados %,d lotes%s desde %s%n", all.size(), rangeMsg, shipmentsDir);
+        System.out.printf("✓ Cargados %,d lotes (todos) desde %s%n", all.size(), shipmentsDir);
         return all;
     }
 }
