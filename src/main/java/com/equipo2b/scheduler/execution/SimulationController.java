@@ -661,12 +661,11 @@ public class SimulationController {
 
     private void releaseHeavyState(ScenarioType scenario) {
         if (scenario == ScenarioType.PERIOD_SIMULATION || scenario == ScenarioType.DAY_TO_DAY) {
-            currentBatches = Collections.emptyList();
             scheduler = null;
             tabuSearch = null;
             validator = null;
             System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name()
-                + "; última solución preservada para consulta REST");
+                + "; última solución y lotes preservados para consulta REST");
         }
     }
     

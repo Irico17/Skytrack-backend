@@ -215,6 +215,27 @@ public class SimulationService implements SimulationController.SimulationListene
         );
     }
 
+    public BagTraceabilityDTO getBagTraceability(
+            String simId,
+            int page,
+            int size,
+            String query,
+            String state,
+            String clientId,
+            String batchId) {
+        validateSimId(simId);
+        int safePage = Math.max(0, page);
+        int safeSize = Math.max(1, Math.min(size, 200));
+        SimulationStatus status = activeController.getStatus();
+        return BagTraceabilityReadModel.build(
+            simId,
+            status.simulatedTime(),
+            getCurrentSolution(),
+            getCurrentBatchesSnapshot(),
+            new BagTraceabilityReadModel.Query(safePage, safeSize, query, state, clientId, batchId)
+        );
+    }
+
     /** Para la simulación activa. */
     public void stopSimulation(String simId) {
         validateSimId(simId);

@@ -172,6 +172,24 @@ public class SimulationRestController {
         }
     }
 
+    @GetMapping("/{id}/bags")
+    public ResponseEntity<BagTraceabilityDTO> getBagTraceability(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) String query,
+            @RequestParam(required = false) String state,
+            @RequestParam(required = false) String clientId,
+            @RequestParam(required = false) String batchId) {
+        try {
+            return ResponseEntity.ok(simulationService.getBagTraceability(
+                id, page, size, query, state, clientId, batchId
+            ));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.notFound().build();
+        }
+    }
+
     @GetMapping("/{id}/solution")
     public ResponseEntity<SolutionDTO> getSolution(@PathVariable String id) {
         try {
