@@ -17,7 +17,12 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -53,6 +58,23 @@ public class SimulationService implements SimulationController.SimulationListene
     private TrafficLightIndicator trafficLight;
     private ScenarioType currentScenario;
     private ZonedDateTime currentStartDate;
+    private ZonedDateTime currentStartedAt;
+    private ZonedDateTime currentFinishedAt;
+
+    public record StartSimulationResult(String simulationId, boolean joinedExisting, ActiveSimulationDTO activeSimulation) {}
+
+    public static class ActiveSimulationConflictException extends RuntimeException {
+        private final ActiveSimulationDTO activeSimulation;
+
+        public ActiveSimulationConflictException(String message, ActiveSimulationDTO activeSimulation) {
+            super(message);
+            this.activeSimulation = activeSimulation;
+        }
+
+        public ActiveSimulationDTO activeSimulation() {
+            return activeSimulation;
+        }
+    }
 
     /**
      * Inicia una nueva simulación del escenario indicado.
@@ -64,16 +86,42 @@ public class SimulationService implements SimulationController.SimulationListene
      * @return simulationId único de la simulación iniciada
      */
     public synchronized String startSimulation(String scenarioName, String startDateStr) {
-        // Detener simulación activa si existe
+        return startOrJoinSimulation(scenarioName, startDateStr, true).simulationId();
+    }
+
+    public synchronized StartSimulationResult startOrJoinSimulation(
+            String scenarioName,
+            String startDateStr,
+            boolean replace) {
+        ScenarioType scenario = ScenarioType.valueOf(scenarioName);
+        ZonedDateTime requestedStartDate = parseStartDate(startDateStr);
+
         if (activeController != null && activeController.isRunning()) {
+            boolean sameScenario = currentScenario == scenario;
+            boolean sameStartDate = Objects.equals(currentStartDate, requestedStartDate);
+            if (sameScenario && sameStartDate) {
+                ActiveSimulationDTO active = buildActiveSimulationDTO();
+                return new StartSimulationResult(activeController.getSimulationId(), true, active);
+            }
+            if (!replace) {
+                ActiveSimulationDTO active = buildActiveSimulationDTO();
+                throw new ActiveSimulationConflictException(
+                    "Ya existe una simulacion activa con otro escenario o fecha de inicio",
+                    active
+                );
+            }
             activeController.stopSimulation();
         }
 
-        ScenarioType scenario = ScenarioType.valueOf(scenarioName);
+        return startNewSimulation(scenario, requestedStartDate);
+    }
+
+    private StartSimulationResult startNewSimulation(ScenarioType scenario, ZonedDateTime requestedStartDate) {
         currentScenario = scenario;
 
-        // Parsear fecha de inicio
-        currentStartDate = parseStartDate(startDateStr);
+        currentStartDate = requestedStartDate;
+        currentStartedAt = ZonedDateTime.now(ZoneOffset.UTC);
+        currentFinishedAt = null;
 
         try {
             System.out.println("🚀 Iniciando simulación: " + scenario.getDescription());
@@ -127,18 +175,51 @@ public class SimulationService implements SimulationController.SimulationListene
 
             activeController.startSimulation(scenario, batches);
 
+            if (webSocketHandler != null) {
+                webSocketHandler.onSimulationStarted(buildActiveSimulationDTO());
+            }
+
             System.out.println("✓ Simulación iniciada: " + simId);
-            return simId;
+            return new StartSimulationResult(simId, false, buildActiveSimulationDTO());
 
         } catch (Exception e) {
             throw new RuntimeException("Error iniciando simulación: " + e.getMessage(), e);
         }
     }
 
+    public ActiveSimulationDTO getActiveSimulation() {
+        if (activeController == null || !activeController.isRunning()) {
+            return null;
+        }
+        return buildActiveSimulationDTO();
+    }
+
+    public SimulationSnapshotDTO getSnapshot(String simId) {
+        validateSimId(simId);
+        return new SimulationSnapshotDTO(buildActiveSimulationDTO(), getStatus(simId));
+    }
+
+    public OperationalStateDTO getOperationalState(String simId, int limit) {
+        validateSimId(simId);
+        int safeLimit = Math.max(1, Math.min(limit, 200));
+        SimulationStatus status = activeController.getStatus();
+        ZonedDateTime simulatedTime = status.simulatedTime();
+        Solution solution = getCurrentSolution();
+
+        return new OperationalStateDTO(
+            simId,
+            formatDate(simulatedTime),
+            buildTransportUnits(solution, simulatedTime, safeLimit),
+            buildWarehouses(solution, simulatedTime),
+            buildOperationalShipments(solution, simulatedTime, safeLimit)
+        );
+    }
+
     /** Para la simulación activa. */
     public void stopSimulation(String simId) {
         validateSimId(simId);
         activeController.stopSimulation();
+        currentFinishedAt = ZonedDateTime.now(ZoneOffset.UTC);
     }
 
     /** Pausa la simulación activa. */
@@ -483,6 +564,7 @@ public class SimulationService implements SimulationController.SimulationListene
     @Override
     public void onSimulationFinished(SimulationStatus status) {
         if (activeController == null) return;
+        currentFinishedAt = ZonedDateTime.now(ZoneOffset.UTC);
         String simId = activeController.getSimulationId();
         Solution solution = activeController.getCurrentSolution();
         List<ShipmentBatch> batches = activeController.getCurrentBatches();
@@ -531,6 +613,7 @@ public class SimulationService implements SimulationController.SimulationListene
         if (webSocketHandler != null) {
             webSocketHandler.onSimulationError(status, errorMessage);
         }
+        currentFinishedAt = ZonedDateTime.now(ZoneOffset.UTC);
     }
 
     private SimulationEntity buildSimulationEntity(
@@ -566,6 +649,187 @@ public class SimulationService implements SimulationController.SimulationListene
     private Solution getCurrentSolution() {
         if (activeController == null) return null;
         return activeController.getCurrentSolution();
+    }
+
+    private ActiveSimulationDTO buildActiveSimulationDTO() {
+        if (activeController == null || currentScenario == null) {
+            return null;
+        }
+        SimulationStatus status = activeController.getStatus();
+        String simulationId = activeController.getSimulationId();
+        ZonedDateTime simulatedTime = status.simulatedTime();
+        int connectedClients = webSocketHandler != null
+            ? webSocketHandler.getConnectedClients(simulationId)
+            : 0;
+
+        return new ActiveSimulationDTO(
+            simulationId,
+            currentScenario.name(),
+            currentScenario.getDescription(),
+            statusLabel(status),
+            formatDate(currentStartDate),
+            formatDate(simulatedTime),
+            status.currentCycle(),
+            activeController.getDaysElapsed(),
+            currentScenario.getK(),
+            currentScenario.getTa(),
+            currentScenario.getSa(),
+            currentScenario.getSc(),
+            connectedClients,
+            formatDate(currentStartedAt),
+            formatDate(currentFinishedAt),
+            status.isRunning()
+        );
+    }
+
+    private List<OperationalStateDTO.TransportUnitItemDTO> buildTransportUnits(
+            Solution solution,
+            ZonedDateTime simulatedTime,
+            int limit) {
+        if (solution == null || simulatedTime == null) return List.of();
+
+        Map<String, TransportAccumulator> byFlight = new LinkedHashMap<>();
+        for (AssignedRoute route : solution.getRoutes().values()) {
+            for (Flight flight : route.getFlights()) {
+                TransportAccumulator acc = byFlight.computeIfAbsent(flight.flightId(), id -> new TransportAccumulator(flight));
+                acc.bags += route.getBatch().quantity();
+                acc.meetsSla = acc.meetsSla && route.meetsSLA();
+            }
+        }
+
+        return byFlight.values().stream()
+            .sorted(Comparator
+                .comparing((TransportAccumulator acc) -> acc.flight.departureTime())
+                .thenComparing(acc -> acc.flight.flightId()))
+            .limit(limit)
+            .map(acc -> new OperationalStateDTO.TransportUnitItemDTO(
+                acc.flight.flightId(),
+                acc.flight.origin().id(),
+                acc.flight.destination().id(),
+                formatDate(acc.flight.departureTime()),
+                formatDate(acc.flight.arrivalTime()),
+                acc.flight.capacity(),
+                acc.bags,
+                acc.flight.capacity() > 0 ? (double) acc.bags / acc.flight.capacity() : 0.0,
+                acc.bags == 0,
+                acc.meetsSla
+            ))
+            .toList();
+    }
+
+    private List<OperationalStateDTO.WarehouseItemDTO> buildWarehouses(Solution solution, ZonedDateTime simulatedTime) {
+        List<CycleUpdateDTO.AirportCapacityDTO> capacities = buildAirportCapacities(solution, simulatedTime);
+        Map<String, CycleUpdateDTO.AirportCapacityDTO> byAirport = new HashMap<>();
+        for (CycleUpdateDTO.AirportCapacityDTO capacity : capacities) {
+            byAirport.put(capacity.airportId(), capacity);
+        }
+
+        if (currentAirportManager == null) return List.of();
+        return currentAirportManager.getAllAirports().stream()
+            .sorted(Comparator.comparing(Airport::id))
+            .map(airport -> {
+                CycleUpdateDTO.AirportCapacityDTO capacity = byAirport.get(airport.id());
+                int currentBags = capacity != null ? capacity.currentBags() : 0;
+                double ratio = capacity != null ? capacity.occupancyRatio() : 0.0;
+                String semaphore = ratio >= 0.9 ? "RED" : ratio >= 0.7 ? "AMBER" : "GREEN";
+                return new OperationalStateDTO.WarehouseItemDTO(
+                    airport.id(),
+                    airport.city(),
+                    airport.country(),
+                    currentBags,
+                    airport.storageCapacity(),
+                    ratio,
+                    semaphore
+                );
+            })
+            .toList();
+    }
+
+    private List<OperationalStateDTO.ShipmentOperationalItemDTO> buildOperationalShipments(
+            Solution solution,
+            ZonedDateTime simulatedTime,
+            int limit) {
+        if (simulatedTime == null) return List.of();
+        List<OperationalStateDTO.ShipmentOperationalItemDTO> items = new ArrayList<>();
+        if (solution != null) {
+            for (AssignedRoute route : solution.getRoutes().values()) {
+                ShipmentBatch batch = route.getBatch();
+                List<Flight> flights = route.getFlights();
+                String state = shipmentState(route, simulatedTime);
+                String currentFlightId = currentFlightId(route, simulatedTime);
+                double progress = shipmentProgress(batch.ingressTime(), route.getFinalArrivalTime(), simulatedTime);
+                items.add(new OperationalStateDTO.ShipmentOperationalItemDTO(
+                    batch.batchId(),
+                    batch.clientId(),
+                    batch.origin().id(),
+                    batch.destination().id(),
+                    batch.quantity(),
+                    state,
+                    currentFlightId,
+                    route.meetsSLA(),
+                    progress,
+                    batch.batchId() + "-B0001",
+                    batch.batchId() + "-B" + String.format("%04d", batch.quantity())
+                ));
+            }
+        }
+
+        return items.stream()
+            .sorted(Comparator.comparing(OperationalStateDTO.ShipmentOperationalItemDTO::state)
+                .thenComparing(OperationalStateDTO.ShipmentOperationalItemDTO::batchId))
+            .limit(limit)
+            .toList();
+    }
+
+    private String shipmentState(AssignedRoute route, ZonedDateTime simulatedTime) {
+        if (!simulatedTime.isBefore(route.getFinalArrivalTime())) return "DELIVERED";
+        for (Flight flight : route.getFlights()) {
+            if (!simulatedTime.isBefore(flight.departureTime()) && simulatedTime.isBefore(flight.arrivalTime())) {
+                return "IN_FLIGHT";
+            }
+        }
+        Flight first = route.getFlights().isEmpty() ? null : route.getFlights().get(0);
+        if (first != null && simulatedTime.isBefore(first.departureTime())) return "PLANNED";
+        return "IN_WAREHOUSE_TRANSIT";
+    }
+
+    private String currentFlightId(AssignedRoute route, ZonedDateTime simulatedTime) {
+        for (Flight flight : route.getFlights()) {
+            if (!simulatedTime.isBefore(flight.departureTime()) && simulatedTime.isBefore(flight.arrivalTime())) {
+                return flight.flightId();
+            }
+            if (simulatedTime.isBefore(flight.departureTime())) {
+                return flight.flightId();
+            }
+        }
+        return null;
+    }
+
+    private double shipmentProgress(ZonedDateTime start, ZonedDateTime end, ZonedDateTime now) {
+        long totalMs = java.time.Duration.between(start, end).toMillis();
+        if (totalMs <= 0) return 1.0;
+        long elapsedMs = java.time.Duration.between(start, now).toMillis();
+        return Math.max(0.0, Math.min(1.0, (double) elapsedMs / totalMs));
+    }
+
+    private static final class TransportAccumulator {
+        private final Flight flight;
+        private int bags;
+        private boolean meetsSla = true;
+
+        private TransportAccumulator(Flight flight) {
+            this.flight = flight;
+        }
+    }
+
+    private String statusLabel(SimulationStatus status) {
+        if (!status.isRunning()) return "STOPPED";
+        if (status.isPaused()) return "PAUSED";
+        return "RUNNING";
+    }
+
+    private String formatDate(ZonedDateTime value) {
+        return value != null ? value.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME) : null;
     }
 
     private void validateSimId(String simId) {
