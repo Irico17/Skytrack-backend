@@ -39,6 +39,8 @@ public class DataLoadingService {
     private volatile List<Airport> cachedAirports;
     private volatile List<Flight> cachedBaseFlights;
     private volatile List<ShipmentBatch> cachedShipments;
+    private volatile ZonedDateTime cachedStart;
+    private volatile ZonedDateTime cachedEnd;
 
     /** Carga todos los aeropuertos desde el archivo configurado. */
     public List<Airport> loadAirports() throws IOException {
@@ -94,6 +96,8 @@ public class DataLoadingService {
             cachedAirports = null;
             cachedBaseFlights = null;
             cachedShipments = null;
+            cachedStart = null;
+            cachedEnd = null;
         }
     }
 
@@ -130,37 +134,28 @@ public class DataLoadingService {
                                                         ClientRegistry clientRegistry,
                                                         ZonedDateTime start,
                                                         ZonedDateTime end) throws IOException {
-        List<ShipmentBatch> all = cachedShipments;
-        if (all == null) {
-            synchronized (cacheLock) {
-                if (cachedShipments == null) {
-                    cachedShipments = List.copyOf(loadShipmentsFromDisk(airportManager, clientRegistry));
-                }
-                all = cachedShipments;
+        synchronized (cacheLock) {
+            // Check if we have this exact range cached
+            if (cachedShipments != null && 
+                ((start == null && cachedStart == null) || (start != null && start.equals(cachedStart))) &&
+                ((end == null && cachedEnd == null) || (end != null && end.equals(cachedEnd)))) {
+                System.out.printf("✓ Cargados %,d lotes desde cache exacto%n", cachedShipments.size());
+                return cachedShipments;
             }
-        }
 
-        List<ShipmentBatch> filtered = all;
-        if (start != null || end != null) {
-            filtered = all.stream()
-                .filter(b -> {
-                    ZonedDateTime t = b.ingressTime();
-                    if (start != null && t.isBefore(start)) return false;
-                    if (end != null && !t.isBefore(end)) return false;
-                    return true;
-                })
-                .toList();
+            // Otherwise, read from disk with early filtering
+            cachedShipments = List.copyOf(loadShipmentsFromDisk(airportManager, clientRegistry, start, end));
+            cachedStart = start;
+            cachedEnd = end;
+            
+            return cachedShipments;
         }
-
-        String rangeMsg = (start != null)
-            ? String.format(" [%s → %s]", start.toLocalDate(), end != null ? end.toLocalDate() : "∞")
-            : " (todos)";
-        System.out.printf("✓ Cargados %,d lotes%s desde cache%n", filtered.size(), rangeMsg);
-        return filtered;
     }
 
     private List<ShipmentBatch> loadShipmentsFromDisk(AirportManager airportManager,
-                                                       ClientRegistry clientRegistry) throws IOException {
+                                                       ClientRegistry clientRegistry,
+                                                       ZonedDateTime start,
+                                                       ZonedDateTime end) throws IOException {
         List<ShipmentBatch> all = new ArrayList<>();
         Path dir = Paths.get(shipmentsDir);
 
@@ -169,22 +164,34 @@ public class DataLoadingService {
         }
 
         try (Stream<Path> files = Files.list(dir)) {
-            files.filter(p -> p.getFileName().toString().startsWith("_envios_")
+            List<ShipmentBatch> loaded = files.filter(p -> p.getFileName().toString().startsWith("_envios_")
                                && p.getFileName().toString().endsWith("_.txt"))
-                 .sorted(Comparator.comparing(p -> p.getFileName().toString()))
-                 .forEach(file -> {
+                 .parallel()
+                 .flatMap(file -> {
                      try {
-                         List<ShipmentBatch> batches = shipmentUploader.loadShipments(
-                             file.toString(), airportManager, clientRegistry);
-                         all.addAll(batches);
+                         return shipmentUploader.loadShipments(
+                             file.toString(), airportManager, clientRegistry, start, end).stream();
                      } catch (Exception e) {
                          System.err.println("⚠️ Error cargando " + file.getFileName() + ": " + e.getMessage());
+                         return Stream.empty();
                      }
-                 });
+                 })
+                 .toList();
+            all.addAll(loaded);
         }
 
-        all.sort(Comparator.comparing(ShipmentBatch::ingressTime));
-        System.out.printf("✓ Cargados %,d lotes (todos) desde %s%n", all.size(), shipmentsDir);
-        return all;
+        // Filtro exacto por ZonedDateTime para estar seguros de los límites
+        List<ShipmentBatch> exactFiltered = all.stream()
+                .filter(b -> {
+                    ZonedDateTime t = b.ingressTime();
+                    if (start != null && t.isBefore(start)) return false;
+                    if (end != null && !t.isBefore(end)) return false;
+                    return true;
+                })
+                .sorted(Comparator.comparing(ShipmentBatch::ingressTime))
+                .toList();
+
+        System.out.printf("✓ Cargados %,d lotes (con filtro temprano) desde %s%n", exactFiltered.size(), shipmentsDir);
+        return exactFiltered;
     }
 }

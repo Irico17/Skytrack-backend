@@ -44,6 +44,12 @@ public class ShipmentUploader {
      */
     public List<ShipmentBatch> loadShipments(String filePath, AirportManager airportManager, 
                                              ClientRegistry clientRegistry) throws IOException {
+        return loadShipments(filePath, airportManager, clientRegistry, null, null);
+    }
+
+    public List<ShipmentBatch> loadShipments(String filePath, AirportManager airportManager, 
+                                             ClientRegistry clientRegistry,
+                                             ZonedDateTime start, ZonedDateTime end) throws IOException {
         Path path = Paths.get(filePath);
         List<ShipmentBatch> shipments = new ArrayList<>();
         AtomicInteger lineNumber = new AtomicInteger(0);
@@ -53,6 +59,9 @@ public class ShipmentUploader {
         String fileName = path.getFileName().toString();
         String originId = extractOriginFromFilename(fileName);
         
+        String startDateStr = start != null ? String.format("%04d%02d%02d", start.getYear(), start.getMonthValue(), start.getDayOfMonth()) : null;
+        String endDateStr = end != null ? String.format("%04d%02d%02d", end.getYear(), end.getMonthValue(), end.getDayOfMonth()) : null;
+
         try (Stream<String> lines = Files.lines(path)) {
             lines.forEach(line -> {
                 int currentLine = lineNumber.incrementAndGet();
@@ -60,6 +69,16 @@ public class ShipmentUploader {
                 // Ignorar líneas vacías
                 if (line.isBlank()) {
                     return;
+                }
+
+                // Filtrado temprano ultra-rápido por fecha (formato YYYYMMDD)
+                if (startDateStr != null || endDateStr != null) {
+                    int firstDash = line.indexOf('-');
+                    if (firstDash > 0 && line.length() >= firstDash + 9) {
+                        String dateStr = line.substring(firstDash + 1, firstDash + 9);
+                        if (startDateStr != null && dateStr.compareTo(startDateStr) < 0) return;
+                        if (endDateStr != null && dateStr.compareTo(endDateStr) > 0) return;
+                    }
                 }
                 
                 try {
