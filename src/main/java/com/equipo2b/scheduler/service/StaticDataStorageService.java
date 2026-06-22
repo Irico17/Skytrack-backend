@@ -37,6 +37,9 @@ public class StaticDataStorageService {
     @Value("${data.shipments.dir}")
     private String shipmentsDir;
 
+    /** Nº de líneas por archivo que se parsean para validar formato (el resto solo se cuenta). */
+    private static final int VALIDATION_SAMPLE_SIZE = 200;
+
     private final AirportUploader airportUploader = new AirportUploader();
     private final FlightPlanUploader flightUploader = new FlightPlanUploader();
     private final ShipmentUploader shipmentUploader = new ShipmentUploader();
@@ -131,7 +134,10 @@ public class StaticDataStorageService {
             new com.equipo2b.scheduler.model.AirlineClient(a.id(), a.city(), "", "")
         ));
 
-        int totalShipments = 0;
+        // Validación eficiente en memoria (VM de 2 GB): se valida el FORMATO parseando solo
+        // una muestra de cada archivo y se cuenta el total por streaming, sin materializar
+        // los ~9,5 M de registros.
+        long totalShipments = 0;
         int shipmentFileCount = 0;
         try (Stream<Path> files = Files.list(shipmentDir)) {
             for (Path file : files
@@ -139,8 +145,12 @@ public class StaticDataStorageService {
                     .filter(p -> p.getFileName().toString().endsWith("_.txt"))
                     .toList()) {
                 shipmentFileCount++;
-                List<ShipmentBatch> batches = shipmentUploader.loadShipments(file.toString(), manager, clientRegistry);
-                totalShipments += batches.size();
+                // Parseo de muestra: lanza excepción si el formato es inválido.
+                shipmentUploader.loadShipments(file.toString(), manager, clientRegistry, null, null, VALIDATION_SAMPLE_SIZE);
+                // Conteo total por streaming (no materializa el archivo completo).
+                try (Stream<String> lines = Files.lines(file)) {
+                    totalShipments += lines.filter(line -> !line.isBlank()).count();
+                }
             }
         }
         if (shipmentFileCount == 0) {
@@ -150,7 +160,7 @@ public class StaticDataStorageService {
             throw new IllegalArgumentException("Los archivos de envios no contienen lotes validos");
         }
 
-        return new ValidationCounts(airports.size(), flightPlan.getTotalFlights(), totalShipments);
+        return new ValidationCounts(airports.size(), flightPlan.getTotalFlights(), Math.toIntExact(totalShipments));
     }
 
     private static Path resolveDataRoot(Path airportsFile, Path flightsFile, Path shipmentDir) throws IOException {

@@ -47,42 +47,64 @@ public class ShipmentUploader {
         return loadShipments(filePath, airportManager, clientRegistry, null, null);
     }
 
-    public List<ShipmentBatch> loadShipments(String filePath, AirportManager airportManager, 
+    public List<ShipmentBatch> loadShipments(String filePath, AirportManager airportManager,
                                              ClientRegistry clientRegistry,
                                              ZonedDateTime start, ZonedDateTime end) throws IOException {
+        return loadShipments(filePath, airportManager, clientRegistry, start, end, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Carga lotes con filtrado temprano por fecha y un tope máximo de registros.
+     * El tope permite consumir en streaming sin materializar archivos completos
+     * (ej. escenario de colapso: semilla acotada en una VM de 2 GB).
+     *
+     * @param maxRecords número máximo de lotes a devolver (corte temprano)
+     */
+    public List<ShipmentBatch> loadShipments(String filePath, AirportManager airportManager,
+                                             ClientRegistry clientRegistry,
+                                             ZonedDateTime start, ZonedDateTime end,
+                                             int maxRecords) throws IOException {
         Path path = Paths.get(filePath);
         List<ShipmentBatch> shipments = new ArrayList<>();
+        if (maxRecords <= 0) return shipments;
         AtomicInteger lineNumber = new AtomicInteger(0);
-        
+
         // Extraer código de aeropuerto origen del nombre del archivo
         // Formato esperado: _envios_SKBO_.txt -> SKBO
         String fileName = path.getFileName().toString();
         String originId = extractOriginFromFilename(fileName);
-        
+
         String startDateStr = start != null ? String.format("%04d%02d%02d", start.getYear(), start.getMonthValue(), start.getDayOfMonth()) : null;
         String endDateStr = end != null ? String.format("%04d%02d%02d", end.getYear(), end.getMonthValue(), end.getDayOfMonth()) : null;
 
+        // Lectura en streaming con corte temprano (no se puede romper un forEach,
+        // por eso iteramos explícitamente y paramos al alcanzar maxRecords).
         try (Stream<String> lines = Files.lines(path)) {
-            lines.forEach(line -> {
+            java.util.Iterator<String> it = lines.iterator();
+            while (it.hasNext() && shipments.size() < maxRecords) {
+                String line = it.next();
                 int currentLine = lineNumber.incrementAndGet();
-                
-                // Ignorar líneas vacías
+
                 if (line.isBlank()) {
-                    return;
+                    continue;
                 }
 
-                // Filtrado temprano ultra-rápido por fecha (formato YYYYMMDD)
+                // Filtrado temprano ultra-rápido por fecha (formato YYYYMMDD).
+                // Los archivos _envios_*.txt están ordenados cronológicamente, así que
+                // una vez superada la fecha de fin podemos CORTAR el archivo (no seguir
+                // leyendo millones de líneas posteriores fuera de la ventana). Esto reduce
+                // drásticamente el arranque de la simulación de 5 días.
                 if (startDateStr != null || endDateStr != null) {
                     int firstDash = line.indexOf('-');
                     if (firstDash > 0 && line.length() >= firstDash + 9) {
                         String dateStr = line.substring(firstDash + 1, firstDash + 9);
-                        if (startDateStr != null && dateStr.compareTo(startDateStr) < 0) return;
-                        if (endDateStr != null && dateStr.compareTo(endDateStr) > 0) return;
+                        if (startDateStr != null && dateStr.compareTo(startDateStr) < 0) continue;
+                        if (endDateStr != null && dateStr.compareTo(endDateStr) > 0) break;
                     }
                 }
-                
+
                 try {
-                    ShipmentBatch batch = parseLine(line, currentLine, originId, 
+                    ShipmentBatch batch = parseLine(line, currentLine, originId,
                                                     airportManager, clientRegistry);
                     shipments.add(batch);
                 } catch (Exception e) {
@@ -91,9 +113,9 @@ public class ShipmentUploader {
                         e
                     );
                 }
-            });
+            }
         }
-        
+
         return shipments;
     }
     

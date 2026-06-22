@@ -139,6 +139,12 @@ public class SimulationResultExporter {
                     && (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
                     && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
                 .count();
+            // Crítico: rutas del día con retraso severo (llegada > deadline + umbral).
+            long critical = solution.getRoutes().values().stream()
+                .filter(r -> (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
+                    && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
+                .filter(SimulationResultExporter::isCriticallyLate)
+                .count();
             int totalBags = solution.getRoutes().values().stream()
                 .filter(r -> (dayEnd == null || r.getFinalArrivalTime().isBefore(dayEnd))
                     && (dayStart == null || !r.getFinalArrivalTime().isBefore(dayStart)))
@@ -147,19 +153,38 @@ public class SimulationResultExporter {
 
             String dateStr = dayStart != null ? dayStart.toLocalDate().toString() : "Day " + d;
 
+            long routesCompleted = onTime + delayed;
+            String collapseLevel = routesCompleted > 0 && critical >= routesCompleted * 0.15
+                ? "CRITICAL"
+                : critical > 0 || (routesCompleted > 0 && delayed >= routesCompleted * 0.3)
+                    ? "WARNING"
+                    : "NORMAL";
+
             snapshots.add(new SimulationResultsDTO.DaySnapshotDTO(
                 d,
                 dateStr,
-                (int)(onTime + delayed),   // routesCompleted
+                (int) routesCompleted,      // routesCompleted
                 totalBags,
                 (int) onTime,
                 (int) delayed,
-                0,                          // critical — no tenemos ese tracking por ahora
+                (int) critical,
                 solution.getFitness(),
-                "NORMAL"
+                collapseLevel
             ));
         }
         return snapshots;
+    }
+
+    /** Umbral de retraso severo para clasificar una ruta como "crítica" en el reporte. */
+    private static final java.time.Duration CRITICAL_LATENESS = java.time.Duration.ofHours(12);
+
+    private static boolean isCriticallyLate(AssignedRoute route) {
+        try {
+            ZonedDateTime deadline = route.getBatch().ingressTime().plus(route.getBatch().calculateSLA());
+            return route.getFinalArrivalTime().isAfter(deadline.plus(CRITICAL_LATENESS));
+        } catch (Exception e) {
+            return !route.meetsSLA();
+        }
     }
 
     private int calculateDaysToExport(Solution solution, ZonedDateTime startDate, ScenarioType scenario) {

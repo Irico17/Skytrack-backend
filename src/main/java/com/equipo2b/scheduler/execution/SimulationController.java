@@ -29,6 +29,10 @@ import java.util.UUID;
 public class SimulationController {
     private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
     private static final long STORAGE_UPDATE_INTERVAL_MS = 250L;
+    /** Cola inicial máxima de lotes reales para el escenario de colapso (decisión PO). */
+    private static final int COLLAPSE_INITIAL_QUEUE_CAP = 1000;
+    /** Días de crecimiento generado sobre la semilla en el escenario de colapso. */
+    private static final int COLLAPSE_GROWTH_DAYS = 5;
     
     // Componentes del sistema
     private final FlightPlan flightPlan;
@@ -490,6 +494,9 @@ public class SimulationController {
                 currentSolution = scheduler.executePlanningCycle(cyclePlanningTime);
                 long algorithmMs = System.currentTimeMillis() - cycleStartRealMs;
                 planningCursor = cycleHorizon;
+                if (currentCycle == 1) {
+                    System.out.printf("⏱️ [arranque] primer ciclo de planificación listo en %d ms (algoritmo)%n", algorithmMs);
+                }
                 logResourceUsage(scenario, algorithmMs);
 
                 // Actualizar estadísticas
@@ -660,13 +667,13 @@ public class SimulationController {
     }
 
     private void releaseHeavyState(ScenarioType scenario) {
-        if (scenario == ScenarioType.PERIOD_SIMULATION || scenario == ScenarioType.DAY_TO_DAY) {
-            scheduler = null;
-            tabuSearch = null;
-            validator = null;
-            System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name()
-                + "; última solución y lotes preservados para consulta REST");
-        }
+        // Los tres escenarios liberan el motor pesado al terminar; la última solución
+        // y los lotes quedan disponibles para consulta REST / exportación.
+        scheduler = null;
+        tabuSearch = null;
+        validator = null;
+        System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name()
+            + "; última solución y lotes preservados para consulta REST");
     }
     
     /**
@@ -685,14 +692,23 @@ public class SimulationController {
                 return historical;
                 
             case COLLAPSE_SIMULATION:
-                // Generar datos futuros con factor de crecimiento alto
-                ShipmentGenerator collapseGenerator = new ShipmentGenerator();
-                List<ShipmentBatch> collapseBatches = collapseGenerator.generateFutureShipments(
-                    historical, scenario.getK(), 1.23
-                );
-                List<ShipmentBatch> collapseAll = new ArrayList<>(historical);
-                collapseAll.addAll(collapseBatches);
-                return collapseAll.subList(0, Math.min(2000, collapseAll.size()));
+                // Semilla real acotada como cola inicial (cap 1000) + crecimiento generado
+                // que empuja la red hacia la saturación. La semilla llega ya recortada
+                // en streaming (≤50k) desde SimulationService; aquí limitamos la cola inicial.
+                List<ShipmentBatch> collapseBase = historical.isEmpty()
+                    ? historical
+                    : new ArrayList<>(historical.subList(0, Math.min(COLLAPSE_INITIAL_QUEUE_CAP, historical.size())));
+                List<ShipmentBatch> collapseAll = new ArrayList<>(collapseBase);
+                if (!collapseBase.isEmpty()) {
+                    // Crecimiento (factor 1.23) sobre la semilla recortada — barato y suficiente
+                    // para provocar el colapso por saturación/complejidad algorítmica.
+                    ShipmentGenerator collapseGenerator = new ShipmentGenerator();
+                    List<ShipmentBatch> collapseBatches = collapseGenerator.generateFutureShipments(
+                        collapseBase, COLLAPSE_GROWTH_DAYS, 1.23
+                    );
+                    collapseAll.addAll(collapseBatches);
+                }
+                return collapseAll;
                 
             default:
                 throw new IllegalArgumentException("Escenario desconocido: " + scenario);

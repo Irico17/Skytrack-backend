@@ -121,6 +121,50 @@ public class DataLoadingService {
         return loadShipmentsFiltered(airportManager, clientRegistry, startInclusive, endExclusive);
     }
 
+    /**
+     * Carga una semilla acotada de envíos desde {@code start} en adelante, en streaming,
+     * deteniéndose al alcanzar {@code maxRecords}. Pensada para el escenario de colapso:
+     * evita materializar los ~9,5 M de registros en una VM de 2 GB.
+     *
+     * <p>Lee los archivos de forma secuencial (no paralela) para poder cortar temprano
+     * y mantener el pico de memoria bajo.</p>
+     */
+    public List<ShipmentBatch> loadShipmentSeed(AirportManager airportManager,
+                                                ClientRegistry clientRegistry,
+                                                ZonedDateTime start,
+                                                int maxRecords) throws IOException {
+        Path dir = Paths.get(shipmentsDir);
+        if (!Files.exists(dir) || !Files.isDirectory(dir)) {
+            throw new IOException("Directorio de envíos no encontrado: " + shipmentsDir);
+        }
+
+        List<ShipmentBatch> seed = new ArrayList<>();
+        List<Path> files;
+        try (Stream<Path> stream = Files.list(dir)) {
+            files = stream
+                .filter(p -> p.getFileName().toString().startsWith("_envios_")
+                    && p.getFileName().toString().endsWith("_.txt"))
+                .sorted()
+                .toList();
+        }
+
+        for (Path file : files) {
+            if (seed.size() >= maxRecords) break;
+            int remaining = maxRecords - seed.size();
+            try {
+                seed.addAll(shipmentUploader.loadShipments(
+                    file.toString(), airportManager, clientRegistry, start, null, remaining));
+            } catch (Exception e) {
+                System.err.println("⚠️ Error cargando semilla de " + file.getFileName() + ": " + e.getMessage());
+            }
+        }
+
+        seed.sort(Comparator.comparing(ShipmentBatch::ingressTime));
+        System.out.printf("✓ Semilla de colapso: %,d lotes (tope %,d) desde %s%n",
+            seed.size(), maxRecords, shipmentsDir);
+        return seed;
+    }
+
     /** Construye una ShipmentQueue a partir de una lista de batches. */
     public ShipmentQueue buildQueue(List<ShipmentBatch> batches) {
         ShipmentQueue queue = new ShipmentQueue();

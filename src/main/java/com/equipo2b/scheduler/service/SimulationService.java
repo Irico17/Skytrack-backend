@@ -48,6 +48,9 @@ public class SimulationService implements SimulationController.SimulationListene
     @Autowired(required = false)
     private SimulationWebSocketHandler webSocketHandler;
 
+    /** Tope de la semilla de envíos para el escenario de colapso (streaming, sin materializar 9,5 M). */
+    private static final int COLLAPSE_SEED_MAX_RECORDS = 50_000;
+
     // Componentes en memoria — se recrean al iniciar cada simulación
     private SimulationController activeController;
     private FlightPlan currentFlightPlan;
@@ -123,6 +126,7 @@ public class SimulationService implements SimulationController.SimulationListene
         currentStartedAt = ZonedDateTime.now(ZoneOffset.UTC);
         currentFinishedAt = null;
 
+        long startupT0 = System.currentTimeMillis();
         try {
             System.out.println("🚀 Iniciando simulación: " + scenario.getDescription());
             if (currentStartDate != null) {
@@ -135,6 +139,7 @@ public class SimulationService implements SimulationController.SimulationListene
             currentAirportManager = dataService.createAirportManager(airports);
             ClientRegistry clientRegistry = dataService.createClientRegistry(airports);
             currentFlightPlan = dataService.loadFlightPlan(currentAirportManager);
+            System.out.printf("⏱️ [arranque] datos base listos en %d ms%n", System.currentTimeMillis() - startupT0);
 
             // 2. Cargar envíos — filtrar por ventana real si aplica
             List<ShipmentBatch> batches;
@@ -145,9 +150,18 @@ public class SimulationService implements SimulationController.SimulationListene
                 batches = dataService.loadShipmentsInRange(
                     currentAirportManager, clientRegistry, currentStartDate, endDate
                 );
+            } else if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                // Colapso: semilla acotada en streaming desde la fecha de inicio.
+                // Evita materializar los ~9,5 M de registros en una VM de 2 GB.
+                batches = dataService.loadShipmentSeed(
+                    currentAirportManager, clientRegistry, currentStartDate, COLLAPSE_SEED_MAX_RECORDS
+                );
             } else {
                 batches = dataService.loadAllShipments(currentAirportManager, clientRegistry);
             }
+
+            System.out.printf("⏱️ [arranque] %,d lotes cargados en %d ms (total)%n",
+                batches.size(), System.currentTimeMillis() - startupT0);
 
             // 3. Construir cola
             currentQueue = dataService.buildQueue(batches);
@@ -179,6 +193,8 @@ public class SimulationService implements SimulationController.SimulationListene
                 webSocketHandler.onSimulationStarted(buildActiveSimulationDTO());
             }
 
+            System.out.printf("⏱️ [arranque] motor iniciado en %d ms; primer ciclo en curso%n",
+                System.currentTimeMillis() - startupT0);
             System.out.println("✓ Simulación iniciada: " + simId);
             return new StartSimulationResult(simId, false, buildActiveSimulationDTO());
 
@@ -239,8 +255,29 @@ public class SimulationService implements SimulationController.SimulationListene
     /** Para la simulación activa. */
     public void stopSimulation(String simId) {
         validateSimId(simId);
+        ScenarioType scenarioBeforeStop = currentScenario;
+        SimulationController controllerBeforeStop = activeController;
         activeController.stopSimulation();
         currentFinishedAt = ZonedDateTime.now(ZoneOffset.UTC);
+
+        // ESC-02: al cerrar una operación día a día (detención manual) exportamos el
+        // reporte JSON para que el frontend pueda mostrarlo (/results). El cierre natural
+        // por fin de datos no aplica a DAY_TO_DAY, por eso se exporta aquí.
+        if (scenarioBeforeStop == ScenarioType.DAY_TO_DAY && controllerBeforeStop != null) {
+            try {
+                resultExporter.exportResults(
+                    controllerBeforeStop.getSimulationId(),
+                    ScenarioType.DAY_TO_DAY,
+                    currentStartDate,
+                    controllerBeforeStop.getCurrentSolution(),
+                    controllerBeforeStop.getCurrentBatches() != null ? controllerBeforeStop.getCurrentBatches().size() : 0,
+                    controllerBeforeStop.getStatus().currentCycle()
+                );
+                System.out.println("✓ Reporte de operación día a día exportado a JSON");
+            } catch (Exception e) {
+                System.err.println("❌ Error exportando reporte día a día: " + e.getMessage());
+            }
+        }
     }
 
     /** Pausa la simulación activa. */
