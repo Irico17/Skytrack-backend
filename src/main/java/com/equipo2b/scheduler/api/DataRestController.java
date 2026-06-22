@@ -4,6 +4,8 @@ import com.equipo2b.scheduler.model.Airport;
 import com.equipo2b.scheduler.model.AirportManager;
 import com.equipo2b.scheduler.model.Flight;
 import com.equipo2b.scheduler.model.FlightPlan;
+import com.equipo2b.scheduler.api.dto.StaticDataBatchProgressDTO;
+import com.equipo2b.scheduler.api.dto.StaticDataBatchStartDTO;
 import com.equipo2b.scheduler.api.dto.StaticDataUploadDTO;
 import com.equipo2b.scheduler.persistence.DataImportService;
 import com.equipo2b.scheduler.service.DataLoadingService;
@@ -222,6 +224,104 @@ public class DataRestController {
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Error reemplazando datos estaticos: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Inicia una sesion de carga por lotes. Escribe aeropuertos y vuelos en staging.
+     * Si sessionId es valido y existe, reutiliza la sesion sin volver a subir esos archivos.
+     */
+    @PostMapping(value = "/static/batch/start", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> startStaticDataBatch(
+            @RequestPart(value = "sessionId", required = false) String sessionId,
+            @RequestPart("airports") MultipartFile airportsFile,
+            @RequestPart("flights") MultipartFile flightsFile) {
+        try {
+            StaticDataBatchStartDTO started = staticDataStorageService.startBatchUpload(
+                sessionId,
+                airportsFile,
+                flightsFile
+            );
+            return ResponseEntity.ok(started);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error iniciando carga por lotes: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Agrega hasta 10 archivos de envios a la sesion de staging.
+     */
+    @PostMapping(value = "/static/batch/shipments", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> appendStaticDataBatchShipments(
+            @RequestPart("sessionId") String sessionId,
+            @RequestPart("shipments") MultipartFile[] shipmentFiles) {
+        try {
+            StaticDataBatchProgressDTO progress = staticDataStorageService.appendShipmentBatch(
+                sessionId,
+                Arrays.asList(shipmentFiles)
+            );
+            return ResponseEntity.ok(progress);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error recibiendo lote de envios: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Valida todos los archivos en staging, aplica swap atomico e importa a BD.
+     */
+    @PostMapping("/static/batch/finalize")
+    public ResponseEntity<?> finalizeStaticDataBatch(@RequestBody Map<String, String> body) {
+        try {
+            String sessionId = body != null ? body.get("sessionId") : null;
+            if (sessionId == null || sessionId.isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "sessionId es requerido"));
+            }
+
+            StaticDataUploadDTO saved = staticDataStorageService.finalizeBatchUpload(sessionId);
+            dataService.invalidateCaches();
+            projectedFlightsCache.clear();
+            var imported = dataImportService.replaceReferenceData();
+
+            return ResponseEntity.ok(new StaticDataUploadDTO(
+                saved.message(),
+                saved.airportsFile(),
+                saved.flightsFile(),
+                saved.shipmentFiles(),
+                saved.airportsLoaded(),
+                saved.flightsLoaded(),
+                saved.shipmentsLoaded(),
+                imported.airports(),
+                imported.flights()
+            ));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error finalizando carga por lotes: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Descarta una sesion de staging sin afectar el dataset activo.
+     */
+    @PostMapping("/static/batch/cancel")
+    public ResponseEntity<?> cancelStaticDataBatch(@RequestBody Map<String, String> body) {
+        try {
+            String sessionId = body != null ? body.get("sessionId") : null;
+            if (sessionId == null || sessionId.isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "sessionId es requerido"));
+            }
+            staticDataStorageService.cancelBatchUpload(sessionId);
+            return ResponseEntity.ok(Map.of("message", "Sesion de carga cancelada"));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error cancelando carga por lotes: " + e.getMessage()));
         }
     }
 }

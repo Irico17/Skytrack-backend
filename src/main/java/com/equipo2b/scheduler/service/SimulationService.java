@@ -271,7 +271,9 @@ public class SimulationService implements SimulationController.SimulationListene
                     currentStartDate,
                     controllerBeforeStop.getCurrentSolution(),
                     controllerBeforeStop.getCurrentBatches() != null ? controllerBeforeStop.getCurrentBatches().size() : 0,
-                    controllerBeforeStop.getStatus().currentCycle()
+                    controllerBeforeStop.getStatus().currentCycle(),
+                    currentAirportManager,
+                    controllerBeforeStop.getCurrentBatches()
                 );
                 System.out.println("✓ Reporte de operación día a día exportado a JSON");
             } catch (Exception e) {
@@ -634,7 +636,9 @@ public class SimulationService implements SimulationController.SimulationListene
                     simId, currentScenario, currentStartDate,
                     solution,
                     batches != null ? batches.size() : 0,
-                    status.currentCycle()
+                    status.currentCycle(),
+                    currentAirportManager,
+                    batches
                 );
                 System.out.println("✓ Resultados de simulación exportados a archivo JSON");
             } catch (Exception e) {

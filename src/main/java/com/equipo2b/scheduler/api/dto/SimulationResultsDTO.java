@@ -31,6 +31,8 @@ public record SimulationResultsDTO(
         int batchesDelayed,
         int batchesCritical,
         double avgFitness,
-        String collapseLevel
+        String collapseLevel,
+        int avgOccupancy,
+        int replanned
     ) {}
 }

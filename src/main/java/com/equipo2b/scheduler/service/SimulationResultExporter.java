@@ -2,8 +2,12 @@ package com.equipo2b.scheduler.service;
 
 import com.equipo2b.scheduler.api.dto.SimulationResultsDTO;
 import com.equipo2b.scheduler.execution.ScenarioType;
+import com.equipo2b.scheduler.model.Airport;
+import com.equipo2b.scheduler.model.AirportManager;
 import com.equipo2b.scheduler.model.AssignedRoute;
+import com.equipo2b.scheduler.model.ShipmentBatch;
 import com.equipo2b.scheduler.model.Solution;
+import com.equipo2b.scheduler.monitoring.StorageInventoryService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.springframework.beans.factory.annotation.Value;
@@ -18,6 +22,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Exporta los resultados finales de una simulación de 5 días a un archivo JSON.
@@ -59,6 +64,23 @@ public class SimulationResultExporter {
             int totalBatches,
             int totalCycles
     ) throws IOException {
+        return exportResults(simId, scenario, startDate, solution, totalBatches, totalCycles, null, null);
+    }
+
+    /**
+     * Variante con datos de inventario para calcular la ocupación REAL de almacén por día
+     * (no una heurística). Si {@code airportManager} es null, avgOccupancy queda en 0.
+     */
+    public Path exportResults(
+            String simId,
+            ScenarioType scenario,
+            ZonedDateTime startDate,
+            Solution solution,
+            int totalBatches,
+            int totalCycles,
+            AirportManager airportManager,
+            List<ShipmentBatch> batches
+    ) throws IOException {
         // Crear directorio si no existe
         Path dir = Paths.get(resultsDir);
         Files.createDirectories(dir);
@@ -72,7 +94,7 @@ public class SimulationResultExporter {
 
         // Construir snapshots por día (agrupamos rutas por día de llegada)
         List<SimulationResultsDTO.DaySnapshotDTO> snapshots = buildDaySnapshots(
-            solution, startDate, scenario
+            solution, startDate, scenario, airportManager, batches
         );
 
         int daysCovered = snapshots.stream()
@@ -118,10 +140,15 @@ public class SimulationResultExporter {
     // ===== PRIVATE =====
 
     private List<SimulationResultsDTO.DaySnapshotDTO> buildDaySnapshots(
-            Solution solution, ZonedDateTime startDate, ScenarioType scenario) {
+            Solution solution, ZonedDateTime startDate, ScenarioType scenario,
+            AirportManager airportManager, List<ShipmentBatch> batches) {
 
         List<SimulationResultsDTO.DaySnapshotDTO> snapshots = new ArrayList<>();
         int daysToExport = calculateDaysToExport(solution, startDate, scenario);
+        StorageInventoryService inventory = airportManager != null
+            ? new StorageInventoryService(airportManager)
+            : null;
+        List<ShipmentBatch> knownBatches = batches != null ? batches : List.of();
 
         for (int day = 1; day <= daysToExport; day++) {
             final int d = day;
@@ -160,6 +187,23 @@ public class SimulationResultExporter {
                     ? "WARNING"
                     : "NORMAL";
 
+            // Ocupación REAL de almacén al cierre del día (promedio de ratios bags/capacidad).
+            // Si no hay AirportManager (llamada legacy), queda 0 — sin heurística falsa.
+            int avgOccupancy = 0;
+            if (inventory != null && dayEnd != null) {
+                Map<Airport, Integer> bagsByAirport = inventory.calculateCurrentBags(solution, dayEnd, knownBatches);
+                double sumRatio = 0; int counted = 0;
+                for (Map.Entry<Airport, Integer> e : bagsByAirport.entrySet()) {
+                    int cap = e.getKey().storageCapacity();
+                    if (cap > 0) { sumRatio += (double) e.getValue() / cap; counted++; }
+                }
+                avgOccupancy = counted > 0 ? Math.min(100, (int) Math.round((sumRatio / counted) * 100)) : 0;
+            }
+            // Replanned por día: el motor no registra replanificaciones por jornada en la
+            // solución final (solo ocurren ante cancelaciones puntuales). Se reporta 0 aquí
+            // y el total agregado se ve en el panel/headline; evitamos un valor falso.
+            int replanned = 0;
+
             snapshots.add(new SimulationResultsDTO.DaySnapshotDTO(
                 d,
                 dateStr,
@@ -169,7 +213,9 @@ public class SimulationResultExporter {
                 (int) delayed,
                 (int) critical,
                 solution.getFitness(),
-                collapseLevel
+                collapseLevel,
+                avgOccupancy,
+                replanned
             ));
         }
         return snapshots;

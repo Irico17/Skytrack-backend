@@ -1,11 +1,12 @@
 package com.equipo2b.scheduler.service;
 
+import com.equipo2b.scheduler.api.dto.StaticDataBatchProgressDTO;
+import com.equipo2b.scheduler.api.dto.StaticDataBatchStartDTO;
 import com.equipo2b.scheduler.api.dto.StaticDataUploadDTO;
 import com.equipo2b.scheduler.model.Airport;
 import com.equipo2b.scheduler.model.AirportManager;
 import com.equipo2b.scheduler.model.ClientRegistry;
 import com.equipo2b.scheduler.model.FlightPlan;
-import com.equipo2b.scheduler.model.ShipmentBatch;
 import com.equipo2b.scheduler.upload.AirportUploader;
 import com.equipo2b.scheduler.upload.FlightPlanUploader;
 import com.equipo2b.scheduler.upload.ShipmentUploader;
@@ -23,6 +24,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 @Service
@@ -40,9 +43,14 @@ public class StaticDataStorageService {
     /** Nº de líneas por archivo que se parsean para validar formato (el resto solo se cuenta). */
     private static final int VALIDATION_SAMPLE_SIZE = 200;
 
+    /** Máximo de archivos de envíos por lote en upload por sesión. */
+    public static final int MAX_SHIPMENTS_PER_BATCH = 10;
+
     private final AirportUploader airportUploader = new AirportUploader();
     private final FlightPlanUploader flightUploader = new FlightPlanUploader();
     private final ShipmentUploader shipmentUploader = new ShipmentUploader();
+
+    private final ConcurrentHashMap<String, UploadSession> uploadSessions = new ConcurrentHashMap<>();
 
     public StaticDataUploadDTO replaceStaticData(
             MultipartFile airportsFile,
@@ -60,47 +68,19 @@ public class StaticDataStorageService {
         Path stagingRoot = Files.createTempDirectory(resolveDataRoot(targetAirports, targetFlights, targetShipmentsDir), "static-data-upload-");
 
         try {
-            Path stagedAirports = stagingRoot.resolve(targetAirports.getFileName().toString());
-            Path stagedFlights = stagingRoot.resolve(targetFlights.getFileName().toString());
-            Path stagedShipmentsDir = stagingRoot.resolve(targetShipmentsDir.getFileName().toString());
-            Files.createDirectories(stagedShipmentsDir);
+            UploadSession session = createStagingSession(stagingRoot, targetAirports, targetFlights, targetShipmentsDir);
+            copyUpload(airportsFile, session.stagedAirports);
+            copyUpload(flightsFile, session.stagedFlights);
+            stageShipmentFiles(session, shipmentFiles);
 
-            copyUpload(airportsFile, stagedAirports);
-            copyUpload(flightsFile, stagedFlights);
-
-            Set<String> shipmentNames = new HashSet<>();
-            for (MultipartFile shipmentFile : shipmentFiles) {
-                validateRequiredFile(shipmentFile, "shipment");
-                String name = cleanFileName(shipmentFile);
-                if (!name.matches("^_envios_[A-Za-z0-9]+_\\.txt$")) {
-                    throw new IllegalArgumentException("Nombre de archivo de envio invalido: " + name);
-                }
-                if (!shipmentNames.add(name)) {
-                    throw new IllegalArgumentException("Archivo de envio duplicado: " + name);
-                }
-                copyUpload(shipmentFile, stagedShipmentsDir.resolve(name));
-            }
-
-            ValidationCounts counts = validateStagedData(stagedAirports, stagedFlights, stagedShipmentsDir);
-
-            Files.createDirectories(targetAirports.getParent());
-            Files.createDirectories(targetFlights.getParent());
-            Files.createDirectories(targetShipmentsDir);
-
-            Files.copy(stagedAirports, targetAirports, StandardCopyOption.REPLACE_EXISTING);
-            Files.copy(stagedFlights, targetFlights, StandardCopyOption.REPLACE_EXISTING);
-            deleteContents(targetShipmentsDir);
-            try (Stream<Path> files = Files.list(stagedShipmentsDir)) {
-                for (Path file : files.toList()) {
-                    Files.copy(file, targetShipmentsDir.resolve(file.getFileName()), StandardCopyOption.REPLACE_EXISTING);
-                }
-            }
+            ValidationCounts counts = validateStagedData(session.stagedAirports, session.stagedFlights, session.stagedShipmentsDir);
+            commitStagedFiles(session, targetAirports, targetFlights, targetShipmentsDir);
 
             return new StaticDataUploadDTO(
                 "Datos estaticos reemplazados correctamente",
                 targetAirports.getFileName().toString(),
                 targetFlights.getFileName().toString(),
-                shipmentNames.size(),
+                session.shipmentNames.size(),
                 counts.airports(),
                 counts.flights(),
                 counts.shipments(),
@@ -112,8 +92,166 @@ public class StaticDataStorageService {
         }
     }
 
+    public StaticDataBatchStartDTO startBatchUpload(String sessionId, MultipartFile airportsFile, MultipartFile flightsFile)
+            throws IOException {
+        if (sessionId != null && !sessionId.isBlank()) {
+            UploadSession existing = uploadSessions.get(sessionId);
+            if (existing != null) {
+                return new StaticDataBatchStartDTO(
+                    sessionId,
+                    "Sesion de carga reutilizada",
+                    existing.shipmentNames.size()
+                );
+            }
+        }
+
+        validateRequiredFile(airportsFile, "airports");
+        validateRequiredFile(flightsFile, "flights");
+
+        Path targetAirports = Paths.get(airportsPath);
+        Path targetFlights = Paths.get(flightsPath);
+        Path targetShipmentsDir = Paths.get(shipmentsDir);
+        Path stagingRoot = Files.createTempDirectory(
+            resolveDataRoot(targetAirports, targetFlights, targetShipmentsDir),
+            "static-data-batch-"
+        );
+
+        UploadSession session = createStagingSession(stagingRoot, targetAirports, targetFlights, targetShipmentsDir);
+        copyUpload(airportsFile, session.stagedAirports);
+        copyUpload(flightsFile, session.stagedFlights);
+
+        String newSessionId = UUID.randomUUID().toString();
+        uploadSessions.put(newSessionId, session);
+        return new StaticDataBatchStartDTO(newSessionId, "Sesion de carga iniciada", 0);
+    }
+
+    public StaticDataBatchProgressDTO appendShipmentBatch(String sessionId, List<MultipartFile> shipmentFiles)
+            throws IOException {
+        UploadSession session = requireSession(sessionId);
+        if (shipmentFiles == null || shipmentFiles.isEmpty()) {
+            throw new IllegalArgumentException("Debe subir al menos un archivo de envios preliminares");
+        }
+        if (shipmentFiles.size() > MAX_SHIPMENTS_PER_BATCH) {
+            throw new IllegalArgumentException(
+                "Maximo " + MAX_SHIPMENTS_PER_BATCH + " archivos de envios por lote"
+            );
+        }
+
+        int filesInBatch = stageShipmentFiles(session, shipmentFiles);
+        return new StaticDataBatchProgressDTO(
+            sessionId,
+            filesInBatch,
+            session.shipmentNames.size(),
+            "Lote de envios recibido"
+        );
+    }
+
+    public StaticDataUploadDTO finalizeBatchUpload(String sessionId) throws IOException {
+        UploadSession session = uploadSessions.remove(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Sesion de carga invalida o expirada: " + sessionId);
+        }
+
+        Path targetAirports = Paths.get(airportsPath);
+        Path targetFlights = Paths.get(flightsPath);
+        Path targetShipmentsDir = Paths.get(shipmentsDir);
+
+        try {
+            if (session.shipmentNames.isEmpty()) {
+                throw new IllegalArgumentException("Debe subir al menos un archivo de envios preliminares");
+            }
+
+            ValidationCounts counts = validateStagedData(
+                session.stagedAirports,
+                session.stagedFlights,
+                session.stagedShipmentsDir
+            );
+            commitStagedFiles(session, targetAirports, targetFlights, targetShipmentsDir);
+
+            return new StaticDataUploadDTO(
+                "Datos estaticos reemplazados correctamente",
+                targetAirports.getFileName().toString(),
+                targetFlights.getFileName().toString(),
+                session.shipmentNames.size(),
+                counts.airports(),
+                counts.flights(),
+                counts.shipments(),
+                0,
+                0
+            );
+        } finally {
+            deleteRecursively(session.stagingRoot);
+        }
+    }
+
+    public void cancelBatchUpload(String sessionId) throws IOException {
+        UploadSession session = uploadSessions.remove(sessionId);
+        if (session != null) {
+            deleteRecursively(session.stagingRoot);
+        }
+    }
+
     public ValidationCounts validateCurrentData() throws IOException {
         return validateStagedData(Paths.get(airportsPath), Paths.get(flightsPath), Paths.get(shipmentsDir));
+    }
+
+    private UploadSession requireSession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new IllegalArgumentException("sessionId es requerido");
+        }
+        UploadSession session = uploadSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Sesion de carga invalida o expirada: " + sessionId);
+        }
+        return session;
+    }
+
+    private static UploadSession createStagingSession(
+            Path stagingRoot,
+            Path targetAirports,
+            Path targetFlights,
+            Path targetShipmentsDir) throws IOException {
+        Path stagedAirports = stagingRoot.resolve(targetAirports.getFileName().toString());
+        Path stagedFlights = stagingRoot.resolve(targetFlights.getFileName().toString());
+        Path stagedShipmentsDir = stagingRoot.resolve(targetShipmentsDir.getFileName().toString());
+        Files.createDirectories(stagedShipmentsDir);
+        return new UploadSession(stagingRoot, stagedAirports, stagedFlights, stagedShipmentsDir);
+    }
+
+    private int stageShipmentFiles(UploadSession session, List<MultipartFile> shipmentFiles) throws IOException {
+        int staged = 0;
+        for (MultipartFile shipmentFile : shipmentFiles) {
+            validateRequiredFile(shipmentFile, "shipment");
+            String name = cleanFileName(shipmentFile);
+            if (!name.matches("^_envios_[A-Za-z0-9]+_\\.txt$")) {
+                throw new IllegalArgumentException("Nombre de archivo de envio invalido: " + name);
+            }
+            if (!session.shipmentNames.add(name)) {
+                throw new IllegalArgumentException("Archivo de envio duplicado: " + name);
+            }
+            copyUpload(shipmentFile, session.stagedShipmentsDir.resolve(name));
+            staged++;
+        }
+        return staged;
+    }
+
+    private static void commitStagedFiles(
+            UploadSession session,
+            Path targetAirports,
+            Path targetFlights,
+            Path targetShipmentsDir) throws IOException {
+        Files.createDirectories(targetAirports.getParent());
+        Files.createDirectories(targetFlights.getParent());
+        Files.createDirectories(targetShipmentsDir);
+
+        Files.copy(session.stagedAirports, targetAirports, StandardCopyOption.REPLACE_EXISTING);
+        Files.copy(session.stagedFlights, targetFlights, StandardCopyOption.REPLACE_EXISTING);
+        deleteContents(targetShipmentsDir);
+        try (Stream<Path> files = Files.list(session.stagedShipmentsDir)) {
+            for (Path file : files.toList()) {
+                Files.copy(file, targetShipmentsDir.resolve(file.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
     }
 
     private ValidationCounts validateStagedData(Path airportsFile, Path flightsFile, Path shipmentDir) throws IOException {
@@ -216,6 +354,21 @@ public class StaticDataStorageService {
             for (Path p : paths) {
                 Files.deleteIfExists(p);
             }
+        }
+    }
+
+    private static final class UploadSession {
+        final Path stagingRoot;
+        final Path stagedAirports;
+        final Path stagedFlights;
+        final Path stagedShipmentsDir;
+        final Set<String> shipmentNames = new HashSet<>();
+
+        UploadSession(Path stagingRoot, Path stagedAirports, Path stagedFlights, Path stagedShipmentsDir) {
+            this.stagingRoot = stagingRoot;
+            this.stagedAirports = stagedAirports;
+            this.stagedFlights = stagedFlights;
+            this.stagedShipmentsDir = stagedShipmentsDir;
         }
     }
 
