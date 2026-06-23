@@ -1,6 +1,7 @@
 package com.equipo2b.scheduler.execution;
 
 import com.equipo2b.scheduler.algorithm.*;
+import com.equipo2b.scheduler.logic.RouteGenerator;
 import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.validation.RouteValidator;
@@ -65,13 +66,11 @@ public class SchedulerFactory {
         tabu.configure(tabuConfig);
 
         return createGATSScheduler(
-            ga, tabu, shipmentQueue, evaluator, validator, Ta, Sa, K
+            ga, tabu, shipmentQueue, evaluator, validator, Ta, Sa, K, flightPlan, false, null
         );
     }
 
-    /**
-     * Crea Scheduler GATS reutilizando algoritmos ya configurados.
-     */
+    /** Compatibilidad: sin relleno de capacidad. */
     public static Scheduler createGATSScheduler(
             GeneticAlgorithm ga,
             TabuSearch tabu,
@@ -79,7 +78,24 @@ public class SchedulerFactory {
             SolutionEvaluator evaluator,
             RouteValidator validator,
             int Ta, int Sa, int K) {
-        
+        return createGATSScheduler(ga, tabu, shipmentQueue, evaluator, validator, Ta, Sa, K, null, false, null);
+    }
+
+    /**
+     * Crea Scheduler GATS reutilizando algoritmos ya configurados, con relleno de
+     * capacidad por sub-lotes opcional (directo + multi-hop; requiere flightPlan + routeGenerator).
+     */
+    public static Scheduler createGATSScheduler(
+            GeneticAlgorithm ga,
+            TabuSearch tabu,
+            ShipmentQueue shipmentQueue,
+            SolutionEvaluator evaluator,
+            RouteValidator validator,
+            int Ta, int Sa, int K,
+            FlightPlan flightPlan,
+            boolean partialFillEnabled,
+            RouteGenerator fillRouteGenerator) {
+
         return new Scheduler(
             ga,                      // primaryAlgorithm = GA
             tabu,                    // tabuSearch para refine
@@ -88,7 +104,10 @@ public class SchedulerFactory {
             shipmentQueue,
             evaluator,
             validator,
-            Ta, Sa, K
+            Ta, Sa, K,
+            flightPlan,
+            partialFillEnabled,
+            fillRouteGenerator
         );
     }
     

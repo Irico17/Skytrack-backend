@@ -33,6 +33,7 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int neighborhoodSize = 20;
     private int routeSearchAttempts = 8;
     private int routeCachedVariants = 2;
+    private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
 
     private int effectiveMaxIterations(int routeCount) {
         if (routeCount >= 2_000) return 0;
@@ -174,8 +175,13 @@ public class TabuSearch implements OptimizationAlgorithm {
         
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
-        
+        final long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
+
         for (int iter = 0; iter < effectiveMaxIterations; iter++) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf("⏱️ Tabú detenido por presupuesto de tiempo en iteración %d%n", iter);
+                break;
+            }
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
             
@@ -527,6 +533,7 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.neighborhoodSize = config.getInt("neighborhoodSize", 20);
         this.routeSearchAttempts = config.getInt("routeSearchAttempts", 8);
         this.routeCachedVariants = config.getInt("routeCachedVariants", 2);
+        this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
         this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
     

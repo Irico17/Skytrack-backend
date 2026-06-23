@@ -43,17 +43,15 @@ public enum ScenarioType {
     ),
     
     /**
-     * Escenario 3: Simulación hasta Colapso (K=75).
-     * - Simula 2.5 meses de operación
-     * - 2000 lotes aproximadamente
-     * - Configuración intensiva de algoritmos
-     * - Objetivo: Detectar colapso logístico
+     * Escenario 3: Simulación hasta Colapso.
+     * - Mismos parámetros de velocidad que PERIOD (decisión PO): K=180, Ta=2, Sa=2 (Sc=6h).
+     * - Objetivo: Detectar colapso logístico por saturación de almacenes.
      */
     COLLAPSE_SIMULATION(
-        75,   // K: Factor de aceleración
+        180,  // K: Factor de aceleración (igual que PERIOD)
         2,    // Ta: Tiempo máximo de algoritmo (minutos)
-        5,    // Sa: Salto entre ejecuciones (minutos)
-        "Escenario 3: Simulación hasta Colapso (K=75)"
+        2,    // Sa: Salto entre ejecuciones (minutos) — Sc=2×180=360min(6h)
+        "Escenario 3: Simulación hasta Colapso (K=180, Ta=2, Sa=2)"
     );
     
     private final int K;           // Constante de proporcionalidad

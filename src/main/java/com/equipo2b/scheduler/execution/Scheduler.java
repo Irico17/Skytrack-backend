@@ -1,6 +1,7 @@
 package com.equipo2b.scheduler.execution;
 
 import com.equipo2b.scheduler.algorithm.*;
+import com.equipo2b.scheduler.logic.RouteGenerator;
 import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.validation.RouteValidator;
@@ -36,6 +37,12 @@ public class Scheduler {
     private final ShipmentQueue shipmentQueue;
     private final SolutionEvaluator evaluator;
     private final RouteValidator validator;
+    // Relleno de capacidad por sub-lotes (split): aprovecha el espacio libre de los vuelos
+    // directos para lotes que quedaron sin ruta. Aditivo: nunca modifica rutas existentes.
+    private final FlightPlan flightPlan;
+    private final boolean partialFillEnabled;
+    private final RouteGenerator fillRouteGenerator;  // para sub-lotes multi-hop (puede ser null)
+    private static final int MIN_FILL_BAGS = 1;
     
     // Parámetros de configuración
     private final int Ta;  // Tiempo algoritmo (minutos)
@@ -70,6 +77,25 @@ public class Scheduler {
                     SolutionEvaluator evaluator,
                     RouteValidator validator,
                     int Ta, int Sa, int K) {
+        this(primaryAlgorithm, tabuSearch, algorithmType, useRefinement,
+             shipmentQueue, evaluator, validator, Ta, Sa, K, null, false, null);
+    }
+
+    /** Constructor con relleno de capacidad por sub-lotes opcional (directo + multi-hop). */
+    public Scheduler(OptimizationAlgorithm primaryAlgorithm,
+                    TabuSearch tabuSearch,
+                    AlgorithmType algorithmType,
+                    boolean useRefinement,
+                    ShipmentQueue shipmentQueue,
+                    SolutionEvaluator evaluator,
+                    RouteValidator validator,
+                    int Ta, int Sa, int K,
+                    FlightPlan flightPlan,
+                    boolean partialFillEnabled,
+                    RouteGenerator fillRouteGenerator) {
+        this.flightPlan = flightPlan;
+        this.partialFillEnabled = partialFillEnabled;
+        this.fillRouteGenerator = fillRouteGenerator;
         this.primaryAlgorithm = Objects.requireNonNull(primaryAlgorithm, "Primary algorithm cannot be null");
         this.tabuSearch = Objects.requireNonNull(tabuSearch, "Tabu search cannot be null");
         this.algorithmType = Objects.requireNonNull(algorithmType, "Algorithm type cannot be null");
@@ -83,10 +109,12 @@ public class Scheduler {
         this.K = K;
         this.Sc = Sa * K;
         
-        // Validar que Sa > Ta
-        if (Sa <= Ta) {
+        // Validar Sa >= Ta. Se permite Sa == Ta porque el algoritmo respeta un
+        // presupuesto de tiempo duro (deadline = Ta) dentro de GA/Tabu: nunca excede Ta,
+        // y la cadencia (Sa) puede igualar Ta para usar todo el CPU sin tiempo muerto.
+        if (Sa < Ta) {
             throw new IllegalArgumentException(
-                String.format("Sa (%d) must be greater than Ta (%d)", Sa, Ta)
+                String.format("Sa (%d) must be >= Ta (%d)", Sa, Ta)
             );
         }
         
@@ -168,7 +196,16 @@ public class Scheduler {
         
         int routesAfterAccumulation = accumulatedSolution.getRoutes().size();
         System.out.println("Rutas totales acumuladas: " + routesAfterAccumulation);
-        
+
+        // 5b. Relleno de capacidad: parte los lotes sin ruta en sub-lotes que quepan en el
+        //     espacio libre de vuelos directos (maximiza el uso de los vuelos). Aditivo y seguro.
+        if (partialFillEnabled && flightPlan != null) {
+            int filled = fillLeftoverCapacity(accumulatedSolution, batches, windowStart, windowEnd);
+            if (filled > 0) {
+                System.out.println("🧩 Relleno de capacidad: " + filled + " sub-lotes ubicados en vuelos directos");
+            }
+        }
+
         // 6. Re-evaluar fitness de la solución completa
         evaluator.evaluate(accumulatedSolution);
         System.out.println("Fitness de solución acumulada: " + String.format("%.2f", accumulatedSolution.getFitness()));
@@ -197,6 +234,105 @@ public class Scheduler {
         
         currentSolution = accumulatedSolution;
         return currentSolution;
+    }
+
+    /**
+     * Rellena el espacio libre de vuelos directos con sub-lotes de lotes sin ruta.
+     * Solo vuelos directos (origen→destino del lote), respetando la capacidad ya usada.
+     * No modifica rutas existentes; añade rutas de 1 tramo para sub-lotes nuevos.
+     *
+     * @return número de sub-lotes ubicados
+     */
+    private int fillLeftoverCapacity(Solution solution, List<ShipmentBatch> cycleBatches,
+                                     ZonedDateTime windowStart, ZonedDateTime windowEnd) {
+        // Capacidad usada por vuelo (suma de cantidades de todas las rutas).
+        Map<String, Integer> usedByFlight = new HashMap<>();
+        for (AssignedRoute route : solution.getRoutes().values()) {
+            int qty = route.getBatch().quantity();
+            for (Flight f : route.getFlights()) {
+                usedByFlight.merge(f.flightId(), qty, Integer::sum);
+            }
+        }
+
+        int filledSubLots = 0;
+        for (ShipmentBatch batch : cycleBatches) {
+            if (solution.getRoute(batch.batchId()) != null) continue; // ya tiene ruta
+
+            List<Flight> directFlights = flightPlan.getFlightsFromAirport(batch.origin(), windowStart, windowEnd)
+                .stream()
+                .filter(f -> f.destination().equals(batch.destination()))
+                .filter(f -> !f.departureTime().isBefore(batch.ingressTime()))
+                .sorted(Comparator.comparing(Flight::departureTime))
+                .toList();
+            if (directFlights.isEmpty()) continue;
+
+            int remaining = batch.quantity();
+            int splitIdx = 0;
+            for (Flight f : directFlights) {
+                if (remaining < MIN_FILL_BAGS) break;
+                int leftover = f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0);
+                if (leftover < MIN_FILL_BAGS) continue;
+
+                int take = Math.min(leftover, remaining);
+                splitIdx++;
+                String subId = batch.batchId() + "-S" + splitIdx;
+                try {
+                    ShipmentBatch subLot = new ShipmentBatch(
+                        subId,
+                        batch.airportBatchId() + "-S" + splitIdx,
+                        batch.clientId(),
+                        batch.origin(),
+                        batch.destination(),
+                        take,
+                        batch.ingressTime()
+                    );
+                    AssignedRoute route = new AssignedRoute(subLot, List.of(f));
+                    solution.addRoute(route);
+                    usedByFlight.merge(f.flightId(), take, Integer::sum);
+                    remaining -= take;
+                    filledSubLots++;
+                } catch (Exception e) {
+                    // Ruta inválida para este vuelo (p.ej. timing) → probar el siguiente.
+                    splitIdx--;
+                }
+            }
+
+            // Multi-hop: para el remanente, intentar una ruta con escalas y verificar
+            // capacidad libre en TODOS los tramos (toma el mínimo disponible en la ruta).
+            if (remaining >= MIN_FILL_BAGS && fillRouteGenerator != null) {
+                try {
+                    String subId = batch.batchId() + "-S" + (splitIdx + 1);
+                    ShipmentBatch probe = new ShipmentBatch(
+                        subId, batch.airportBatchId() + "-S" + (splitIdx + 1), batch.clientId(),
+                        batch.origin(), batch.destination(), remaining, batch.ingressTime());
+                    AssignedRoute probeRoute = fillRouteGenerator.generateFeasibleRoute(probe);
+                    if (probeRoute != null && probeRoute.getFlights().size() > 1) {
+                        int take = remaining;
+                        for (Flight f : probeRoute.getFlights()) {
+                            take = Math.min(take, f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0));
+                        }
+                        if (take >= MIN_FILL_BAGS) {
+                            splitIdx++;
+                            ShipmentBatch subLot = take == remaining ? probe : new ShipmentBatch(
+                                subId, batch.airportBatchId() + "-S" + splitIdx, batch.clientId(),
+                                batch.origin(), batch.destination(), take, batch.ingressTime());
+                            AssignedRoute route = take == remaining
+                                ? probeRoute
+                                : new AssignedRoute(subLot, probeRoute.getFlights());
+                            solution.addRoute(route);
+                            for (Flight f : route.getFlights()) {
+                                usedByFlight.merge(f.flightId(), take, Integer::sum);
+                            }
+                            remaining -= take;
+                            filledSubLots++;
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // Sin ruta multi-hop factible → el remanente queda sin ubicar este ciclo.
+                }
+            }
+        }
+        return filledSubLots;
     }
 
     private void logQualityMetrics(

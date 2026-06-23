@@ -47,6 +47,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private int largeVolumeBatchThreshold = 2_500;
     private int routeSearchAttempts = 12;
     private int routeCachedVariants = 3;
+    private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro por ciclo (presupuesto Ta)
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -381,13 +382,19 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         
         // 1. Inicializar población con rutas factibles
         List<Solution> population = initializePopulation(batches, effectivePopulationSize);
-        
+
         // Variables para early stopping
         double bestFitnessSoFar = Double.MAX_VALUE;
         int stagnationCounter = 0;
-        
+        // Deadline duro: nunca exceder el presupuesto de tiempo (Ta). Devuelve el mejor hallado.
+        final long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
+
         // 2. Evolucionar durante N generaciones (con early stopping)
         for (int gen = 0; gen < effectiveGenerations; gen++) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf("⏱️ GA detenido por presupuesto de tiempo en generación %d%n", gen);
+                break;
+            }
             // Evaluar fitness de toda la población
             evaluatePopulation(population, effectivePopulationSize);
             
@@ -482,6 +489,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.largeVolumeBatchThreshold = config.getInt("largeVolumeBatchThreshold", 2_500);
         this.routeSearchAttempts = config.getInt("routeSearchAttempts", 12);
         this.routeCachedVariants = config.getInt("routeCachedVariants", 3);
+        this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
         this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
 }

@@ -31,6 +31,8 @@ public class SimulationController {
     private static final long STORAGE_UPDATE_INTERVAL_MS = 250L;
     /** Cola inicial máxima de lotes reales para el escenario de colapso (decisión PO). */
     private static final int COLLAPSE_INITIAL_QUEUE_CAP = 1000;
+    /** Relleno de capacidad por sub-lotes (split en vuelos directos). Aditivo y seguro. */
+    private static final boolean PARTIAL_FILL_ENABLED = true;
     /** Días de crecimiento generado sobre la semilla en el escenario de colapso. */
     private static final int COLLAPSE_GROWTH_DAYS = 5;
     
@@ -127,9 +129,13 @@ public class SimulationController {
         // Crear Scheduler con GATS (por defecto)
         SolutionEvaluator evaluator = new SolutionEvaluator(flightPlan, airportManager);
         
+        com.equipo2b.scheduler.logic.RouteGenerator fillRouteGen = PARTIAL_FILL_ENABLED
+            ? new com.equipo2b.scheduler.logic.RouteGenerator(flightPlan, airportManager)
+            : null;
         this.scheduler = SchedulerFactory.createGATSScheduler(
             ga, tabu, queue, evaluator, validator,
-            scenario.getTa(), scenario.getSa(), scenario.getK()
+            scenario.getTa(), scenario.getSa(), scenario.getK(),
+            flightPlan, PARTIAL_FILL_ENABLED, fillRouteGen
         );
         
         // Inicializar estado
@@ -521,12 +527,12 @@ public class SimulationController {
                     }
                 }
 
+                // Nota: el algoritmo ahora respeta un presupuesto de tiempo duro (deadline=Ta),
+                // así que el "colapso por complejidad algorítmica" deja de ser un gatillo válido
+                // (daría falsos positivos). El colapso se declara solo por SATURACIÓN logística.
                 if (scenario == ScenarioType.COLLAPSE_SIMULATION
-                        && algorithmMs > scenario.getTa() * 60_000L) {
-                    System.out.println("\n⚠️  COLAPSO POR COMPLEJIDAD ALGORÍTMICA - tiempo de ciclo excedió Ta="
-                        + scenario.getTa() + " min");
-                    completedNaturally = true;
-                    break;
+                        && algorithmMs > scenario.getTa() * 60_000L * 3) {
+                    System.out.println("\n⚠️  Ciclo de colapso muy lento (>3×Ta) — posible sobrecarga de la VM");
                 }
 
                 if (scenario == ScenarioType.COLLAPSE_SIMULATION && isWarehouseNetworkCollapsed()) {
@@ -751,19 +757,29 @@ public class SimulationController {
                 break;
                 
             case COLLAPSE_SIMULATION:
-                // Configuración intensiva
-                gaConfig.setInt("populationSize", 40);
-                gaConfig.setInt("generations", 25);
+                // Mismos parámetros/velocidad que PERIOD (decisión PO) y config liviana
+                // apta para VM 2 CPU / 2 GB; el deadline duro garantiza Ta.
+                gaConfig.setInt("populationSize", 20);
+                gaConfig.setInt("generations", 10);
                 gaConfig.setDouble("mutationRate", 0.1);
-                gaConfig.setBoolean("parallelEnabled", true);
-                gaConfig.setInt("parallelMinProcessors", 3);
-                gaConfig.setInt("parallelPopulationThreshold", 40);
-                tabuConfig.setInt("maxIterations", 150);
-                tabuConfig.setInt("tabuTenure", 15);
-                tabuConfig.setInt("neighborhoodSize", 25);
+                gaConfig.setInt("stagnationLimit", 4);
+                gaConfig.setBoolean("parallelEnabled", false);
+                gaConfig.setInt("routeSearchAttempts", 10);
+                gaConfig.setInt("routeCachedVariants", 3);
+                tabuConfig.setInt("maxIterations", 32);
+                tabuConfig.setInt("tabuTenure", 12);
+                tabuConfig.setInt("neighborhoodSize", 8);
+                tabuConfig.setInt("routeSearchAttempts", 8);
+                tabuConfig.setInt("routeCachedVariants", 2);
                 break;
         }
-        
+
+        // Presupuesto de tiempo duro por ciclo (deadline): el algoritmo nunca excede Ta.
+        // GA ~70% y Tabú ~25% de Ta (5% de margen para evaluación/acumulación).
+        long taMs = scenario.getTa() * 60_000L;
+        gaConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.70));
+        tabuConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.25));
+
         ga.configure(gaConfig);
         tabu.configure(tabuConfig);
     }
