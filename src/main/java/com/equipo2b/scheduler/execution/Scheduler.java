@@ -37,8 +37,10 @@ public class Scheduler {
     private final ShipmentQueue shipmentQueue;
     private final SolutionEvaluator evaluator;
     private final RouteValidator validator;
-    // Relleno de capacidad por sub-lotes (split): aprovecha el espacio libre de los vuelos
-    // directos para lotes que quedaron sin ruta. Aditivo: nunca modifica rutas existentes.
+    // División por capacidad (sub-lotes): cuando un vuelo va lleno pero solo caben algunas
+    // maletas de un envío, divide el envío — las que caben se quedan y el resto se reubican
+    // en otros vuelos con espacio (directo o con escalas). Cubre vuelos sobre-capacidad y
+    // lotes sin ruta; ver applyCapacityAwareSplitting.
     private final FlightPlan flightPlan;
     private final boolean partialFillEnabled;
     private final RouteGenerator fillRouteGenerator;  // para sub-lotes multi-hop (puede ser null)
@@ -197,12 +199,14 @@ public class Scheduler {
         int routesAfterAccumulation = accumulatedSolution.getRoutes().size();
         System.out.println("Rutas totales acumuladas: " + routesAfterAccumulation);
 
-        // 5b. Relleno de capacidad: parte los lotes sin ruta en sub-lotes que quepan en el
-        //     espacio libre de vuelos directos (maximiza el uso de los vuelos). Aditivo y seguro.
+        // 5b. División por capacidad (sub-lotes): cuando un vuelo va lleno pero solo caben
+        //     ALGUNAS maletas de un envío, el envío se divide — las que caben se quedan y el
+        //     resto se reubican en otros vuelos con espacio. Cubre TODOS los casos (no solo
+        //     lotes sin ruta). Determinista, aditivo y solo actúa si hay exceso real.
         if (partialFillEnabled && flightPlan != null) {
-            int filled = fillLeftoverCapacity(accumulatedSolution, batches, windowStart, windowEnd);
-            if (filled > 0) {
-                System.out.println("🧩 Relleno de capacidad: " + filled + " sub-lotes ubicados en vuelos directos");
+            int splits = applyCapacityAwareSplitting(accumulatedSolution, batches, windowStart, windowEnd);
+            if (splits > 0) {
+                System.out.println("🧩 División por capacidad: " + splits + " sub-lotes ubicados (envíos divididos en vuelos distintos)");
             }
         }
 
@@ -237,102 +241,227 @@ public class Scheduler {
     }
 
     /**
-     * Rellena el espacio libre de vuelos directos con sub-lotes de lotes sin ruta.
-     * Solo vuelos directos (origen→destino del lote), respetando la capacidad ya usada.
-     * No modifica rutas existentes; añade rutas de 1 tramo para sub-lotes nuevos.
+     * División de envíos por capacidad (sub-lotes), aplicada en CADA ciclo y a TODOS los casos.
      *
-     * @return número de sub-lotes ubicados
+     * <p>El algoritmo asigna cada lote de forma atómica y la capacidad de vuelo es una
+     * restricción BLANDA (solo penalizada), por lo que un envío puede quedar asignado a un vuelo
+     * que excede su capacidad. Este paso lo corrige de forma general:</p>
+     * <ol>
+     *   <li><b>Despegue de exceso:</b> en los vuelos sobre-capacidad, se "despega" el exceso de
+     *       maletas de los envíos que los usan (los más grandes primero) — las maletas que SÍ
+     *       caben se quedan en el vuelo y el resto se vuelve un remanente a reubicar.</li>
+     *   <li><b>Reubicación:</b> cada remanente (y los lotes que quedaron sin ruta) se divide en el
+     *       espacio libre de otros vuelos directos y, si hace falta, en una ruta con escalas. Así
+     *       las maletas de un mismo envío viajan en vuelos distintos cuando uno solo no alcanza.</li>
+     * </ol>
+     * <p>Es determinista, aditivo y solo actúa si hay exceso real, por lo que no degrada la
+     * calidad (de hecho elimina penalizaciones por capacidad) ni el rendimiento.</p>
+     *
+     * @return número de sub-lotes (divisiones) generados
      */
-    private int fillLeftoverCapacity(Solution solution, List<ShipmentBatch> cycleBatches,
-                                     ZonedDateTime windowStart, ZonedDateTime windowEnd) {
-        // Capacidad usada por vuelo (suma de cantidades de todas las rutas).
+    private int applyCapacityAwareSplitting(Solution solution, List<ShipmentBatch> cycleBatches,
+                                            ZonedDateTime windowStart, ZonedDateTime windowEnd) {
+        // 1. Capacidad usada por vuelo + índices (vuelo→capacidad, vuelo→lotes que lo usan).
         Map<String, Integer> usedByFlight = new HashMap<>();
+        Map<String, Flight> flightById = new HashMap<>();
+        Map<String, List<String>> batchesByFlight = new HashMap<>();
         for (AssignedRoute route : solution.getRoutes().values()) {
             int qty = route.getBatch().quantity();
+            String bId = route.getBatch().batchId();
             for (Flight f : route.getFlights()) {
                 usedByFlight.merge(f.flightId(), qty, Integer::sum);
+                flightById.putIfAbsent(f.flightId(), f);
+                batchesByFlight.computeIfAbsent(f.flightId(), k -> new ArrayList<>()).add(bId);
             }
         }
 
-        int filledSubLots = 0;
-        for (ShipmentBatch batch : cycleBatches) {
-            if (solution.getRoute(batch.batchId()) != null) continue; // ya tiene ruta
+        // Lotes que YA tenían ruta antes de este paso (para no recontarlos como "sin ruta").
+        Set<String> hadRoute = new HashSet<>(solution.getRoutes().keySet());
 
-            List<Flight> directFlights = flightPlan.getFlightsFromAirport(batch.origin(), windowStart, windowEnd)
-                .stream()
-                .filter(f -> f.destination().equals(batch.destination()))
-                .filter(f -> !f.departureTime().isBefore(batch.ingressTime()))
-                .sorted(Comparator.comparing(Flight::departureTime))
-                .toList();
-            if (directFlights.isEmpty()) continue;
+        // Contador de sufijos -S por lote base, sembrado con los sub-lotes ya existentes para
+        // garantizar IDs únicos (addRoute reemplaza por batchId → un choque perdería maletas).
+        Map<String, Integer> splitCounter = new HashMap<>();
+        for (String id : solution.getRoutes().keySet()) {
+            String base = baseBatchId(id);
+            int idx = lastSplitIndex(id);
+            splitCounter.merge(base, idx, Math::max);
+        }
 
-            int remaining = batch.quantity();
-            int splitIdx = 0;
-            for (Flight f : directFlights) {
-                if (remaining < MIN_FILL_BAGS) break;
-                int leftover = f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0);
-                if (leftover < MIN_FILL_BAGS) continue;
+        // 2. Despegar el exceso de los vuelos sobre-capacidad → remanentes a reubicar.
+        List<RemainderLot> remainders = new ArrayList<>();
+        List<String> overCapacity = usedByFlight.entrySet().stream()
+            .filter(e -> {
+                Flight f = flightById.get(e.getKey());
+                return f != null && e.getValue() > f.capacity();
+            })
+            .map(Map.Entry::getKey)
+            .sorted()
+            .toList();
 
-                int take = Math.min(leftover, remaining);
-                splitIdx++;
-                String subId = batch.batchId() + "-S" + splitIdx;
-                try {
-                    ShipmentBatch subLot = new ShipmentBatch(
-                        subId,
-                        batch.airportBatchId() + "-S" + splitIdx,
-                        batch.clientId(),
-                        batch.origin(),
-                        batch.destination(),
-                        take,
-                        batch.ingressTime()
-                    );
-                    AssignedRoute route = new AssignedRoute(subLot, List.of(f));
-                    solution.addRoute(route);
-                    usedByFlight.merge(f.flightId(), take, Integer::sum);
-                    remaining -= take;
-                    filledSubLots++;
-                } catch (Exception e) {
-                    // Ruta inválida para este vuelo (p.ej. timing) → probar el siguiente.
-                    splitIdx--;
-                }
+        for (String flightId : overCapacity) {
+            Flight f = flightById.get(flightId);
+            int overflow = usedByFlight.getOrDefault(flightId, 0) - f.capacity();
+            if (overflow <= 0) continue;
+
+            // Rutas que usan este vuelo, las más grandes primero (desempate determinista por id).
+            List<AssignedRoute> routesHere = new ArrayList<>();
+            for (String bId : batchesByFlight.getOrDefault(flightId, List.of())) {
+                AssignedRoute r = solution.getRoute(bId);
+                if (r != null) routesHere.add(r);
             }
+            routesHere.sort(Comparator
+                .comparingInt((AssignedRoute r) -> r.getBatch().quantity()).reversed()
+                .thenComparing(r -> r.getBatch().batchId()));
 
-            // Multi-hop: para el remanente, intentar una ruta con escalas y verificar
-            // capacidad libre en TODOS los tramos (toma el mínimo disponible en la ruta).
-            if (remaining >= MIN_FILL_BAGS && fillRouteGenerator != null) {
-                try {
-                    String subId = batch.batchId() + "-S" + (splitIdx + 1);
-                    ShipmentBatch probe = new ShipmentBatch(
-                        subId, batch.airportBatchId() + "-S" + (splitIdx + 1), batch.clientId(),
-                        batch.origin(), batch.destination(), remaining, batch.ingressTime());
-                    AssignedRoute probeRoute = fillRouteGenerator.generateFeasibleRoute(probe);
-                    if (probeRoute != null && probeRoute.getFlights().size() > 1) {
-                        int take = remaining;
-                        for (Flight f : probeRoute.getFlights()) {
-                            take = Math.min(take, f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0));
-                        }
-                        if (take >= MIN_FILL_BAGS) {
-                            splitIdx++;
-                            ShipmentBatch subLot = take == remaining ? probe : new ShipmentBatch(
-                                subId, batch.airportBatchId() + "-S" + splitIdx, batch.clientId(),
-                                batch.origin(), batch.destination(), take, batch.ingressTime());
-                            AssignedRoute route = take == remaining
-                                ? probeRoute
-                                : new AssignedRoute(subLot, probeRoute.getFlights());
-                            solution.addRoute(route);
-                            for (Flight f : route.getFlights()) {
-                                usedByFlight.merge(f.flightId(), take, Integer::sum);
-                            }
-                            remaining -= take;
-                            filledSubLots++;
-                        }
+            for (AssignedRoute r : routesHere) {
+                if (overflow <= 0) break;
+                ShipmentBatch b = r.getBatch();
+                int peel = Math.min(overflow, b.quantity());
+                if (peel <= 0) continue;
+                int newQty = b.quantity() - peel;
+                // Reducir la ruta en TODOS sus tramos (libera capacidad también en escalas).
+                for (Flight g : r.getFlights()) {
+                    usedByFlight.merge(g.flightId(), -peel, Integer::sum);
+                }
+                if (newQty >= MIN_FILL_BAGS) {
+                    try {
+                        ShipmentBatch reduced = new ShipmentBatch(
+                            b.batchId(), b.airportBatchId(), b.clientId(),
+                            b.origin(), b.destination(), newQty, b.ingressTime());
+                        solution.addRoute(new AssignedRoute(reduced, r.getFlights())); // reemplaza por batchId
+                    } catch (Exception e) {
+                        solution.removeRoute(b.batchId());
                     }
-                } catch (Exception ignored) {
-                    // Sin ruta multi-hop factible → el remanente queda sin ubicar este ciclo.
+                } else {
+                    solution.removeRoute(b.batchId());
                 }
+                remainders.add(new RemainderLot(b, baseBatchId(b.batchId()), peel));
+                overflow -= peel;
             }
         }
-        return filledSubLots;
+
+        // 3. Añadir los lotes que NUNCA tuvieron ruta como remanentes (división de extremo a extremo).
+        for (ShipmentBatch batch : cycleBatches) {
+            if (hadRoute.contains(batch.batchId())) continue;
+            if (solution.getRoute(batch.batchId()) != null) continue;
+            remainders.add(new RemainderLot(batch, baseBatchId(batch.batchId()), batch.quantity()));
+        }
+
+        // 4. Reubicar cada remanente en el espacio libre (directo y, si hace falta, con escalas).
+        int splitsGenerated = 0;
+        for (RemainderLot rem : remainders) {
+            splitsGenerated += placeBagsInLeftover(solution, usedByFlight, splitCounter, rem, windowStart, windowEnd);
+        }
+        return splitsGenerated;
+    }
+
+    /**
+     * Coloca {@code rem.quantity()} maletas en el espacio libre de vuelos directos y, para el
+     * remanente, en una ruta con escalas. Divide en tantos sub-lotes como vuelos haga falta.
+     *
+     * @return número de sub-lotes creados para este remanente
+     */
+    private int placeBagsInLeftover(Solution solution, Map<String, Integer> usedByFlight,
+                                    Map<String, Integer> splitCounter, RemainderLot rem,
+                                    ZonedDateTime windowStart, ZonedDateTime windowEnd) {
+        int remaining = rem.quantity();
+        if (remaining < MIN_FILL_BAGS) return 0;
+        ShipmentBatch t = rem.template();
+        int placed = 0;
+
+        // Vuelos directos origen→destino con espacio libre.
+        List<Flight> directFlights = flightPlan.getFlightsFromAirport(t.origin(), windowStart, windowEnd)
+            .stream()
+            .filter(f -> f.destination().equals(t.destination()))
+            .filter(f -> !f.departureTime().isBefore(t.ingressTime()))
+            .sorted(Comparator.comparing(Flight::departureTime))
+            .toList();
+
+        for (Flight f : directFlights) {
+            if (remaining < MIN_FILL_BAGS) break;
+            int leftover = f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0);
+            if (leftover < MIN_FILL_BAGS) continue;
+            int take = Math.min(leftover, remaining);
+            int idx = splitCounter.merge(rem.baseId(), 1, Integer::sum);
+            String subId = rem.baseId() + "-S" + idx;
+            try {
+                ShipmentBatch subLot = new ShipmentBatch(
+                    subId, t.airportBatchId() + "-S" + idx, t.clientId(),
+                    t.origin(), t.destination(), take, t.ingressTime());
+                solution.addRoute(new AssignedRoute(subLot, List.of(f)));
+                usedByFlight.merge(f.flightId(), take, Integer::sum);
+                remaining -= take;
+                placed++;
+            } catch (Exception e) {
+                splitCounter.merge(rem.baseId(), -1, Integer::sum); // revertir índice no usado
+            }
+        }
+
+        // Multi-hop para el remanente: ruta con escalas verificando capacidad en TODOS los tramos.
+        if (remaining >= MIN_FILL_BAGS && fillRouteGenerator != null) {
+            try {
+                int idx = splitCounter.merge(rem.baseId(), 1, Integer::sum);
+                String subId = rem.baseId() + "-S" + idx;
+                ShipmentBatch probe = new ShipmentBatch(
+                    subId, t.airportBatchId() + "-S" + idx, t.clientId(),
+                    t.origin(), t.destination(), remaining, t.ingressTime());
+                AssignedRoute probeRoute = fillRouteGenerator.generateFeasibleRoute(probe);
+                if (probeRoute != null && probeRoute.getFlights().size() > 1) {
+                    int take = remaining;
+                    for (Flight f : probeRoute.getFlights()) {
+                        take = Math.min(take, f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0));
+                    }
+                    if (take >= MIN_FILL_BAGS) {
+                        AssignedRoute route = take == remaining ? probeRoute : new AssignedRoute(
+                            new ShipmentBatch(subId, t.airportBatchId() + "-S" + idx, t.clientId(),
+                                t.origin(), t.destination(), take, t.ingressTime()),
+                            probeRoute.getFlights());
+                        solution.addRoute(route);
+                        for (Flight f : route.getFlights()) {
+                            usedByFlight.merge(f.flightId(), take, Integer::sum);
+                        }
+                        remaining -= take;
+                        placed++;
+                    } else {
+                        splitCounter.merge(rem.baseId(), -1, Integer::sum);
+                    }
+                } else {
+                    splitCounter.merge(rem.baseId(), -1, Integer::sum);
+                }
+            } catch (Exception ignored) {
+                // Sin ruta multi-hop factible → el remanente queda sin ubicar este ciclo.
+            }
+        }
+        return placed;
+    }
+
+    /** Remanente de maletas a reubicar; {@code template} aporta origen/destino/cliente/ingreso. */
+    private record RemainderLot(ShipmentBatch template, String baseId, int quantity) {}
+
+    /** Quita los sufijos "-S&lt;n&gt;" finales para obtener el id base del lote. */
+    private static String baseBatchId(String id) {
+        String s = id;
+        while (true) {
+            int idx = s.lastIndexOf("-S");
+            if (idx < 0 || idx + 2 >= s.length()) break;
+            String suffix = s.substring(idx + 2);
+            if (!suffix.chars().allMatch(Character::isDigit)) break;
+            s = s.substring(0, idx);
+        }
+        return s.isEmpty() ? id : s;
+    }
+
+    /** Índice numérico del último sufijo "-S&lt;n&gt;" de un id, o 0 si no tiene. */
+    private static int lastSplitIndex(String id) {
+        int idx = id.lastIndexOf("-S");
+        if (idx < 0 || idx + 2 >= id.length()) return 0;
+        String suffix = id.substring(idx + 2);
+        if (suffix.isEmpty() || !suffix.chars().allMatch(Character::isDigit)) return 0;
+        try {
+            return Integer.parseInt(suffix);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     private void logQualityMetrics(

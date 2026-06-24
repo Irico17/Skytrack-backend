@@ -76,6 +76,9 @@ public class SimulationController {
     // Fecha de inicio para calcular días transcurridos
     private ZonedDateTime startDate;
     private volatile double daysElapsed = 0.0;
+
+    // Condiciones del colapso (cuándo, qué lo provocó y por qué) capturadas al detectarlo.
+    private volatile CollapseInfo collapseInfo;
     
     /**
      * Constructor del SimulationController.
@@ -149,6 +152,7 @@ public class SimulationController {
         this.currentCycle = 0;
         this.batchesProcessed = 0;
         this.batchesFailed = 0;
+        this.collapseInfo = null;
         this.state = SimulationState.RUNNING;
         this.running.set(true);
         
@@ -535,15 +539,33 @@ public class SimulationController {
                     System.out.println("\n⚠️  Ciclo de colapso muy lento (>3×Ta) — posible sobrecarga de la VM");
                 }
 
-                if (scenario == ScenarioType.COLLAPSE_SIMULATION && isWarehouseNetworkCollapsed()) {
-                    System.out.println("\n⚠️  COLAPSO POR SATURACIÓN DE ALMACENES - más del 50% de aeropuertos críticos");
-                    completedNaturally = true;
-                    break;
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                    int[] sat = evaluateWarehouseSaturation(); // [críticos, total]
+                    if (sat[1] > 0 && sat[0] * 2 > sat[1]) {
+                        System.out.println("\n⚠️  COLAPSO POR SATURACIÓN DE ALMACENES - más del 50% de aeropuertos críticos");
+                        this.collapseInfo = new CollapseInfo(
+                            "WAREHOUSE_SATURATION",
+                            "Saturación de la red de almacenes",
+                            String.format("Se consideró colapso porque %d de %d aeropuertos (%.0f%%) superaron el 90%% "
+                                + "de su capacidad de almacén simultáneamente, dejando la red sin espacio para recibir más maletas.",
+                                sat[0], sat[1], sat[1] > 0 ? sat[0] * 100.0 / sat[1] : 0.0),
+                            ZonedDateTime.now(),
+                            simulatedTime,
+                            collapseStatus.occupancyPercentage(),
+                            collapseStatus.unserviceablePercentage(),
+                            sat[0],
+                            sat[1],
+                            currentCycle
+                        );
+                        completedNaturally = true;
+                        break;
+                    }
                 }
 
                 if (collapseStatus.isCollapsed()) {
                     if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
                         System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
+                        this.collapseInfo = buildCollapseInfoFromStatus(collapseStatus);
                         completedNaturally = true;
                         break;
                     } else {
@@ -654,22 +676,71 @@ public class SimulationController {
         batchesFailed = Math.toIntExact(Math.min(Integer.MAX_VALUE, delayed + releasedWithoutRoute));
     }
 
-    private boolean isWarehouseNetworkCollapsed() {
+    /**
+     * Evalúa la saturación de la red de almacenes.
+     * @return arreglo [aeropuertos críticos (≥90% capacidad), aeropuertos evaluados].
+     */
+    private int[] evaluateWarehouseSaturation() {
         if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
-            return false;
+            return new int[]{0, 0};
         }
 
         StorageInventoryService inventoryService = new StorageInventoryService(airportManager);
         Map<Airport, Integer> currentBags = inventoryService.calculateCurrentBags(currentSolution, simulatedTime, currentBatches);
         if (currentBags.isEmpty()) {
-            return false;
+            return new int[]{0, 0};
         }
 
-        long criticalAirports = currentBags.entrySet().stream()
+        int criticalAirports = (int) currentBags.entrySet().stream()
             .filter(entry -> entry.getKey().storageCapacity() > 0
                 && entry.getValue() >= entry.getKey().storageCapacity() * 0.90)
             .count();
-        return criticalAirports * 2 > currentBags.size();
+        return new int[]{criticalAirports, currentBags.size()};
+    }
+
+    /**
+     * Construye las condiciones del colapso a partir del estado del detector, traduciendo
+     * la causa concreta (no atendibles / saturación de capacidad / fitness) a un motivo legible.
+     */
+    private CollapseInfo buildCollapseInfoFromStatus(CollapseStatus status) {
+        int[] sat = evaluateWarehouseSaturation();
+        String causeCode;
+        String causeLabel;
+        String reason;
+        if (status.message() != null && status.message().toLowerCase().contains("fitness")) {
+            causeCode = "ALGORITHM_FITNESS";
+            causeLabel = "Penalizaciones superan recompensas";
+            reason = "Se consideró colapso porque la solución dejó de ser viable: las penalizaciones "
+                + "(retrasos y sobrecapacidad) superaron las recompensas por entregas a tiempo. " + status.message();
+        } else if (status.unserviceablePercentage() > 20.0) {
+            causeCode = "UNSERVICEABLE_BATCHES";
+            causeLabel = "Demasiados lotes no atendibles";
+            reason = String.format("Se consideró colapso porque el %.0f%% de los lotes no pudo planificarse a tiempo "
+                + "(umbral de no atendibles: 20%%), con una ocupación promedio del sistema del %.0f%%.",
+                status.unserviceablePercentage(), status.occupancyPercentage());
+        } else if (status.occupancyPercentage() >= 80.0) {
+            causeCode = "CAPACITY_SATURATION";
+            causeLabel = "Saturación de capacidad de la red";
+            reason = String.format("Se consideró colapso porque la ocupación promedio del sistema alcanzó el %.0f%% "
+                + "(umbral de saturación: 80%%), superando la capacidad operable de vuelos y almacenes.",
+                status.occupancyPercentage());
+        } else {
+            causeCode = "ALGORITHM_FITNESS";
+            causeLabel = "Penalizaciones superan recompensas";
+            reason = String.format("Se consideró colapso porque la solución dejó de ser viable: las penalizaciones "
+                + "(retrasos/sobrecapacidad) superaron las recompensas. %s", status.message());
+        }
+        return new CollapseInfo(
+            causeCode, causeLabel, reason,
+            ZonedDateTime.now(), simulatedTime,
+            status.occupancyPercentage(), status.unserviceablePercentage(),
+            sat[0], sat[1], currentCycle
+        );
+    }
+
+    /** Condiciones del colapso si la simulación colapsó; null si no hubo colapso. */
+    public CollapseInfo getCollapseInfo() {
+        return collapseInfo;
     }
 
     private void releaseHeavyState(ScenarioType scenario) {

@@ -29,7 +29,11 @@ public class RouteGenerator {
     private int maxAttempts = 12;
     private int maxCachedVariants = 3;
     private static final int MAX_ROUTE_CACHE_ENTRIES = 20_000;
-    private static final int MAX_HOPS = 3;  // Máximo de escalas
+    // Tope práctico de tramos por ruta. No se limita "artificialmente" a pocos saltos:
+    // el SLA (12h intra / 24h inter) ya poda los caminos largos y la BFS está acotada por
+    // su set `visited` (aeropuerto+hora), así que subir a 5 no degrada el rendimiento.
+    // 5 tramos es el máximo que el SLA permite en la práctica.
+    private static final int MAX_HOPS = 5;  // Máximo de tramos por ruta (acotado por SLA)
 
     /**
      * Constructor que inicializa el generador de rutas con el plan de vuelos y gestor de aeropuertos.

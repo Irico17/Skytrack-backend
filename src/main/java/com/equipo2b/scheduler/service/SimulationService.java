@@ -638,7 +638,8 @@ public class SimulationService implements SimulationController.SimulationListene
                     batches != null ? batches.size() : 0,
                     status.currentCycle(),
                     currentAirportManager,
-                    batches
+                    batches,
+                    activeController.getCollapseInfo()
                 );
                 System.out.println("✓ Resultados de simulación exportados a archivo JSON");
             } catch (Exception e) {

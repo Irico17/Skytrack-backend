@@ -1,6 +1,7 @@
 package com.equipo2b.scheduler.service;
 
 import com.equipo2b.scheduler.api.dto.SimulationResultsDTO;
+import com.equipo2b.scheduler.execution.CollapseInfo;
 import com.equipo2b.scheduler.execution.ScenarioType;
 import com.equipo2b.scheduler.model.Airport;
 import com.equipo2b.scheduler.model.AirportManager;
@@ -64,7 +65,7 @@ public class SimulationResultExporter {
             int totalBatches,
             int totalCycles
     ) throws IOException {
-        return exportResults(simId, scenario, startDate, solution, totalBatches, totalCycles, null, null);
+        return exportResults(simId, scenario, startDate, solution, totalBatches, totalCycles, null, null, null);
     }
 
     /**
@@ -80,6 +81,26 @@ public class SimulationResultExporter {
             int totalCycles,
             AirportManager airportManager,
             List<ShipmentBatch> batches
+    ) throws IOException {
+        return exportResults(simId, scenario, startDate, solution, totalBatches, totalCycles,
+            airportManager, batches, null);
+    }
+
+    /**
+     * Variante completa: incluye las condiciones del colapso ({@code collapseInfo}) para que
+     * el reporte pueda publicar cuándo ocurrió (real/simulado), qué lo provocó y por qué.
+     * {@code collapseInfo} es null si la simulación no colapsó (p.ej. 5 días que termina ok).
+     */
+    public Path exportResults(
+            String simId,
+            ScenarioType scenario,
+            ZonedDateTime startDate,
+            Solution solution,
+            int totalBatches,
+            int totalCycles,
+            AirportManager airportManager,
+            List<ShipmentBatch> batches,
+            CollapseInfo collapseInfo
     ) throws IOException {
         // Crear directorio si no existe
         Path dir = Paths.get(resultsDir);
@@ -103,6 +124,19 @@ public class SimulationResultExporter {
             .orElse(scenario == ScenarioType.PERIOD_SIMULATION ? 5 : 1);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+        SimulationResultsDTO.CollapseInfoDTO collapseInfoDto = collapseInfo == null ? null
+            : new SimulationResultsDTO.CollapseInfoDTO(
+                collapseInfo.causeCode(),
+                collapseInfo.causeLabel(),
+                collapseInfo.reason(),
+                collapseInfo.detectedAtReal() != null ? collapseInfo.detectedAtReal().format(fmt) : null,
+                collapseInfo.detectedAtSim() != null ? collapseInfo.detectedAtSim().format(fmt) : null,
+                collapseInfo.occupancyPct(),
+                collapseInfo.unserviceablePct(),
+                collapseInfo.criticalAirports(),
+                collapseInfo.totalAirports(),
+                collapseInfo.cycle()
+            );
         SimulationResultsDTO dto = new SimulationResultsDTO(
             simId,
             scenario.name(),
@@ -116,7 +150,8 @@ public class SimulationResultExporter {
             slaCompliance,
             totalCycles,
             "GATS",
-            snapshots
+            snapshots,
+            collapseInfoDto
         );
 
         Path file = dir.resolve("sim_" + simId + ".json");
