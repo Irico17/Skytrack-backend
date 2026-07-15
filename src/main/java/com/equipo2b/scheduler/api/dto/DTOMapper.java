@@ -78,6 +78,19 @@ public final class DTOMapper {
         );
     }
 
+    public static ShipmentDTO toShipmentDTO(ShipmentBatch batch, String status) {
+        return new ShipmentDTO(
+            batch.batchId(),
+            batch.clientId(),
+            batch.origin().id(),
+            batch.destination().id(),
+            batch.quantity(),
+            batch.ingressTime().format(ISO),
+            batch.ingressTime().plus(batch.calculateSLA()).format(ISO),
+            status
+        );
+    }
+
     // ===== STATUS =====
 
     public static SimulationStatusDTO toStatusDTO(

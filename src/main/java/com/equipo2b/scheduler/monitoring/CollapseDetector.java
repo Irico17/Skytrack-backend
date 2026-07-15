@@ -28,6 +28,9 @@ public class CollapseDetector {
     /** Monitor de capacidad para calcular ocupación real. Puede ser null. */
     private CapacityMonitor capacityMonitor;
 
+    /** Último nivel alertado: evita spamear el log (el bucle de storage evalúa 4 veces/seg). */
+    private volatile CollapseLevel lastAlertedLevel = CollapseLevel.NORMAL;
+
     /** Constructor con umbrales por defecto y sin monitor de capacidad. */
     public CollapseDetector() {
         this(70.0, 20.0, null);
@@ -84,12 +87,14 @@ public class CollapseDetector {
      * **Validates: Requirements 31.1, 31.2, 31.3, 31.4, 31.5**
      */
     public CollapseStatus evaluateCollapse(Solution solution, int totalBatches, int failedBatches) {
-        // Colapso directo si fitness positivo (penalizaciones superan premios)
-        if (solution.isEvaluated() && solution.getFitness() > 0) {
-            String msg = "Sistema colapsado - fitness positivo: " + String.format("%.0f", solution.getFitness());
-            System.out.println("\n⚠️  COLAPSO POR FITNESS: " + msg);
-            return new CollapseStatus(CollapseLevel.COLLAPSED, 100.0, 100.0, msg);
-        }
+        // Nota: antes había un atajo que declaraba colapso instantáneo si un solo ciclo
+        // tenía fitness positivo (penalizaciones > premios). Se retiró porque un ciclo
+        // aislado con fitness positivo puede deberse a ruido del GA/Tabu (arranque en frío,
+        // ventana de consumo chica, sin caché de rutas) y no a saturación real del sistema
+        // — daba falsos positivos que tumbaban la simulación de colapso en el primer ciclo
+        // mientras la de 5 días, con la misma solución, seguía normal (ahí solo se loguea,
+        // no detiene). El colapso ahora se declara solo por métricas de negocio reales:
+        // ocupación de vuelos/almacenes y porcentaje de lotes no atendibles.
 
         // 1. Calcular saturación promedio del sistema
         double occupancy = calculateSystemOccupancy(solution);
@@ -105,10 +110,13 @@ public class CollapseDetector {
         // 4. Generar mensaje descriptivo
         String message = generateMessage(level, occupancy, unserviceablePercentage);
 
-        // 5. Emitir alerta si es necesario
-        if (level == CollapseLevel.CRITICAL || level == CollapseLevel.COLLAPSED) {
+        // 5. Emitir alerta SOLO en la transición de nivel (no en cada evaluación: el bucle de
+        //    storage evalúa 4 veces/seg y llenaba el log — I/O inútil en la VM).
+        if ((level == CollapseLevel.CRITICAL || level == CollapseLevel.COLLAPSED)
+                && level != lastAlertedLevel) {
             System.out.println("\n⚠️  ALERTA DE COLAPSO: " + message);
         }
+        lastAlertedLevel = level;
 
         return new CollapseStatus(level, occupancy, unserviceablePercentage, message);
     }

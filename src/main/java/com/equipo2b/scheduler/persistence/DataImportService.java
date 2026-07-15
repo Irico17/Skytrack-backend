@@ -22,6 +22,8 @@ import java.util.List;
 @Service
 public class DataImportService {
 
+    public record ImportCounts(int airports, int flights) {}
+
     @Autowired
     private DataLoadingService dataService;
 
@@ -50,6 +52,15 @@ public class DataImportService {
         } catch (Exception e) {
             throw new RuntimeException("Error importando aeropuertos: " + e.getMessage(), e);
         }
+    }
+
+    @Transactional
+    public ImportCounts replaceReferenceData() {
+        flightRepository.deleteAllInBatch();
+        airportRepository.deleteAllInBatch();
+        int airports = importAirports();
+        int flights = importFlights();
+        return new ImportCounts(airports, flights);
     }
 
     /**

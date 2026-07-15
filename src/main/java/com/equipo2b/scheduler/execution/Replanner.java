@@ -105,13 +105,7 @@ public class Replanner {
         
         for (AssignedRoute route : solution.getRoutes().values()) {
             for (Flight flight : route.getFlights()) {
-                // Comparar por ID base (sin sufijo -D)
-                String baseFlightId = flight.flightId().split("-D")[0];
-                String cancelledBaseId = cancelledFlight.flightId().split("-D")[0];
-                
-                if (baseFlightId.equals(cancelledBaseId) &&
-                    flight.origin().equals(cancelledFlight.origin()) &&
-                    flight.destination().equals(cancelledFlight.destination())) {
+                if (isSameFlightInstance(flight, cancelledFlight)) {
                     affected.add(route.getBatch());
                     break;
                 }
@@ -119,6 +113,19 @@ public class Replanner {
         }
         
         return affected;
+    }
+
+    private boolean isSameFlightInstance(Flight flight, Flight cancelledFlight) {
+        if (flight.flightId().equals(cancelledFlight.flightId())) {
+            return true;
+        }
+
+        String baseFlightId = flight.flightId().split("-D")[0];
+        String cancelledBaseId = cancelledFlight.flightId().split("-D")[0];
+        return baseFlightId.equals(cancelledBaseId)
+            && flight.origin().equals(cancelledFlight.origin())
+            && flight.destination().equals(cancelledFlight.destination())
+            && flight.departureTime().equals(cancelledFlight.departureTime());
     }
     
     /**

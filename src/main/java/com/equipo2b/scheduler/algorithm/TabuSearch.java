@@ -31,6 +31,22 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int maxIterations = 200;
     private int tabuTenure = 15;
     private int neighborhoodSize = 20;
+    private int routeSearchAttempts = 8;
+    private int routeCachedVariants = 2;
+    private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
+
+    private int effectiveMaxIterations(int routeCount) {
+        if (routeCount >= 2_000) return 0;
+        if (routeCount >= 1_000) return Math.min(maxIterations, 4);
+        if (routeCount >= 500) return Math.min(maxIterations, 8);
+        return maxIterations;
+    }
+
+    private int effectiveNeighborhoodSize(int routeCount) {
+        if (routeCount >= 1_000) return Math.min(neighborhoodSize, 3);
+        if (routeCount >= 500) return Math.min(neighborhoodSize, 4);
+        return neighborhoodSize;
+    }
     
     /**
      * Constructor que inicializa Búsqueda Tabú con dependencias.
@@ -64,18 +80,28 @@ public class TabuSearch implements OptimizationAlgorithm {
         currentSolution.setFitness(evaluator.evaluate(currentSolution));
         
         Solution bestSolution = new Solution(currentSolution);
+        int effectiveMaxIterations = effectiveMaxIterations(currentSolution.getRoutes().size());
+        int effectiveNeighborhoodSize = effectiveNeighborhoodSize(currentSolution.getRoutes().size());
+
+        if (effectiveMaxIterations == 0) {
+            System.out.printf(
+                "Carga alta (%d rutas): se omite Tabú puro para respetar tiempo de ciclo%n",
+                currentSolution.getRoutes().size()
+            );
+            return bestSolution;
+        }
         
         // Lista tabú: contiene batch IDs de rutas modificadas recientemente
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
         
         // Iterar durante maxIterations iteraciones
-        for (int iter = 0; iter < maxIterations; iter++) {
+        for (int iter = 0; iter < effectiveMaxIterations; iter++) {
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
             
             // Explorar vecindario
-            for (int n = 0; n < neighborhoodSize; n++) {
+            for (int n = 0; n < effectiveNeighborhoodSize; n++) {
                 Move move = generateMove(currentSolution, batches);
                 Solution neighbor = move.solution();
                 neighbor.setFitness(evaluator.evaluate(neighbor));
@@ -128,16 +154,39 @@ public class TabuSearch implements OptimizationAlgorithm {
         }
         
         Solution bestSolution = new Solution(currentSolution);
+        int routeCount = currentSolution.getRoutes().size();
+        int effectiveMaxIterations = effectiveMaxIterations(routeCount);
+        int effectiveNeighborhoodSize = effectiveNeighborhoodSize(routeCount);
+
+        if (effectiveMaxIterations == 0) {
+            System.out.printf(
+                "Carga alta (%d rutas): se omite refinamiento Tabú para respetar tiempo de ciclo%n",
+                routeCount
+            );
+            return bestSolution;
+        }
+
+        if (effectiveMaxIterations != maxIterations || effectiveNeighborhoodSize != neighborhoodSize) {
+            System.out.printf(
+                "Carga alta (%d rutas): Tabú adaptativo iteraciones=%d, vecindario=%d%n",
+                routeCount, effectiveMaxIterations, effectiveNeighborhoodSize
+            );
+        }
         
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
-        
-        for (int iter = 0; iter < maxIterations; iter++) {
+        final long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
+
+        for (int iter = 0; iter < effectiveMaxIterations; iter++) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf("⏱️ Tabú detenido por presupuesto de tiempo en iteración %d%n", iter);
+                break;
+            }
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
             
             // Explorar vecindario generando variaciones de rutas individuales
-            for (int n = 0; n < neighborhoodSize; n++) {
+            for (int n = 0; n < effectiveNeighborhoodSize; n++) {
                 Move move = generateMoveFromSolution(currentSolution);
                 Solution neighbor = move.solution();
                 neighbor.setFitness(evaluator.evaluate(neighbor));
@@ -407,6 +456,14 @@ public class TabuSearch implements OptimizationAlgorithm {
     
     /** MULTI_REGENERATE: Regenera 2-3 lotes simultáneamente (salto grande en vecindario). */
     private Move generateMultiRegenerateMove(Solution current, List<ShipmentBatch> batches) {
+        if (batches.size() < 2) {
+            // Con 0 o 1 lotes disponibles no hay "salto múltiple" posible: antes,
+            // ThreadLocalRandom.nextInt(2, Math.min(4, size+1)) quedaba con bound<=origin
+            // (size=0 → nextInt(2,1); size=1 → nextInt(2,2)) y lanzaba
+            // IllegalArgumentException, tumbando TODA la simulación (visto en ciclos con
+            // ventanas de consumo muy pequeñas, p.ej. 1 solo lote). Cae a un solo lote.
+            return batches.isEmpty() ? new Move(new Solution(current), "") : generateRegenerateMove(current, batches);
+        }
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
         int count = random.nextInt(2, Math.min(4, batches.size() + 1));
@@ -425,12 +482,16 @@ public class TabuSearch implements OptimizationAlgorithm {
     
     /** MULTI_REGENERATE desde solución existente. */
     private Move generateMultiRegenerateMoveFromSolution(Solution current) {
-        ThreadLocalRandom random = ThreadLocalRandom.current();
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
-        if (batchIds.isEmpty()) {
-            return new Move(new Solution(current), "");
+        if (batchIds.size() < 2) {
+            // Mismo caso que generateMultiRegenerateMove: con 0 o 1 rutas en la solución
+            // (típico en ciclos con ventana de consumo muy pequeña, p.ej. el remanente final
+            // de datos) el rango nextInt(2, Math.min(4, size+1)) era inválido y crasheaba
+            // toda la simulación con IllegalArgumentException. Cae a un solo lote regenerado.
+            return batchIds.isEmpty() ? new Move(new Solution(current), "") : generateRegenerateMoveFromSolution(current);
         }
-        
+
+        ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
         int count = random.nextInt(2, Math.min(4, batchIds.size() + 1));
         String firstBatchId = null;
@@ -482,6 +543,10 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.maxIterations = config.getInt("maxIterations", 200);
         this.tabuTenure = config.getInt("tabuTenure", 15);
         this.neighborhoodSize = config.getInt("neighborhoodSize", 20);
+        this.routeSearchAttempts = config.getInt("routeSearchAttempts", 8);
+        this.routeCachedVariants = config.getInt("routeCachedVariants", 2);
+        this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
+        this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
     
     /**

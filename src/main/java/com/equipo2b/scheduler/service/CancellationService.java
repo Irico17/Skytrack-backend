@@ -3,17 +3,18 @@ package com.equipo2b.scheduler.service;
 import com.equipo2b.scheduler.api.dto.ReplanResultDTO;
 import com.equipo2b.scheduler.api.dto.DTOMapper;
 import com.equipo2b.scheduler.execution.ReplanResult;
-import com.equipo2b.scheduler.execution.Replanner;
 import com.equipo2b.scheduler.execution.SimulationController;
 import com.equipo2b.scheduler.model.*;
-import com.equipo2b.scheduler.validation.RouteValidator;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.util.List;
 
 /**
  * Servicio de cancelación de vuelos durante una simulación activa.
@@ -46,36 +47,50 @@ public class CancellationService {
             throw new IllegalArgumentException("No hay simulación activa con id: " + simId);
         }
 
-        // 1. Calcular offset de días respecto a la fecha base del plan de vuelos
-        LocalDate cancelDay = LocalDate.parse(day, DateTimeFormatter.ISO_LOCAL_DATE);
-        long dayOffset = ChronoUnit.DAYS.between(FLIGHT_BASE_DATE, cancelDay);
+        SimulationController controller = simulationService.getActiveController();
+        FlightPlan flightPlan = simulationService.getCurrentFlightPlan();
 
-        // 2. Construir el flight ID ajustado con sufijo de día
+        // 1. Localizar el vuelo base en el plan para conocer su hora de salida y zona horaria de origen.
+        Flight baseFlight = flightPlan.getAllFlights().stream()
+            .filter(f -> f.flightId().equals(flightIdBase))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("Vuelo no encontrado en el plan: " + flightIdBase));
+
+        ZoneId originZone = baseFlight.origin().zoneId() != null
+            ? baseFlight.origin().zoneId()
+            : ZoneOffset.UTC;
+        LocalTime departureTimeOfDay = baseFlight.departureTime().toLocalTime();
+
+        // 2. Determinar el día objetivo según la regla de negocio (decisión PO):
+        //    - cancelTime <= salida - 1h  → se cancela la instancia del MISMO día.
+        //    - en caso contrario          → se cancela la instancia del DÍA SIGUIENTE
+        //      (vuelo "inmediato siguiente"). Todo evaluado en hora local del aeropuerto de origen.
+        ZonedDateTime cancelInstant = controller.getSimulatedTime();
+        LocalDate targetDate;
+        if (cancelInstant != null) {
+            ZonedDateTime cancelLocal = cancelInstant.withZoneSameInstant(originZone);
+            LocalDate cancelDate = cancelLocal.toLocalDate();
+            ZonedDateTime departureToday = ZonedDateTime.of(cancelDate, departureTimeOfDay, originZone);
+            targetDate = !cancelLocal.isAfter(departureToday.minusHours(1))
+                ? cancelDate
+                : cancelDate.plusDays(1);
+            System.out.printf("🚫 Cancelación: ahora(local %s)=%s, salida=%s → día objetivo=%s%n",
+                originZone, cancelLocal.toLocalTime(), departureTimeOfDay, targetDate);
+        } else {
+            // Sin reloj activo: usar el día provisto por el cliente como respaldo.
+            targetDate = LocalDate.parse(day, DateTimeFormatter.ISO_LOCAL_DATE);
+        }
+
+        // 3. Calcular offset de días respecto a la fecha base del plan y construir el ID ajustado.
+        long dayOffset = ChronoUnit.DAYS.between(FLIGHT_BASE_DATE, targetDate);
         String adjustedFlightId = flightIdBase + "-D" + dayOffset;
 
-        // 3. Marcar como cancelado en FlightPlan (RouteGenerator ya no lo verá)
-        FlightPlan flightPlan = simulationService.getCurrentFlightPlan();
+        // 4. Marcar como cancelado en FlightPlan (RouteGenerator ya no lo verá) y replanificar.
         flightPlan.cancelFlight(adjustedFlightId);
-
         System.out.printf("🚫 Vuelo cancelado: %s (día %s = offset D%d)%n",
-            adjustedFlightId, day, dayOffset);
+            adjustedFlightId, targetDate, dayOffset);
 
-        // 4. Delegar replanificación al controller activo
-        // registerCancellation busca el vuelo en el plan, identifica lotes afectados
-        // y ejecuta Replanner con TabuSearch
-        SimulationController controller = simulationService.getActiveController();
-        controller.registerCancellation(adjustedFlightId);
-
-        // 5. Construir ReplanResultDTO
-        // registerCancellation no retorna ReplanResult directamente, pero actualiza la solución.
-        // Retornamos un resultado básico con la solución actualizada.
-        Solution updatedSolution = controller.getCurrentSolution();
-        ReplanResult syntheticResult = new ReplanResult(
-            updatedSolution,
-            List.of(),        // replanned - registerCancellation ya los procesó internamente
-            List.of()         // unreplannable - ídem
-        );
-
-        return DTOMapper.toReplanResultDTO(adjustedFlightId, syntheticResult);
+        ReplanResult result = controller.registerCancellation(adjustedFlightId);
+        return DTOMapper.toReplanResultDTO(adjustedFlightId, result);
     }
 }

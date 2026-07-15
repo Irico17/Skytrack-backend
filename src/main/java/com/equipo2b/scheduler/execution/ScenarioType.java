@@ -5,7 +5,7 @@ package com.equipo2b.scheduler.execution;
  * 
  * Cada escenario tiene diferentes parámetros de aceleración (K) y configuración:
  * - DAY_TO_DAY: Operación en tiempo real (K=1)
- * - PERIOD_SIMULATION: Simulación de 3-5 días (K=14-23)
+ * - PERIOD_SIMULATION: Simulación de 3-5 días (K=240)
  * - COLLAPSE_SIMULATION: Simulación hasta colapso (K=75)
  * 
  * **Validates: Requirements 21.1-21.3**
@@ -20,36 +20,38 @@ public enum ScenarioType {
     DAY_TO_DAY(
         1,    // K: Factor de aceleración
         2,    // Ta: Tiempo máximo de algoritmo (minutos)
-        5,    // Sa: Salto entre ejecuciones (minutos)
+        2,    // Sa: Salto entre ejecuciones (minutos) — antes 5; alineado con los otros 2 escenarios
         "Escenario 1: Operación Día a Día (K=1)"
     ),
     
     /**
-     * Escenario 2: Simulación de Período (K=14).
-     * - Simula 3-5 días de operación
-     * - 500 lotes aproximadamente
+     * Escenario 2: Simulación de Período (K=180).
+     * - Simula 5 días de operación
      * - Configuración balanceada de algoritmos
-     * - Debe completarse en 30-90 minutos reales
+     * - Debe completarse en ~40 minutos reales
+     *
+     * <p>Timing: Sc = Sa×K = 2×180 = 360 min (6h de datos por ciclo).
+     * 5 días = 7200 min / 360 = 20 ciclos × 2 min reales ≈ 40 min reales totales.
+     * Ventana de consumo más fina (6h) ⇒ primer ciclo más liviano (mejor arranque) y
+     * mayor granularidad de replanificación que la antigua de 12h.
      */
     PERIOD_SIMULATION(
-        120,  // K: Factor de aceleración — Sc=6×120=720min(12h). 5 días = 10 ciclos ≈ 60 min reales
-        3,    // Ta: Tiempo máximo de algoritmo (minutos)
-        6,    // Sa: Salto entre ejecuciones (minutos)
-        "Escenario 2: Simulación 5 Días (K=120, Ta=3, Sa=6)"
+        180,  // K: Factor de aceleración (1 min real = 180 min simulados)
+        2,    // Ta: Tiempo máximo de algoritmo (minutos reales)
+        2,    // Sa: Salto entre ejecuciones (minutos reales) — Sc=2×180=360min(6h)
+        "Escenario 2: Simulación 5 Días (K=180, Ta=2, Sa=2)"
     ),
-    
+
     /**
-     * Escenario 3: Simulación hasta Colapso (K=75).
-     * - Simula 2.5 meses de operación
-     * - 2000 lotes aproximadamente
-     * - Configuración intensiva de algoritmos
-     * - Objetivo: Detectar colapso logístico
+     * Escenario 3: Simulación hasta Colapso.
+     * - Mismos parámetros de velocidad que PERIOD (decisión PO): K=180, Ta=2, Sa=2 (Sc=6h).
+     * - Objetivo: Detectar colapso logístico por saturación de almacenes.
      */
     COLLAPSE_SIMULATION(
-        75,   // K: Factor de aceleración
+        180,  // K: Factor de aceleración (igual que PERIOD)
         2,    // Ta: Tiempo máximo de algoritmo (minutos)
-        5,    // Sa: Salto entre ejecuciones (minutos)
-        "Escenario 3: Simulación hasta Colapso (K=75)"
+        2,    // Sa: Salto entre ejecuciones (minutos) — Sc=2×180=360min(6h)
+        "Escenario 3: Simulación hasta Colapso (K=180, Ta=2, Sa=2)"
     );
     
     private final int K;           // Constante de proporcionalidad

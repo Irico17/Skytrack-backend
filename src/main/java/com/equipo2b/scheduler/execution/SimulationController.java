@@ -8,6 +8,9 @@ import com.equipo2b.scheduler.util.ShipmentGenerator;
 import com.equipo2b.scheduler.validation.RouteValidator;
 
 import java.time.ZonedDateTime;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.UUID;
@@ -24,7 +27,35 @@ import java.util.UUID;
  * **Validates: Requirements 21.1-21.5, 22.1-22.5, 24.1-24.5**
  */
 public class SimulationController {
-    
+    private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
+    private static final long STORAGE_UPDATE_INTERVAL_MS = 250L;
+    /** Relleno de capacidad por sub-lotes (split en vuelos directos). Aditivo y seguro. */
+    private static final boolean PARTIAL_FILL_ENABLED = true;
+    /**
+     * Tamaño de cada bloque de carga incremental para el escenario de colapso, en días
+     * reales de calendario. En vez de precargar TODO el volumen (semilla + crecimiento de
+     * varios días) de una sola vez —lo que antes disparaba el ciclo 1 con una ráfaga enorme
+     * y arriesgaba quedarse sin memoria—, colapso carga solo este bloque al arrancar y va
+     * pidiendo el siguiente a medida que el reloj simulado se acerca al borde de lo cargado.
+     * Esto permite que colapso corra indefinidamente (hasta que el backend detecte colapso
+     * real) sin ningún tope arbitrario de cantidad de registros.
+     */
+    private static final int COLLAPSE_CHUNK_DAYS = 2;
+    /** Margen de aviso: se pide el siguiente bloque cuando falta esto para agotar el actual. */
+    private static final int COLLAPSE_REFILL_MARGIN_DAYS = 1;
+    /** Factor de crecimiento aplicado sobre cada bloque real cargado (Requisito 29.2). */
+    private static final double COLLAPSE_GROWTH_FACTOR = 1.23;
+    /**
+     * Umbral de sobrecarga SEVERA por aeropuerto (120% de su capacidad de almacén) y
+     * cantidad mínima de aeropuertos en ese estado para declarar colapso. Complementa
+     * evaluateWarehouseSaturation (que exige más del 50% de TODA la red): un puñado de
+     * hubs importantes desbordados muy por encima del 100% (ej. varios entre 120% y 172%,
+     * visto en pruebas reales) representa un colapso real aunque sean pocos frente al total
+     * de 30 aeropuertos — sin este chequeo, ese escenario nunca disparaba colapso.
+     */
+    private static final double SEVERE_OVERLOAD_RATIO = 1.20;
+    private static final int SEVERE_OVERLOAD_MIN_AIRPORTS = 3;
+
     // Componentes del sistema
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
@@ -41,6 +72,11 @@ public class SimulationController {
     private volatile Solution currentSolution;
     private TabuSearch tabuSearch;
     private RouteValidator validator;
+    private ScenarioType currentScenario;
+    private volatile ZonedDateTime simulatedClockHorizon;
+    private volatile Thread storageUpdateThread;
+    private volatile String lastErrorMessage;
+    private volatile boolean completedNaturally;
 
     // Identificador único de la simulación activa
     private String simulationId;
@@ -60,7 +96,24 @@ public class SimulationController {
     // Fecha de inicio para calcular días transcurridos
     private ZonedDateTime startDate;
     private volatile double daysElapsed = 0.0;
-    
+
+    // Carga incremental por bloques de fecha real para el escenario de colapso (evita
+    // precargar todo el volumen de una sola vez). null para los demás escenarios.
+    private java.util.function.BiFunction<ZonedDateTime, ZonedDateTime, List<ShipmentBatch>> collapseChunkLoader;
+    private ZonedDateTime collapseLoadedHorizon;
+    private List<ShipmentBatch> collapseLastNonEmptyChunk;
+
+    // Condiciones del colapso (cuándo, qué lo provocó y por qué) capturadas al detectarlo.
+    private volatile CollapseInfo collapseInfo;
+
+    // Componentes REUTILIZABLES (antes se instanciaban por ciclo/consulta):
+    // - CollapseDetector es puro (solo umbrales inmutables) → una instancia basta.
+    // - StorageInventoryService cachea internamente los eventos ordenados por solución;
+    //   crear uno nuevo por llamada tiraba ese cache y re-ordenaba O(E log E) cada vez.
+    //   Reutilizarlo elimina ese allocation rate en la Young Gen y aprovecha el cache.
+    private final CollapseDetector collapseDetector;
+    private volatile StorageInventoryService inventoryService;
+
     /**
      * Constructor del SimulationController.
      */
@@ -73,8 +126,23 @@ public class SimulationController {
         this.state = SimulationState.STOPPED;
         this.currentSolution = new Solution();
         this.simulationId = UUID.randomUUID().toString();
+        // CapacityMonitor real (ocupación de vuelos genuina) en vez del fallback basado
+        // en fitness — evita que la ocupación reportada/usada para colapso sea una
+        // estimación indirecta y ruidosa del fitness de un solo ciclo.
+        this.collapseDetector = new CollapseDetector(new CapacityMonitor(this.flightPlan, this.airportManager));
     }
-    
+
+    /**
+     * Define la función que carga un bloque de envíos reales por rango de fecha
+     * [start, end). Debe llamarse ANTES de {@link #startSimulation} para
+     * {@link ScenarioType#COLLAPSE_SIMULATION} — permite cargar la semilla y los
+     * refuerzos posteriores en bloques pequeños en vez de todo de una vez.
+     */
+    public void setCollapseChunkLoader(
+            java.util.function.BiFunction<ZonedDateTime, ZonedDateTime, List<ShipmentBatch>> loader) {
+        this.collapseChunkLoader = loader;
+    }
+
     /**
      * Inicia una simulación con el escenario especificado.
      * 
@@ -91,8 +159,9 @@ public class SimulationController {
         System.out.println("INICIANDO SIMULACIÓN: " + scenario.getDescription());
         System.out.println("=".repeat(80));
         
+        this.currentScenario = scenario;
         // Preparar datos según el escenario y guardarlos para persistencia final
-        this.currentBatches = prepareData(scenario, historicalBatches);
+        this.currentBatches = new ArrayList<>(prepareData(scenario, historicalBatches));
         
         // Configurar algoritmos según el escenario
         GeneticAlgorithm ga = new GeneticAlgorithm(flightPlan, airportManager);
@@ -112,22 +181,56 @@ public class SimulationController {
         // Crear Scheduler con GATS (por defecto)
         SolutionEvaluator evaluator = new SolutionEvaluator(flightPlan, airportManager);
         
+        com.equipo2b.scheduler.logic.RouteGenerator fillRouteGen = PARTIAL_FILL_ENABLED
+            ? new com.equipo2b.scheduler.logic.RouteGenerator(flightPlan, airportManager)
+            : null;
         this.scheduler = SchedulerFactory.createGATSScheduler(
-            flightPlan, airportManager, queue, evaluator, validator,
-            scenario.getTa(), scenario.getSa(), scenario.getK()
+            ga, tabu, queue, evaluator, validator,
+            scenario.getTa(), scenario.getSa(), scenario.getK(),
+            flightPlan, PARTIAL_FILL_ENABLED, fillRouteGen
         );
         
         // Inicializar estado
-        this.simulatedTime = startDate != null ? startDate : currentBatches.get(0).ingressTime();
+        this.simulatedTime = startDate != null
+            ? startDate
+            : (currentBatches.isEmpty() ? ZonedDateTime.now() : currentBatches.get(0).ingressTime());
+        this.simulatedClockHorizon = this.simulatedTime;
+        this.storageUpdateThread = null;
+        this.lastErrorMessage = null;
+        this.completedNaturally = false;
         this.currentCycle = 0;
         this.batchesProcessed = 0;
         this.batchesFailed = 0;
+        this.collapseInfo = null;
+        this.inventoryService = new StorageInventoryService(airportManager);
         this.state = SimulationState.RUNNING;
         this.running.set(true);
         
         // Ejecutar en thread separado
         simulationThread = new Thread(() -> runSimulation(scenario));
         simulationThread.start();
+    }
+
+    /**
+     * Registra un lote creado desde la operación día a día.
+     * El lote queda disponible para consumo en el siguiente ciclo de planificación.
+     */
+    public synchronized ShipmentBatch addShipment(ShipmentBatch batch) {
+        if (!running.get()) {
+            throw new IllegalStateException("No hay simulación activa");
+        }
+        if (currentScenario != ScenarioType.DAY_TO_DAY) {
+            throw new IllegalStateException("La carga transaccional de maletas solo está habilitada para DAY_TO_DAY");
+        }
+        if (scheduler == null) {
+            throw new IllegalStateException("Scheduler no inicializado");
+        }
+
+        currentBatches.add(batch);
+        scheduler.addShipment(batch);
+        System.out.printf("✓ Lote registrado desde UI: %s (%s → %s, %d maletas)%n",
+            batch.batchId(), batch.origin().id(), batch.destination().id(), batch.quantity());
+        return batch;
     }
     
     /**
@@ -211,11 +314,10 @@ public class SimulationController {
      * 
      * **Validates: Requirements 24.1, 24.4, 24.5, 12.1-12.6, 25.1-25.4**
      */
-    public void registerCancellation(String flightId) {
+    public ReplanResult registerCancellation(String flightId) {
         // 1. Validar que hay simulación activa
         if (!running.get()) {
-            System.out.println("⚠️  No hay simulación activa");
-            return;
+            throw new IllegalStateException("No hay simulación activa");
         }
         
         System.out.println("\n" + "=".repeat(80));
@@ -227,7 +329,7 @@ public class SimulationController {
         if (cancelledFlight == null) {
             System.out.println("❌ Error: Vuelo no encontrado: " + flightId);
             System.out.println("=".repeat(80));
-            return;
+            throw new IllegalArgumentException("Vuelo no encontrado: " + flightId);
         }
         
         System.out.println("✓ Vuelo encontrado:");
@@ -241,7 +343,7 @@ public class SimulationController {
             System.out.println("  Tiempo simulado: " + simulatedTime);
             System.out.println("  Hora de salida: " + cancelledFlight.departureTime());
             System.out.println("=".repeat(80));
-            return;
+            throw new IllegalArgumentException("No se puede cancelar: el vuelo ya despegó");
         }
         
         System.out.println("✓ Vuelo puede ser cancelado (no ha despegado)");
@@ -257,6 +359,7 @@ public class SimulationController {
         // 6. Actualizar solución en Scheduler
         scheduler.updateSolution(result.updatedSolution());
         this.currentSolution = result.updatedSolution();
+        this.batchesProcessed = currentSolution.getRoutes().size();
         
         // 7. Logging de resultados
         System.out.println("\n📊 RESULTADO DE REPLANIFICACIÓN:");
@@ -283,6 +386,16 @@ public class SimulationController {
         
         System.out.println("\n✓ Replanificación completada exitosamente");
         System.out.println("=".repeat(80));
+
+        if (listener != null) {
+            try {
+                listener.onCycleCompleted(getStatus(), currentSolution);
+            } catch (Exception e) {
+                System.err.println("⚠️ Error notificando replanificación: " + e.getMessage());
+            }
+        }
+
+        return result;
     }
     
     /**
@@ -292,8 +405,34 @@ public class SimulationController {
      * @return Vuelo encontrado o null si no existe
      */
     private Flight findFlightById(String flightId) {
+        String baseId = flightId;
+        Long dayOffset = null;
+
+        int suffixIndex = flightId.lastIndexOf("-D");
+        if (suffixIndex > 0 && suffixIndex + 2 < flightId.length()) {
+            String candidateOffset = flightId.substring(suffixIndex + 2);
+            try {
+                dayOffset = Long.parseLong(candidateOffset);
+                baseId = flightId.substring(0, suffixIndex);
+            } catch (NumberFormatException ignored) {
+                dayOffset = null;
+                baseId = flightId;
+            }
+        }
+
         for (Flight flight : flightPlan.getAllFlights()) {
-            if (flight.flightId().equals(flightId)) {
+            if (flight.flightId().equals(baseId)) {
+                if (dayOffset != null) {
+                    return new Flight(
+                        flightId,
+                        flight.origin(),
+                        flight.destination(),
+                        flight.departureTime().plusDays(dayOffset),
+                        flight.arrivalTime().plusDays(dayOffset),
+                        flight.capacity(),
+                        flight.type()
+                    );
+                }
                 return flight;
             }
         }
@@ -306,8 +445,7 @@ public class SimulationController {
      * @return Estado actual
      */
     public SimulationStatus getStatus() {
-        CollapseDetector detector = new CollapseDetector();
-        CollapseStatus collapseStatus = detector.evaluateCollapse(
+        CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
             currentSolution, batchesProcessed, batchesFailed
         );
         
@@ -354,6 +492,14 @@ public class SimulationController {
         return daysElapsed;
     }
 
+    public ZonedDateTime getSimulatedTime() {
+        return simulatedTime;
+    }
+
+    public int getPendingCount() {
+        return scheduler != null ? scheduler.getPendingCount() : 0;
+    }
+
     /**
      * Retorna los lotes actuales preparados para esta simulación.
      */
@@ -377,6 +523,13 @@ public class SimulationController {
         try {
             long simStartRealMs = System.currentTimeMillis();
             long simStartSimMs = simulatedTime.toInstant().toEpochMilli();
+            ZonedDateTime planningCursor = simulatedTime;
+            ZonedDateTime simulationEndTime = scenario == ScenarioType.PERIOD_SIMULATION
+                ? planningCursor.plusDays(5)
+                : null;
+
+            simulatedClockHorizon = planningCursor;
+            startStorageUpdateLoop(simStartRealMs, simStartSimMs, scenario);
 
             while (running.get()) {
                 // Esperar si está pausado
@@ -390,21 +543,38 @@ public class SimulationController {
                 currentCycle++;
                 long cycleStartRealMs = System.currentTimeMillis();
                 System.out.println("\n--- CICLO " + currentCycle + " ---");
+                ZonedDateTime cyclePlanningTime = planningCursor;
+                ZonedDateTime cycleHorizon = cyclePlanningTime.plusMinutes(scenario.getSc());
+                simulatedClockHorizon = cycleHorizon;
                 
-                // 1. Ejecutar algoritmo (hasta Ta minutos reales máximo)
-                currentSolution = scheduler.executePlanningCycle(simulatedTime);
+                // 1. Ejecutar algoritmo sobre una ventana de consumo discreta y secuencial.
+                //    Si el algoritmo se demora, el siguiente ciclo no salta datos: continúa
+                //    desde cycleHorizon, no desde el reloj de pared.
+                currentSolution = scheduler.executePlanningCycle(cyclePlanningTime);
                 long algorithmMs = System.currentTimeMillis() - cycleStartRealMs;
+                planningCursor = cycleHorizon;
+                if (currentCycle == 1) {
+                    System.out.printf("⏱️ [arranque] primer ciclo de planificación listo en %d ms (algoritmo)%n", algorithmMs);
+                }
+                logResourceUsage(scenario, algorithmMs);
 
                 // Actualizar estadísticas
-                batchesProcessed = currentSolution.getRoutes().size();
+                updateBatchCounters(planningCursor);
+
+                // 1b. Colapso: si el reloj de planificación se acerca al borde de lo cargado,
+                //     pedir el siguiente bloque de datos reales (+ crecimiento) e inyectarlo a
+                //     la cola en marcha — así colapso puede correr indefinidamente sin tope.
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION && collapseChunkLoader != null
+                        && !planningCursor.isBefore(collapseLoadedHorizon.minusDays(COLLAPSE_REFILL_MARGIN_DAYS))) {
+                    refillCollapseChunk();
+                }
 
                 // 2. Avanzar tiempo simulado: basado en tiempo real transcurrido × K
                 //    Esto asegura que el reloj del backend coincida con el del frontend
                 updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
 
-                // 3. Verificar colapso
-                CollapseDetector detector = new CollapseDetector();
-                CollapseStatus collapseStatus = detector.evaluateCollapse(
+                // 3. Verificar colapso (instancia compartida — el detector es sin estado)
+                CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
                     currentSolution, batchesProcessed, batchesFailed
                 );
 
@@ -417,19 +587,83 @@ public class SimulationController {
                     }
                 }
 
+                // Nota: el algoritmo ahora respeta un presupuesto de tiempo duro (deadline=Ta),
+                // así que el "colapso por complejidad algorítmica" deja de ser un gatillo válido
+                // (daría falsos positivos). El colapso se declara solo por SATURACIÓN logística.
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION
+                        && algorithmMs > scenario.getTa() * 60_000L * 3) {
+                    System.out.println("\n⚠️  Ciclo de colapso muy lento (>3×Ta) — posible sobrecarga de la VM");
+                }
+
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                    List<Airport> severeAirports = evaluateSevereOverload();
+                    if (severeAirports.size() >= SEVERE_OVERLOAD_MIN_AIRPORTS) {
+                        String names = severeAirports.stream().map(Airport::id)
+                            .collect(java.util.stream.Collectors.joining(", "));
+                        System.out.println("\n⚠️  COLAPSO POR SOBRECARGA SEVERA - " + severeAirports.size()
+                            + " aeropuertos por encima del " + (int) (SEVERE_OVERLOAD_RATIO * 100) + "% de capacidad: " + names);
+                        this.collapseInfo = new CollapseInfo(
+                            "SEVERE_OVERLOAD",
+                            "Sobrecarga severa en varios aeropuertos",
+                            String.format("Se consideró colapso porque %d aeropuertos (%s) superaron el %.0f%% de su "
+                                + "capacidad de almacén simultáneamente — aunque no lleguen a ser la mitad de la red, "
+                                + "esos hubs ya no pueden recibir más carga.",
+                                severeAirports.size(), names, SEVERE_OVERLOAD_RATIO * 100),
+                            ZonedDateTime.now(),
+                            simulatedTime,
+                            collapseStatus.occupancyPercentage(),
+                            collapseStatus.unserviceablePercentage(),
+                            severeAirports.size(),
+                            airportManager.getAllAirports().size(),
+                            currentCycle
+                        );
+                        completedNaturally = true;
+                        break;
+                    }
+
+                    int[] sat = evaluateWarehouseSaturation(); // [críticos, total]
+                    if (sat[1] > 0 && sat[0] * 2 > sat[1]) {
+                        System.out.println("\n⚠️  COLAPSO POR SATURACIÓN DE ALMACENES - más del 50% de aeropuertos críticos");
+                        this.collapseInfo = new CollapseInfo(
+                            "WAREHOUSE_SATURATION",
+                            "Saturación de la red de almacenes",
+                            String.format("Se consideró colapso porque %d de %d aeropuertos (%.0f%%) superaron el 90%% "
+                                + "de su capacidad de almacén simultáneamente, dejando la red sin espacio para recibir más maletas.",
+                                sat[0], sat[1], sat[1] > 0 ? sat[0] * 100.0 / sat[1] : 0.0),
+                            ZonedDateTime.now(),
+                            simulatedTime,
+                            collapseStatus.occupancyPercentage(),
+                            collapseStatus.unserviceablePercentage(),
+                            sat[0],
+                            sat[1],
+                            currentCycle
+                        );
+                        completedNaturally = true;
+                        break;
+                    }
+                }
+
                 if (collapseStatus.isCollapsed()) {
                     if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
                         System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
+                        this.collapseInfo = buildCollapseInfoFromStatus(collapseStatus);
+                        completedNaturally = true;
                         break;
                     } else {
                         System.out.println("⚠️  Alerta de colapso (informativo) - la simulación continúa");
                     }
                 }
                 
-                // 5. Condición de parada natural para simulación de 5 días
-                if (scenario == ScenarioType.PERIOD_SIMULATION && daysElapsed >= 5.0) {
-                    System.out.println("\n✅ Simulación de 5 días completada (días transcurridos: " 
+                // 5. Condición de parada natural para simulación de 5 días.
+                //    Usa el cursor planificado para completar toda la ventana sin saltos
+                //    aunque la VM tarde más que Sa en algún ciclo.
+                if (simulationEndTime != null && !planningCursor.isBefore(simulationEndTime)) {
+                    simulatedClockHorizon = simulationEndTime;
+                    simulatedTime = simulationEndTime;
+                    daysElapsed = 5.0;
+                    System.out.println("\n✅ Simulación de 5 días completada (días transcurridos: "
                         + String.format("%.2f", daysElapsed) + ")");
+                    completedNaturally = true;
                     break;
                 }
 
@@ -442,7 +676,7 @@ public class SimulationController {
                 if (remainingMs > 0) {
                     System.out.printf("⏳ Algoritmo terminó en %.1fs — esperando %.1fs hasta el siguiente ciclo (Sa=%d min)%n",
                         algorithmMs / 1000.0, remainingMs / 1000.0, scenario.getSa());
-                    sleepUntilNextCycle(remainingMs, simStartRealMs, simStartSimMs, scenario);
+                    sleepUntilNextCycle(remainingMs);
                 } else {
                     System.out.printf("⚠️ Algoritmo tardó %.1fs (> Sa=%d min) — siguiente ciclo inmediato%n",
                         algorithmMs / 1000.0, scenario.getSa());
@@ -452,9 +686,17 @@ public class SimulationController {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             System.out.println("⚠️  Simulación interrumpida");
+        } catch (Exception e) {
+            lastErrorMessage = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            System.err.println("❌ Simulación falló: " + lastErrorMessage);
+            e.printStackTrace();
         } finally {
             running.set(false);
             paused.set(false);
+            if (storageUpdateThread != null) {
+                storageUpdateThread.interrupt();
+                storageUpdateThread = null;
+            }
             state = SimulationState.STOPPED;
             System.out.println("\n✓ Simulación finalizada");
             printFinalSummary();
@@ -462,12 +704,192 @@ public class SimulationController {
             // Notificar listener (WebSocket) al terminar
             if (listener != null) {
                 try {
-                    listener.onSimulationFinished(getStatus());
+                    if (lastErrorMessage != null) {
+                        listener.onSimulationError(getStatus(), lastErrorMessage);
+                    } else if (completedNaturally) {
+                        listener.onSimulationFinished(getStatus());
+                    } else {
+                        System.out.println("✓ Simulación detenida antes de completarse; no se exportan resultados finales");
+                    }
                 } catch (Exception e) {
                     System.err.println("⚠️ Error notificando listener en finish: " + e.getMessage());
                 }
             }
+
+            releaseHeavyState(scenario);
         }
+    }
+
+    private void logResourceUsage(ScenarioType scenario, long algorithmMs) {
+        MemoryUsage heap = MEMORY_BEAN.getHeapMemoryUsage();
+        long usedMb = heap.getUsed() / (1024 * 1024);
+        long committedMb = heap.getCommitted() / (1024 * 1024);
+        long maxMb = heap.getMax() / (1024 * 1024);
+        int routes = currentSolution != null ? currentSolution.getRoutes().size() : 0;
+        int currentBatchCount = currentBatches != null ? currentBatches.size() : 0;
+
+        System.out.printf(
+            "📊 Recursos ciclo %d [%s]: heap=%d/%d MB committed=%d MB, rutas=%d, lotes=%d, algoritmo=%.1fs%n",
+            currentCycle,
+            scenario.name(),
+            usedMb,
+            maxMb,
+            committedMb,
+            routes,
+            currentBatchCount,
+            algorithmMs / 1000.0
+        );
+    }
+
+    private void updateBatchCounters(ZonedDateTime plannedUntil) {
+        Map<String, AssignedRoute> routes = currentSolution != null
+            ? currentSolution.getRoutes()
+            : Map.of();
+        int routed = routes.size();
+        long delayed = routes.values().stream().filter(route -> !route.meetsSLA()).count();
+
+        // "Sin ruta" debe contar LOTES ORIGINALES distintos sin ninguna ruta — no
+        // "released - routed" (unidades distintas: released cuenta lotes originales,
+        // routed cuenta ENTRADAS del mapa de solución, que se inflan con los sub-lotes
+        // -S1/-S2 de applyCapacityAwareSplitting). Esa resta podía enmascarar lotes
+        // realmente sin ruta con Math.max(0, ...) cuando había suficientes divisiones.
+        Set<String> routedBaseIds = routedBaseIds(routes);
+        long releasedWithoutRoute = currentBatches != null
+            ? currentBatches.stream()
+                .filter(batch -> !batch.ingressTime().isAfter(plannedUntil))
+                .filter(batch -> !routedBaseIds.contains(batch.batchId()))
+                .count()
+            : 0;
+
+        batchesProcessed = routed;
+        batchesFailed = Math.toIntExact(Math.min(Integer.MAX_VALUE, delayed + releasedWithoutRoute));
+    }
+
+    /**
+     * Ids base (sin sufijo "-S&lt;n&gt;") de todos los lotes que tienen AL MENOS una ruta
+     * en la solución, incluyendo los que solo quedaron parcialmente ubicados vía sub-lotes.
+     */
+    private static Set<String> routedBaseIds(Map<String, AssignedRoute> routes) {
+        Set<String> ids = new HashSet<>();
+        for (String key : routes.keySet()) {
+            ids.add(stripSplitSuffix(key));
+        }
+        return ids;
+    }
+
+    /** Quita los sufijos "-S&lt;n&gt;" finales de un id de lote (mismo criterio que Scheduler). */
+    private static String stripSplitSuffix(String id) {
+        String s = id;
+        while (true) {
+            int idx = s.lastIndexOf("-S");
+            if (idx < 0 || idx + 2 >= s.length()) break;
+            String suffix = s.substring(idx + 2);
+            if (!suffix.chars().allMatch(Character::isDigit)) break;
+            s = s.substring(0, idx);
+        }
+        return s;
+    }
+
+    /**
+     * Evalúa la saturación de la red de almacenes.
+     * @return arreglo [aeropuertos críticos (≥90% capacidad), aeropuertos evaluados].
+     */
+    private int[] evaluateWarehouseSaturation() {
+        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
+            return new int[]{0, 0};
+        }
+
+        StorageInventoryService inventory = inventoryService != null
+            ? inventoryService
+            : new StorageInventoryService(airportManager);
+        Map<Airport, Integer> currentBags = inventory.calculateCurrentBags(currentSolution, simulatedTime, currentBatches);
+        if (currentBags.isEmpty()) {
+            return new int[]{0, 0};
+        }
+
+        int criticalAirports = (int) currentBags.entrySet().stream()
+            .filter(entry -> entry.getKey().storageCapacity() > 0
+                && entry.getValue() >= entry.getKey().storageCapacity() * 0.90)
+            .count();
+        return new int[]{criticalAirports, currentBags.size()};
+    }
+
+    /**
+     * Devuelve los aeropuertos con sobrecarga SEVERA (≥ {@link #SEVERE_OVERLOAD_RATIO} de
+     * su capacidad de almacén) en el instante simulado actual — no solo "casi llenos", sino
+     * genuinamente desbordados.
+     */
+    private List<Airport> evaluateSevereOverload() {
+        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
+            return List.of();
+        }
+
+        StorageInventoryService inventory = inventoryService != null
+            ? inventoryService
+            : new StorageInventoryService(airportManager);
+        Map<Airport, Integer> currentBags = inventory.calculateCurrentBags(currentSolution, simulatedTime, currentBatches);
+
+        return currentBags.entrySet().stream()
+            .filter(entry -> entry.getKey().storageCapacity() > 0
+                && entry.getValue() >= entry.getKey().storageCapacity() * SEVERE_OVERLOAD_RATIO)
+            .map(Map.Entry::getKey)
+            .toList();
+    }
+
+    /**
+     * Construye las condiciones del colapso a partir del estado del detector, traduciendo
+     * la causa concreta (no atendibles / saturación de capacidad / fitness) a un motivo legible.
+     */
+    private CollapseInfo buildCollapseInfoFromStatus(CollapseStatus status) {
+        int[] sat = evaluateWarehouseSaturation();
+        String causeCode;
+        String causeLabel;
+        String reason;
+        if (status.message() != null && status.message().toLowerCase().contains("fitness")) {
+            causeCode = "ALGORITHM_FITNESS";
+            causeLabel = "Penalizaciones superan recompensas";
+            reason = "Se consideró colapso porque la solución dejó de ser viable: las penalizaciones "
+                + "(retrasos y sobrecapacidad) superaron las recompensas por entregas a tiempo. " + status.message();
+        } else if (status.unserviceablePercentage() > 20.0) {
+            causeCode = "UNSERVICEABLE_BATCHES";
+            causeLabel = "Demasiados lotes no atendibles";
+            reason = String.format("Se consideró colapso porque el %.0f%% de los lotes no pudo planificarse a tiempo "
+                + "(umbral de no atendibles: 20%%), con una ocupación promedio del sistema del %.0f%%.",
+                status.unserviceablePercentage(), status.occupancyPercentage());
+        } else if (status.occupancyPercentage() >= 80.0) {
+            causeCode = "CAPACITY_SATURATION";
+            causeLabel = "Saturación de capacidad de la red";
+            reason = String.format("Se consideró colapso porque la ocupación promedio del sistema alcanzó el %.0f%% "
+                + "(umbral de saturación: 80%%), superando la capacidad operable de vuelos y almacenes.",
+                status.occupancyPercentage());
+        } else {
+            causeCode = "ALGORITHM_FITNESS";
+            causeLabel = "Penalizaciones superan recompensas";
+            reason = String.format("Se consideró colapso porque la solución dejó de ser viable: las penalizaciones "
+                + "(retrasos/sobrecapacidad) superaron las recompensas. %s", status.message());
+        }
+        return new CollapseInfo(
+            causeCode, causeLabel, reason,
+            ZonedDateTime.now(), simulatedTime,
+            status.occupancyPercentage(), status.unserviceablePercentage(),
+            sat[0], sat[1], currentCycle
+        );
+    }
+
+    /** Condiciones del colapso si la simulación colapsó; null si no hubo colapso. */
+    public CollapseInfo getCollapseInfo() {
+        return collapseInfo;
+    }
+
+    private void releaseHeavyState(ScenarioType scenario) {
+        // Los tres escenarios liberan el motor pesado al terminar; la última solución
+        // y los lotes quedan disponibles para consulta REST / exportación.
+        scheduler = null;
+        tabuSearch = null;
+        validator = null;
+        inventoryService = null; // libera el cache de eventos ordenados (puede ser grande)
+        System.out.println("✓ Referencias pesadas liberadas tras finalizar " + scenario.name()
+            + "; última solución y lotes preservados para consulta REST");
     }
     
     /**
@@ -476,35 +898,80 @@ public class SimulationController {
     private List<ShipmentBatch> prepareData(ScenarioType scenario, List<ShipmentBatch> historical) {
         switch (scenario) {
             case DAY_TO_DAY:
-                // Usar solo datos históricos limitados
-                int numBatches = Math.min(100, historical.size());
-                return historical.subList(0, numBatches);
+                // Indicación del curso (prueba de operaciones día a día): "La tabla de envíos
+                // debe estar limpia. Aquí no aplica data histórica ni la data proyectada".
+                // Los envíos entran SOLO por registro manual (pantalla de ingreso) o por la
+                // carga de archivo durante la ejecución — nunca del dataset de simulación.
+                return List.of();
                 
             case PERIOD_SIMULATION:
-                // Generar datos futuros con factor de crecimiento moderado
-                ShipmentGenerator generator = new ShipmentGenerator();
-                List<ShipmentBatch> futureBatches = generator.generateFutureShipments(
-                    historical, scenario.getK(), 1.20
-                );
-                List<ShipmentBatch> allBatches = new ArrayList<>(historical);
-                allBatches.addAll(futureBatches);
-                return allBatches.subList(0, Math.min(500, allBatches.size()));
+                // Usar todos los lotes reales cargados para la ventana seleccionada.
+                // El filtrado por fecha/hora se realiza antes, en SimulationService.
+                return historical;
                 
             case COLLAPSE_SIMULATION:
-                // Generar datos futuros con factor de crecimiento alto
-                ShipmentGenerator collapseGenerator = new ShipmentGenerator();
-                List<ShipmentBatch> collapseBatches = collapseGenerator.generateFutureShipments(
-                    historical, scenario.getK(), 1.23
-                );
-                List<ShipmentBatch> collapseAll = new ArrayList<>(historical);
-                collapseAll.addAll(collapseBatches);
-                return collapseAll.subList(0, Math.min(2000, collapseAll.size()));
-                
+                // Carga incremental por bloques de fecha real (COLLAPSE_CHUNK_DAYS días a la
+                // vez) en vez de precargar TODO el volumen de golpe: evita la ráfaga enorme en
+                // el ciclo 1 y el riesgo de memoria de materializar cientos de miles de lotes
+                // de una sola vez. El primer bloque se carga aquí; los siguientes se piden
+                // durante la simulación (ver runSimulation) a medida que el reloj avanza.
+                ZonedDateTime chunkStart = startDate != null ? startDate : ZonedDateTime.now();
+                ZonedDateTime chunkEnd = chunkStart.plusDays(COLLAPSE_CHUNK_DAYS);
+                List<ShipmentBatch> firstChunk = collapseChunkLoader != null
+                    ? collapseChunkLoader.apply(chunkStart, chunkEnd)
+                    : historical;
+                collapseLoadedHorizon = chunkEnd;
+                if (!firstChunk.isEmpty()) {
+                    collapseLastNonEmptyChunk = firstChunk;
+                }
+                return buildCollapseBlock(firstChunk);
+
             default:
                 throw new IllegalArgumentException("Escenario desconocido: " + scenario);
         }
     }
-    
+
+    /**
+     * Aplica el factor de crecimiento (Requisito 29.2) sobre un bloque real de envíos y
+     * devuelve el bloque real + lo generado. Si el bloque real viene vacío (fecha fuera del
+     * dataset), usa el último bloque real no vacío como base para el patrón/crecimiento, de
+     * modo que el colapso siga escalando presión aunque los datos reales ya se hayan agotado.
+     */
+    private List<ShipmentBatch> buildCollapseBlock(List<ShipmentBatch> realChunk) {
+        List<ShipmentBatch> base = !realChunk.isEmpty() ? realChunk : collapseLastNonEmptyChunk;
+        List<ShipmentBatch> block = new ArrayList<>(realChunk);
+        if (base != null && !base.isEmpty()) {
+            ShipmentGenerator collapseGenerator = new ShipmentGenerator();
+            List<ShipmentBatch> growthBatches = collapseGenerator.generateFutureShipments(
+                base, COLLAPSE_CHUNK_DAYS, COLLAPSE_GROWTH_FACTOR
+            );
+            block.addAll(growthBatches);
+        }
+        return block;
+    }
+
+    /**
+     * Pide el siguiente bloque de fecha real de colapso, le aplica el crecimiento y lo
+     * inyecta en la cola del scheduler EN MARCHA (sin reiniciar nada). Se llama desde el
+     * bucle principal cuando el reloj simulado se acerca al borde de lo ya cargado.
+     */
+    private void refillCollapseChunk() {
+        ZonedDateTime nextStart = collapseLoadedHorizon;
+        ZonedDateTime nextEnd = nextStart.plusDays(COLLAPSE_CHUNK_DAYS);
+        List<ShipmentBatch> nextChunk = collapseChunkLoader.apply(nextStart, nextEnd);
+        if (!nextChunk.isEmpty()) {
+            collapseLastNonEmptyChunk = nextChunk;
+        }
+        List<ShipmentBatch> block = buildCollapseBlock(nextChunk);
+        for (ShipmentBatch batch : block) {
+            scheduler.addShipment(batch);
+        }
+        currentBatches.addAll(block);
+        collapseLoadedHorizon = nextEnd;
+        System.out.printf("➕ Colapso: bloque [%s → %s) cargado — %,d lotes reales + crecimiento (%,d total)%n",
+            nextStart.toLocalDate(), nextEnd.toLocalDate(), nextChunk.size(), block.size());
+    }
+
     /**
      * Configura los algoritmos según el escenario.
      */
@@ -518,32 +985,52 @@ public class SimulationController {
                 gaConfig.setInt("populationSize", 20);
                 gaConfig.setInt("generations", 15);
                 gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setBoolean("parallelEnabled", false);
                 tabuConfig.setInt("maxIterations", 50);
                 tabuConfig.setInt("tabuTenure", 10);
                 tabuConfig.setInt("neighborhoodSize", 15);
                 break;
                 
             case PERIOD_SIMULATION:
-                // Configuración balanceada
-                gaConfig.setInt("populationSize", 30);
-                gaConfig.setInt("generations", 20);
+                // Configuración ajustada para VM 2 CPU / 2 GB
+                gaConfig.setInt("populationSize", 20);
+                gaConfig.setInt("generations", 10);
                 gaConfig.setDouble("mutationRate", 0.1);
-                tabuConfig.setInt("maxIterations", 100);
+                gaConfig.setInt("stagnationLimit", 4);
+                gaConfig.setBoolean("parallelEnabled", false);
+                gaConfig.setInt("routeSearchAttempts", 10);
+                gaConfig.setInt("routeCachedVariants", 3);
+                tabuConfig.setInt("maxIterations", 32);
                 tabuConfig.setInt("tabuTenure", 12);
-                tabuConfig.setInt("neighborhoodSize", 20);
+                tabuConfig.setInt("neighborhoodSize", 8);
+                tabuConfig.setInt("routeSearchAttempts", 8);
+                tabuConfig.setInt("routeCachedVariants", 2);
                 break;
                 
             case COLLAPSE_SIMULATION:
-                // Configuración intensiva
-                gaConfig.setInt("populationSize", 40);
-                gaConfig.setInt("generations", 25);
+                // Mismos parámetros/velocidad que PERIOD (decisión PO) y config liviana
+                // apta para VM 2 CPU / 2 GB; el deadline duro garantiza Ta.
+                gaConfig.setInt("populationSize", 20);
+                gaConfig.setInt("generations", 10);
                 gaConfig.setDouble("mutationRate", 0.1);
-                tabuConfig.setInt("maxIterations", 150);
-                tabuConfig.setInt("tabuTenure", 15);
-                tabuConfig.setInt("neighborhoodSize", 25);
+                gaConfig.setInt("stagnationLimit", 4);
+                gaConfig.setBoolean("parallelEnabled", false);
+                gaConfig.setInt("routeSearchAttempts", 10);
+                gaConfig.setInt("routeCachedVariants", 3);
+                tabuConfig.setInt("maxIterations", 32);
+                tabuConfig.setInt("tabuTenure", 12);
+                tabuConfig.setInt("neighborhoodSize", 8);
+                tabuConfig.setInt("routeSearchAttempts", 8);
+                tabuConfig.setInt("routeCachedVariants", 2);
                 break;
         }
-        
+
+        // Presupuesto de tiempo duro por ciclo (deadline): el algoritmo nunca excede Ta.
+        // GA ~70% y Tabú ~25% de Ta (5% de margen para evaluación/acumulación).
+        long taMs = scenario.getTa() * 60_000L;
+        gaConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.70));
+        tabuConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.25));
+
         ga.configure(gaConfig);
         tabu.configure(tabuConfig);
     }
@@ -560,8 +1047,7 @@ public class SimulationController {
         System.out.println("Lotes fallidos: " + batchesFailed);
         System.out.println("Fitness final: " + String.format("%.2f", currentSolution.getFitness()));
         
-        CollapseDetector detector = new CollapseDetector();
-        CollapseStatus collapseStatus = detector.evaluateCollapse(
+        CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
             currentSolution, batchesProcessed, batchesFailed
         );
         System.out.println("\nEstado del Sistema: " + collapseStatus.level());
@@ -612,6 +1098,11 @@ public class SimulationController {
         void onStorageUpdated(SimulationStatus status, Solution solution);
 
         /**
+         * Llamado cuando la simulación termina por un error no recuperable.
+         */
+        void onSimulationError(SimulationStatus status, String errorMessage);
+
+        /**
          * Llamado cuando la simulación termina (por fin de datos, colapso o stop manual).
          * @param status Estado final
          */
@@ -637,42 +1128,70 @@ public class SimulationController {
         }
     }
 
-    private void sleepUntilNextCycle(
-            long totalMs,
-            long simStartRealMs,
-            long simStartSimMs,
-            ScenarioType scenario) throws InterruptedException {
-        long remaining = totalMs;
-        while (remaining > 0 && running.get()) {
-            while (paused.get() && running.get()) {
-                Thread.sleep(100);
-            }
-            if (!running.get()) return;
+    private void sleepUntilNextCycle(long totalMs) throws InterruptedException {
+        sleepInterruptibly(totalMs);
+    }
 
-            long chunk = Math.min(remaining, 1000);
-            Thread.sleep(chunk);
-            remaining -= chunk;
-
-            updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
-            if (listener != null) {
+    private void startStorageUpdateLoop(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {
+        storageUpdateThread = new Thread(() -> {
+            while (running.get()) {
                 try {
-                    listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
-                } catch (Exception e) {
-                    System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
+                    while (paused.get() && running.get()) {
+                        Thread.sleep(100);
+                    }
+                    if (!running.get()) return;
+
+                    updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
+                    notifyStorageUpdated();
+                    Thread.sleep(STORAGE_UPDATE_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
+        }, "simulation-storage-updates-" + simulationId);
+        storageUpdateThread.setDaemon(true);
+        storageUpdateThread.start();
+    }
+
+    private void notifyStorageUpdated() {
+        if (listener == null) return;
+        try {
+            listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
+        } catch (Exception e) {
+            System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
         }
     }
 
     private void updateSimulatedClock(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {
         long realElapsedMs = System.currentTimeMillis() - simStartRealMs;
         long simElapsedMs = realElapsedMs * scenario.getK();
-        simulatedTime = java.time.Instant.ofEpochMilli(simStartSimMs + simElapsedMs)
+        ZonedDateTime wallClockTime = java.time.Instant.ofEpochMilli(simStartSimMs + simElapsedMs)
             .atZone(startDate != null ? startDate.getZone() : java.time.ZoneOffset.UTC);
 
+        ZonedDateTime horizon = simulatedClockHorizon;
+        if (horizon != null && wallClockTime.isAfter(horizon)) {
+            wallClockTime = horizon;
+        }
+
+        simulatedTime = wallClockTime;
+
         if (startDate != null) {
-            long minutesElapsed = java.time.Duration.between(startDate, simulatedTime).toMinutes();
-            daysElapsed = Math.min(5.0, minutesElapsed / (24.0 * 60.0));
+            // Milisegundos (no toMinutes(), que trunca a minutos enteros): con K=1 (día a día,
+            // 1:1 con el reloj real) esa truncación congelaba los segundos del contador de
+            // "tiempo transcurrido" hasta el siguiente minuto completo. Con K=180 (5 días/
+            // colapso) era imperceptible (la pérdida de precisión es menor a 1/3 de segundo
+            // real), pero para día a día se notaba de sobra.
+            long millisElapsed = java.time.Duration.between(startDate, simulatedTime).toMillis();
+            double rawDaysElapsed = millisElapsed / (24.0 * 60.0 * 60.0 * 1000.0);
+            // El tope de 5 días (120h) solo aplica a PERIOD_SIMULATION, que tiene ventana fija.
+            // COLLAPSE_SIMULATION corre hasta que el backend detecte colapso (puede superar los
+            // 5 días); antes este Math.min(5.0, ...) universal congelaba el reloj del frontend
+            // en 120h para TODOS los escenarios, dando la falsa impresión de que colapso se
+            // detenía como la simulación de 5 días.
+            daysElapsed = scenario == ScenarioType.PERIOD_SIMULATION
+                ? Math.min(5.0, rawDaysElapsed)
+                : rawDaysElapsed;
         }
     }
 

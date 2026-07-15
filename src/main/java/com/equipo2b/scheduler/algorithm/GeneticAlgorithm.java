@@ -8,6 +8,7 @@ import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 /**
  * Implementación del Algoritmo Genético para planificación masiva.
@@ -40,6 +41,13 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private int tournamentSize = 4;
     private int eliteCount = 2;
     private int stagnationLimit = 15;  // Early stopping: max generations sin mejora
+    private boolean parallelEnabled = true;
+    private int parallelMinProcessors = 3;
+    private int parallelPopulationThreshold = 32;
+    private int largeVolumeBatchThreshold = 2_500;
+    private int routeSearchAttempts = 12;
+    private int routeCachedVariants = 3;
+    private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro por ciclo (presupuesto Ta)
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -63,35 +71,47 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
     
     /**
-     * Inicializa la población con soluciones candidatas (PARALELIZADO).
+    * Inicializa la población con soluciones candidatas.
      * 
      * <p>Para cada solución en la población, genera rutas factibles para todos
      * los lotes usando RouteGenerator. Para introducir diversidad, procesa los
      * lotes en orden aleatorio para cada individuo.
      * 
-     * <p>PARALELIZACIÓN: Usa IntStream.parallel() para crear individuos en paralelo.
-     * ThreadLocalRandom garantiza thread-safety sin sincronización.
+    * <p>La paralelización se habilita solo cuando la configuración y los CPUs
+    * disponibles lo justifican. En VMs pequeñas, el costo de ForkJoinPool suele
+    * superar la ganancia.
      * 
      * <p><strong>Validates: Requirement 10.1</strong>
      * 
      * @param batches Lista de lotes para los cuales generar rutas
      * @return Población inicial de soluciones
      */
-    private List<Solution> initializePopulation(List<ShipmentBatch> batches) {
+    private List<Solution> initializePopulation(List<ShipmentBatch> batches, int effectivePopulationSize) {
         Set<String> unroutableBatches = Collections.synchronizedSet(new HashSet<>());
         
-        List<Solution> population = IntStream.range(0, populationSize)
-            .parallel()
-            .mapToObj(i -> {
+        Stream<Integer> populationIndexes = IntStream.range(0, effectivePopulationSize).boxed();
+        if (shouldUseParallelism(effectivePopulationSize)) {
+            populationIndexes = populationIndexes.parallel();
+        }
+
+        List<Solution> population = populationIndexes.map(i -> {
                 Solution solution = new Solution();
                 
-                // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
-                // ThreadLocalRandom es thread-safe sin sincronización
                 List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
-                Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
+                if (i == 0) {
+                    shuffledBatches.sort(Comparator
+                        .comparing(ShipmentBatch::ingressTime)
+                        .thenComparing(ShipmentBatch::batchId));
+                } else {
+                    // IMPORTANTE: Shufflear lotes para cada individuo para generar diversidad
+                    // ThreadLocalRandom es thread-safe sin sincronización
+                    Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
+                }
                 
                 for (ShipmentBatch batch : shuffledBatches) {
-                    AssignedRoute route = routeGenerator.generateFeasibleRoute(batch);
+                    AssignedRoute route = i == 0
+                        ? routeGenerator.generateEarliestFeasibleRoute(batch)
+                        : routeGenerator.generateFeasibleRoute(batch);
                     if (route != null) {
                         solution.addRoute(route);
                     } else {
@@ -119,25 +139,97 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
     
     /**
-     * Evalúa el fitness de cada solución no evaluada en la población (PARALELIZADO).
+    * Evalúa el fitness de cada solución no evaluada en la población.
      * 
      * <p>Usa SolutionEvaluator para calcular el fitness y marca las soluciones
      * como evaluadas para evitar recálculos innecesarios.
      * 
-     * <p>PARALELIZACIÓN: Usa parallelStream() para evaluar múltiples soluciones
-     * simultáneamente. SolutionEvaluator es thread-safe (stateless).
+    * <p>La evaluación paralela se usa solo cuando hay suficientes CPUs y población.
+    * SolutionEvaluator es thread-safe (stateless).
      * 
      * <p><strong>Validates: Requirement 10.2</strong>
      * 
      * @param population Población de soluciones a evaluar
      */
-    private void evaluatePopulation(List<Solution> population) {
-        population.parallelStream()
+    private void evaluatePopulation(List<Solution> population, int effectivePopulationSize) {
+        Stream<Solution> stream = shouldUseParallelism(effectivePopulationSize)
+            ? population.parallelStream()
+            : population.stream();
+
+        stream
             .filter(solution -> !solution.isEvaluated())
             .forEach(solution -> {
                 double fitness = evaluator.evaluate(solution);
                 solution.setFitness(fitness);
             });
+    }
+
+    private boolean shouldUseParallelism(int effectivePopulationSize) {
+        return parallelEnabled
+            && Runtime.getRuntime().availableProcessors() >= parallelMinProcessors
+            && effectivePopulationSize >= parallelPopulationThreshold;
+    }
+
+    private int effectivePopulationSize(int batchCount) {
+        if (batchCount >= 4_000) return Math.min(populationSize, 6);
+        if (batchCount >= 2_000) return Math.min(populationSize, 8);
+        if (batchCount >= 1_000) return Math.min(populationSize, 10);
+        if (batchCount >= 500) return Math.min(populationSize, 14);
+        return populationSize;
+    }
+
+    private int effectiveGenerations(int batchCount) {
+        if (batchCount >= 4_000) return Math.min(generations, 3);
+        if (batchCount >= 2_000) return Math.min(generations, 4);
+        if (batchCount >= 1_000) return Math.min(generations, 5);
+        if (batchCount >= 500) return Math.min(generations, 7);
+        return generations;
+    }
+
+    private int effectiveStagnationLimit(int batchCount, int effectiveGenerations) {
+        if (batchCount >= 4_000) return Math.min(stagnationLimit, 3);
+        if (batchCount >= 500) return Math.min(stagnationLimit, 4);
+        return Math.min(stagnationLimit, effectiveGenerations);
+    }
+
+    private Solution buildHeuristicSolution(List<ShipmentBatch> batches) {
+        Solution solution = new Solution();
+        List<ShipmentBatch> orderedBatches = new ArrayList<>(batches);
+        orderedBatches.sort(Comparator.comparing(ShipmentBatch::ingressTime));
+
+        int unroutable = 0;
+        for (ShipmentBatch batch : orderedBatches) {
+            AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(batch);
+            if (route != null) {
+                solution.addRoute(route);
+            } else {
+                unroutable++;
+            }
+        }
+
+        if (unroutable > 0) {
+            System.err.printf("Warning: %d batches could not be routed in large-volume mode%n", unroutable);
+        }
+        return solution;
+    }
+
+    private Solution optimizeLargeVolume(List<ShipmentBatch> batches) {
+        long startMs = System.currentTimeMillis();
+        System.out.printf(
+            "Carga masiva (%d lotes): usando planificación heurística cacheada para respetar CPU/RAM%n",
+            batches.size()
+        );
+
+        Solution solution = buildHeuristicSolution(batches);
+        evaluator.evaluate(solution);
+
+        System.out.printf(
+            "Planificación masiva completada en %.1fs: rutas=%d, fitness=%.2f%n",
+            (System.currentTimeMillis() - startMs) / 1000.0,
+            solution.getRoutes().size(),
+            solution.getFitness()
+        );
+        return solution;
     }
     
     /**
@@ -226,14 +318,23 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @param solution Solución a mutar (se modifica in-place)
      * @param batches Lista de lotes disponibles
      */
+    /** Probabilidad de generar la ruta mutada SIN cache (diversidad genuina en el pool). */
+    private static final double FRESH_ROUTE_PROBABILITY = 0.30;
+
     private void mutate(Solution solution, List<ShipmentBatch> batches) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         // Mutar 1-3 genes aleatorios (en vez de iterar todos con 5%)
         int mutationCount = random.nextInt(1, Math.min(4, batches.size() + 1));
-        
+
         for (int m = 0; m < mutationCount; m++) {
             ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
-            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            // Bypass probabilístico del cache de rutas: el cache limita cada lote a ≤3
+            // variantes y homogeneiza la población en 2-3 generaciones (fitness estancado).
+            // Un 30% de mutaciones con BFS fresco inyecta rutas nuevas; el 70% cacheado
+            // mantiene el costo de CPU acotado bajo carga.
+            AssignedRoute newRoute = random.nextDouble() < FRESH_ROUTE_PROBABILITY
+                ? routeGenerator.generateFeasibleRouteNoCache(batch)
+                : routeGenerator.generateFeasibleRoute(batch);
             if (newRoute != null) {
                 solution.addRoute(newRoute);
             }
@@ -269,25 +370,127 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         if (batches == null) {
             throw new NullPointerException("Batches cannot be null");
         }
-        
+
         // Configurar evaluador con cantidad esperada de lotes
         evaluator.setExpectedBatchCount(batches.size());
-        
-        // 1. Inicializar población con rutas factibles
-        List<Solution> population = initializePopulation(batches);
-        
-        // Variables para early stopping
+
+        if (batches.size() >= largeVolumeBatchThreshold) {
+            return optimizeLargeVolume(batches);
+        }
+
+        int effectivePopulationSize = effectivePopulationSize(batches.size());
+        int effectiveGenerations = effectiveGenerations(batches.size());
+        int effectiveStagnationLimit = effectiveStagnationLimit(batches.size(), effectiveGenerations);
+
+        if (effectivePopulationSize != populationSize || effectiveGenerations != generations) {
+            System.out.printf(
+                "Carga alta (%d lotes): GA adaptativo población=%d, generaciones=%d%n",
+                batches.size(), effectivePopulationSize, effectiveGenerations
+            );
+        }
+
+        // Deadline duro global: nunca exceder el presupuesto de tiempo (Ta).
+        final long startMs = System.currentTimeMillis();
+        final long deadline = maxTimeMillis > 0 ? startMs + maxTimeMillis : Long.MAX_VALUE;
+
+        // PACIENCIA ADAPTATIVA AL PRESUPUESTO: con carga ligera el presupuesto Ta queda
+        // >99% sin usar; cortar tras 4 generaciones sin mejora ahorraba un tiempo que no
+        // necesitábamos ahorrar. Con presupuesto configurado y carga baja, exploramos más.
+        if (maxTimeMillis > 0 && batches.size() < 500) {
+            effectiveStagnationLimit = Math.max(effectiveStagnationLimit, 12);
+            effectiveGenerations = Math.max(effectiveGenerations, 40);
+        }
+
+        // REINICIOS ITERADOS: cuando la evolución converge (early-stop) y sobra presupuesto,
+        // relanzar con población fresca conserva el mejor global y ataca el estancamiento
+        // causado por la baja diversidad inicial (cache de rutas). Solo con carga baja
+        // (<500 lotes) y siempre bajo el deadline duro — bajo carga alta se corre una vez,
+        // exactamente como antes.
+        final boolean restartsEnabled = maxTimeMillis > 0 && batches.size() < 500;
+        final int maxRestarts = restartsEnabled ? 6 : 1;
+        final int maxRestartsWithoutImprovement = 2;
+
+        Solution globalBest = null;
+        int runs = 0;
+        int improvements = 0;
+        int runsWithoutImprovement = 0;
+        int totalGenerations = 0;
+        double firstRunFitness = Double.NaN;
+
+        while (runs < maxRestarts) {
+            long remaining = deadline - System.currentTimeMillis();
+            // Reiniciar solo si queda al menos ~30% del presupuesto (evita corridas truncadas).
+            if (runs > 0 && (remaining < maxTimeMillis * 0.30 || runsWithoutImprovement >= maxRestartsWithoutImprovement)) {
+                break;
+            }
+
+            EvolutionResult result = runEvolution(
+                batches, effectivePopulationSize, effectiveGenerations, effectiveStagnationLimit, deadline);
+            runs++;
+            totalGenerations += result.generationsExecuted;
+            if (runs == 1) {
+                firstRunFitness = result.best.getFitness();
+            }
+
+            if (globalBest == null || result.best.getFitness() < globalBest.getFitness() - 0.01) {
+                if (globalBest != null) improvements++;
+                globalBest = result.best;
+                runsWithoutImprovement = 0;
+            } else {
+                runsWithoutImprovement++;
+            }
+
+            if (System.currentTimeMillis() >= deadline) break;
+        }
+
+        // Log liviano de UNA línea con lo necesario para analizar la búsqueda:
+        // corridas (1=sin reinicio), generaciones totales, fitness 1ª corrida → final
+        // (delta = ganancia de los reinicios), y tiempo usado del presupuesto.
+        if (runs > 1 || improvements > 0) {
+            System.out.printf(
+                "🧬 GA: corridas=%d gens=%d fitness %.2f→%.2f (mejoras por reinicio=%d) en %dms%n",
+                runs, totalGenerations, firstRunFitness, globalBest.getFitness(), improvements,
+                System.currentTimeMillis() - startMs
+            );
+        }
+
+        return globalBest;
+    }
+
+    /** Resultado de una corrida evolutiva: mejor solución y generaciones ejecutadas. */
+    private record EvolutionResult(Solution best, int generationsExecuted) {}
+
+    /**
+     * Una corrida evolutiva completa (población fresca → early-stop/deadline/límite de
+     * generaciones). Extraída de optimize() para poder reiniciarla con semillas nuevas.
+     */
+    private EvolutionResult runEvolution(
+            List<ShipmentBatch> batches,
+            int effectivePopulationSize,
+            int effectiveGenerations,
+            int effectiveStagnationLimit,
+            long deadline) {
+
+        // 1. Inicializar población con rutas factibles (aleatoriedad nueva en cada corrida)
+        List<Solution> population = initializePopulation(batches, effectivePopulationSize);
+
         double bestFitnessSoFar = Double.MAX_VALUE;
         int stagnationCounter = 0;
-        
+        int gensExecuted = 0;
+
         // 2. Evolucionar durante N generaciones (con early stopping)
-        for (int gen = 0; gen < generations; gen++) {
+        for (int gen = 0; gen < effectiveGenerations; gen++) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf("⏱️ GA detenido por presupuesto de tiempo en generación %d%n", gen);
+                break;
+            }
+            gensExecuted = gen + 1;
             // Evaluar fitness de toda la población
-            evaluatePopulation(population);
-            
+            evaluatePopulation(population, effectivePopulationSize);
+
             // Ordenar por fitness (menor es mejor)
             population.sort(Comparator.comparingDouble(Solution::getFitness));
-            
+
             // Early stopping: detectar convergencia prematura
             double currentBest = population.get(0).getFitness();
             if (currentBest < bestFitnessSoFar - 0.01) {
@@ -296,41 +499,40 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             } else {
                 stagnationCounter++;
             }
-            
-            if (stagnationCounter >= stagnationLimit) {
-                System.out.printf("Early stopping at generation %d (no improvement for %d generations)%n", 
-                                gen, stagnationLimit);
+
+            if (stagnationCounter >= effectiveStagnationLimit) {
                 break;
             }
-            
+
             // Crear nueva generación
             List<Solution> nextGeneration = new ArrayList<>();
-            
+
             // Elitismo: preservar mejores soluciones
-            for (int i = 0; i < eliteCount && i < population.size(); i++) {
+            int effectiveEliteCount = Math.min(eliteCount, Math.max(1, effectivePopulationSize / 8));
+            for (int i = 0; i < effectiveEliteCount && i < population.size(); i++) {
                 nextGeneration.add(new Solution(population.get(i)));
             }
-            
+
             // Generar resto de la población
-            while (nextGeneration.size() < populationSize) {
+            while (nextGeneration.size() < effectivePopulationSize) {
                 Solution parent1 = tournamentSelection(population);
                 Solution parent2 = tournamentSelection(population);
                 Solution child = crossover(parent1, parent2);
-                
+
                 if (ThreadLocalRandom.current().nextDouble() < mutationRate) {
                     mutate(child, batches);
                 }
-                
+
                 nextGeneration.add(child);
             }
-            
+
             population = nextGeneration;
         }
-        
+
         // Evaluar población final y retornar mejor
-        evaluatePopulation(population);
+        evaluatePopulation(population, effectivePopulationSize);
         population.sort(Comparator.comparingDouble(Solution::getFitness));
-        return population.get(0);
+        return new EvolutionResult(population.get(0), gensExecuted);
     }
     
     /**
@@ -344,6 +546,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      *   <li>mutationRate: Tasa de mutación (default: 0.1)</li>
      *   <li>tournamentSize: Tamaño del torneo (default: 4)</li>
      *   <li>eliteCount: Número de élites a preservar (default: 2)</li>
+    *   <li>parallelEnabled: Habilita paralelismo si la VM tiene CPUs suficientes</li>
+    *   <li>parallelMinProcessors: CPUs mínimos para paralelizar (default: 3)</li>
+    *   <li>parallelPopulationThreshold: población mínima para paralelizar (default: 32)</li>
      * </ul>
      * 
      * <p>NOTA: randomSeed ya no es configurable. Se usa ThreadLocalRandom
@@ -366,5 +571,13 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.tournamentSize = config.getInt("tournamentSize", 4);
         this.eliteCount = config.getInt("eliteCount", 2);
         this.stagnationLimit = config.getInt("stagnationLimit", 15);
+        this.parallelEnabled = config.getBoolean("parallelEnabled", true);
+        this.parallelMinProcessors = config.getInt("parallelMinProcessors", 3);
+        this.parallelPopulationThreshold = config.getInt("parallelPopulationThreshold", 32);
+        this.largeVolumeBatchThreshold = config.getInt("largeVolumeBatchThreshold", 2_500);
+        this.routeSearchAttempts = config.getInt("routeSearchAttempts", 12);
+        this.routeCachedVariants = config.getInt("routeCachedVariants", 3);
+        this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
+        this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
 }

@@ -40,9 +40,9 @@ public record ShipmentBatch(
     }
     
     /**
-     * Calcula el SLA (plazo máximo) según continentes de origen y destino.
-     * Mismo continente: 12 horas (medio día)
-     * Diferentes continentes: 24 horas (1 día)
+    * Calcula el SLA (plazo máximo) según continentes de origen y destino.
+    * Mismo continente: 12 horas (medio día)
+    * Diferentes continentes: 24 horas (1 día)
      * 
      * @return Duration representando el SLA
      */

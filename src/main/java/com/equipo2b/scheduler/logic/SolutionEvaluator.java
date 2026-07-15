@@ -144,15 +144,42 @@ public class SolutionEvaluator {
     
     /**
      * Penalización por cada lote de maletas que no pudo ser asignado a una ruta.
-     * 
+     *
      * <p>Valor: 50,000 puntos por lote no asignado
-     * 
+     *
      * <p>Esta penalización es la más alta para garantizar que los algoritmos
      * prioricen encontrar rutas para todos los lotes antes de optimizar.
-     * 
+     *
      * <p><strong>Validates: Requirement 9.8</strong>
      */
     public static final double PENALTY_UNASSIGNED_BATCH = 50_000.0;
+
+    /**
+     * Micro-recompensa CONTINUA por hora de holgura, SIN tope, como desempate de mesetas.
+     *
+     * <p>El premio principal de holgura (100/h) se topa en 500 pts: por encima de 5 h de
+     * holgura, todos los vecinos empataban exactamente y el GA/Tabú no tenía gradiente que
+     * seguir ("no improvement" instantáneo). Esta escala mínima (100× menor que el premio
+     * principal, 10 000× menor que las penalizaciones duras) rompe los empates y da dirección
+     * de búsqueda sin alterar ninguna decisión de negocio.</p>
+     */
+    public static final double REWARD_SLACK_TIEBREAK_PER_HOUR = 1.0;
+
+    /**
+     * Costo marginal CONVEXO por ocupación de vuelo: α · load²/capacidad por vuelo.
+     *
+     * <p>La penalización dura solo castiga el EXCESO (>100%); entre 0% y 100% el algoritmo
+     * era indiferente y saturaba los vuelos "buenos" primero, adelantando el colapso por
+     * congestión de almacenes intermedios. Este término suave y cuadrático hace que cargar
+     * un vuelo al 90% cueste más que dos al 45% → el GA/Tabú balancea la carga entre rutas
+     * alternativas de forma natural.
+     *
+     * <p>Escala calibrada MUY por debajo de las restricciones duras y del mismo orden que
+     * los premios: dos vuelos de cap 100 con 100 maletas → todo en uno = α·100; repartido
+     * 50/50 = α·50. Con α=2 la diferencia (100 pts) equivale a 1 h de holgura — orienta la
+     * búsqueda sin sacrificar jamás SLA ni factibilidad (que valen 10k-50k pts).
+     */
+    public static final double PENALTY_LOAD_CONVEX_FACTOR = 2.0;
     
     // ==================== Dependencias ====================
     
@@ -218,18 +245,25 @@ public class SolutionEvaluator {
             }
         }
         
-        // Calcular exceso y aplicar penalización
+        // Calcular exceso (restricción dura) + costo marginal convexo de ocupación (suave).
         double penalty = 0.0;
         for (java.util.Map.Entry<com.equipo2b.scheduler.model.Flight, Integer> entry : bagsPerFlight.entrySet()) {
             com.equipo2b.scheduler.model.Flight flight = entry.getKey();
             int assignedBags = entry.getValue();
-            int excess = assignedBags - flight.capacity();
-            
+            int capacity = flight.capacity();
+            int excess = assignedBags - capacity;
+
             if (excess > 0) {
                 penalty += excess * PENALTY_FLIGHT_CAPACITY;
             }
+            if (capacity > 0 && assignedBags > 0) {
+                // α · load²/cap — convexo: presiona a repartir carga entre vuelos alternativos
+                // (retrasa el punto de colapso). Aritmética primitiva, sin asignaciones.
+                double load = assignedBags;
+                penalty += PENALTY_LOAD_CONVEX_FACTOR * (load * load) / capacity;
+            }
         }
-        
+
         return penalty;
     }
     
@@ -359,17 +393,19 @@ public class SolutionEvaluator {
         
         for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
             if (route.meetsSLA()) {
-                // Calcular horas de holgura
+                // Holgura CONTINUA (minutos/60.0, no toHours() truncado): antes dos rutas con
+                // 30 min de diferencia empataban en el fitness — otra fuente de mesetas.
                 java.time.Duration slack = route.getSLASlack();
-                long slackHours = slack.toHours();
-                
-                // Aplicar premio con límite máximo
-                double routeReward = slackHours * REWARD_TIME_SLACK_PER_HOUR;
-                routeReward = Math.min(routeReward, REWARD_TIME_SLACK_MAX);
+                double slackHours = slack.toMinutes() / 60.0;
+
+                // Premio principal con tope (comportamiento de negocio intacto)
+                double routeReward = Math.min(slackHours * REWARD_TIME_SLACK_PER_HOUR, REWARD_TIME_SLACK_MAX);
+                // Desempate continuo sin tope: da gradiente al GA/Tabú más allá del tope de 5h
+                routeReward += slackHours * REWARD_SLACK_TIEBREAK_PER_HOUR;
                 reward += routeReward;
             }
         }
-        
+
         return reward;
     }
     
