@@ -143,16 +143,12 @@ public class SimulationService implements SimulationController.SimulationListene
             List<ShipmentBatch> batches;
             if (scenario == ScenarioType.DAY_TO_DAY) {
                 batches = new ArrayList<>();
-            } else if (scenario == ScenarioType.PERIOD_SIMULATION && currentStartDate != null) {
-                ZonedDateTime endDate = currentStartDate.plusDays(5);
-                batches = dataService.loadShipmentsInRange(
-                    currentAirportManager, clientRegistry, currentStartDate, endDate
-                );
-            } else if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
-                // Colapso: carga incremental por bloques de fecha real (ver
-                // SimulationController.setCollapseChunkLoader) en vez de precargar toda la
-                // semilla de una sola vez — evita materializar los ~9,5 M de registros del
-                // dataset completo en la VM de 2 GB, y evita la ráfaga de datos en el ciclo 1.
+            } else if ((scenario == ScenarioType.PERIOD_SIMULATION && currentStartDate != null)
+                    || scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                // 5 días y colapso: carga incremental por bloques de fecha real (ver
+                // SimulationController.setChunkLoader) en vez de precargar toda la ventana
+                // de una sola vez — el ciclo 1 arranca tras cargar solo el primer bloque
+                // (~1 día) y el resto se pide durante la simulación.
                 batches = new ArrayList<>();
             } else {
                 batches = dataService.loadAllShipments(currentAirportManager, clientRegistry);
@@ -175,16 +171,17 @@ public class SimulationService implements SimulationController.SimulationListene
             );
             activeController.setStartDate(currentStartDate);
 
-            if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
-                // Carga incremental: cada bloque reutiliza el mismo loadShipmentsInRange que
-                // ya usa 5 días, solo que en ventanas chicas repetidas en vez de una sola vez.
+            if (scenario == ScenarioType.COLLAPSE_SIMULATION || scenario == ScenarioType.PERIOD_SIMULATION) {
+                // Carga incremental: cada bloque usa loadShipmentsInRange sobre ventanas
+                // chicas; el uploader posiciona la lectura con búsqueda binaria por fecha,
+                // así cada bloque cuesta solo lo que pesa su ventana (no todo el dataset).
                 AirportManager loaderAirportManager = currentAirportManager;
                 ClientRegistry loaderClientRegistry = clientRegistry;
-                activeController.setCollapseChunkLoader((start, end) -> {
+                activeController.setChunkLoader((start, end) -> {
                     try {
                         return dataService.loadShipmentsInRange(loaderAirportManager, loaderClientRegistry, start, end);
                     } catch (IOException e) {
-                        System.err.println("⚠️ Error cargando bloque de colapso [" + start + " → " + end + "): " + e.getMessage());
+                        System.err.println("⚠️ Error cargando bloque [" + start + " → " + end + "): " + e.getMessage());
                         return new ArrayList<>();
                     }
                 });
@@ -801,8 +798,9 @@ public class SimulationService implements SimulationController.SimulationListene
             status.currentCycle(),
             activeController.getDaysElapsed(),
             currentScenario.getK(),
-            currentScenario.getTa(),
-            currentScenario.getSa(),
+            // Ta y Sa en SEGUNDOS (antes minutos); Sc sigue en minutos simulados.
+            currentScenario.getTaSeconds(),
+            currentScenario.getSaSeconds(),
             currentScenario.getSc(),
             connectedClients,
             formatDate(currentStartedAt),

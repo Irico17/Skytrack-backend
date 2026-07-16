@@ -35,8 +35,8 @@ public class SchedulerFactory {
      * @param shipmentQueue Cola de pedidos
      * @param evaluator Evaluador de fitness
      * @param validator Validador de soluciones
-     * @param Ta Tiempo máximo de algoritmo (minutos)
-     * @param Sa Salto entre ejecuciones (minutos)
+     * @param taSeconds Presupuesto máximo del algoritmo (segundos)
+     * @param saSeconds Salto entre ejecuciones (segundos)
      * @param K Constante de proporcionalidad
      * @return Scheduler configurado con GATS
      */
@@ -46,7 +46,7 @@ public class SchedulerFactory {
             ShipmentQueue shipmentQueue,
             SolutionEvaluator evaluator,
             RouteValidator validator,
-            int Ta, int Sa, int K) {
+            int taSeconds, int saSeconds, int K) {
         
         GeneticAlgorithm ga = new GeneticAlgorithm(flightPlan, airportManager);
         TabuSearch tabu = new TabuSearch(flightPlan, airportManager);
@@ -66,7 +66,7 @@ public class SchedulerFactory {
         tabu.configure(tabuConfig);
 
         return createGATSScheduler(
-            ga, tabu, shipmentQueue, evaluator, validator, Ta, Sa, K, flightPlan, false, null
+            ga, tabu, shipmentQueue, evaluator, validator, taSeconds, saSeconds, K, flightPlan, false, null
         );
     }
 
@@ -77,8 +77,8 @@ public class SchedulerFactory {
             ShipmentQueue shipmentQueue,
             SolutionEvaluator evaluator,
             RouteValidator validator,
-            int Ta, int Sa, int K) {
-        return createGATSScheduler(ga, tabu, shipmentQueue, evaluator, validator, Ta, Sa, K, null, false, null);
+            int taSeconds, int saSeconds, int K) {
+        return createGATSScheduler(ga, tabu, shipmentQueue, evaluator, validator, taSeconds, saSeconds, K, null, false, null);
     }
 
     /**
@@ -91,7 +91,7 @@ public class SchedulerFactory {
             ShipmentQueue shipmentQueue,
             SolutionEvaluator evaluator,
             RouteValidator validator,
-            int Ta, int Sa, int K,
+            int taSeconds, int saSeconds, int K,
             FlightPlan flightPlan,
             boolean partialFillEnabled,
             RouteGenerator fillRouteGenerator) {
@@ -104,7 +104,7 @@ public class SchedulerFactory {
             shipmentQueue,
             evaluator,
             validator,
-            Ta, Sa, K,
+            taSeconds, saSeconds, K,
             flightPlan,
             partialFillEnabled,
             fillRouteGenerator
@@ -126,8 +126,8 @@ public class SchedulerFactory {
      * @param shipmentQueue Cola de pedidos
      * @param evaluator Evaluador de fitness
      * @param validator Validador de soluciones
-     * @param Ta Tiempo máximo de algoritmo (minutos)
-     * @param Sa Salto entre ejecuciones (minutos)
+     * @param taSeconds Presupuesto máximo del algoritmo (segundos)
+     * @param saSeconds Salto entre ejecuciones (segundos)
      * @param K Constante de proporcionalidad
      * @return Scheduler configurado con Tabu puro
      */
@@ -137,7 +137,7 @@ public class SchedulerFactory {
             ShipmentQueue shipmentQueue,
             SolutionEvaluator evaluator,
             RouteValidator validator,
-            int Ta, int Sa, int K) {
+            int taSeconds, int saSeconds, int K) {
         
         // Crear solo Tabu
         TabuSearch tabu = new TabuSearch(flightPlan, airportManager);
@@ -157,7 +157,7 @@ public class SchedulerFactory {
             shipmentQueue,
             evaluator,
             validator,
-            Ta, Sa, K
+            taSeconds, saSeconds, K
         );
     }
 }

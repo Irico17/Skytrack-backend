@@ -170,25 +170,30 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             && effectivePopulationSize >= parallelPopulationThreshold;
     }
 
+    // Niveles adaptativos por volumen. La banda 500-2,500 se recalibró para la ventana de
+    // consumo de 1.5h (Sc=90 min): en época pico (nov-2028) cada ciclo trae ~1,000-1,600
+    // lotes y el presupuesto duro (deadline=70% de Ta) protege el ciclo — medido: pop=10 ×
+    // gens=5 usaba solo 5-9s de los 21s disponibles, así que hay espacio para buscar más
+    // profundo sin riesgo (si la VM se atrasa, el deadline corta y devuelve lo mejor logrado).
     private int effectivePopulationSize(int batchCount) {
         if (batchCount >= 4_000) return Math.min(populationSize, 6);
-        if (batchCount >= 2_000) return Math.min(populationSize, 8);
-        if (batchCount >= 1_000) return Math.min(populationSize, 10);
+        if (batchCount >= 2_000) return Math.min(populationSize, 10);
+        if (batchCount >= 1_000) return Math.min(populationSize, 12);
         if (batchCount >= 500) return Math.min(populationSize, 14);
         return populationSize;
     }
 
     private int effectiveGenerations(int batchCount) {
         if (batchCount >= 4_000) return Math.min(generations, 3);
-        if (batchCount >= 2_000) return Math.min(generations, 4);
-        if (batchCount >= 1_000) return Math.min(generations, 5);
-        if (batchCount >= 500) return Math.min(generations, 7);
+        if (batchCount >= 2_000) return Math.min(generations, 6);
+        if (batchCount >= 1_000) return Math.min(generations, 8);
+        if (batchCount >= 500) return Math.min(generations, 10);
         return generations;
     }
 
     private int effectiveStagnationLimit(int batchCount, int effectiveGenerations) {
         if (batchCount >= 4_000) return Math.min(stagnationLimit, 3);
-        if (batchCount >= 500) return Math.min(stagnationLimit, 4);
+        if (batchCount >= 500) return Math.min(stagnationLimit, 5);
         return Math.min(stagnationLimit, effectiveGenerations);
     }
 

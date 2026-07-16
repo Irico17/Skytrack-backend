@@ -46,6 +46,14 @@ public class SimulationController {
     /** Factor de crecimiento aplicado sobre cada bloque real cargado (Requisito 29.2). */
     private static final double COLLAPSE_GROWTH_FACTOR = 1.23;
     /**
+     * Carga por bloques también para la simulación de 5 DÍAS: bloques de 1 día con margen
+     * de medio día. El primer ciclo arranca tras cargar SOLO el día 1 (~17-21K lotes en
+     * época pico vs ~85K de los 5 días completos) y el resto se pide durante la simulación
+     * — mismo mecanismo que colapso, pero sin factor de crecimiento y acotado a 5 días.
+     */
+    private static final int PERIOD_CHUNK_DAYS = 1;
+    private static final int PERIOD_REFILL_MARGIN_HOURS = 12;
+    /**
      * Umbral de sobrecarga SEVERA por aeropuerto (120% de su capacidad de almacén) y
      * cantidad mínima de aeropuertos en ese estado para declarar colapso. Complementa
      * evaluateWarehouseSaturation (que exige más del 50% de TODA la red): un puñado de
@@ -97,11 +105,13 @@ public class SimulationController {
     private ZonedDateTime startDate;
     private volatile double daysElapsed = 0.0;
 
-    // Carga incremental por bloques de fecha real para el escenario de colapso (evita
-    // precargar todo el volumen de una sola vez). null para los demás escenarios.
-    private java.util.function.BiFunction<ZonedDateTime, ZonedDateTime, List<ShipmentBatch>> collapseChunkLoader;
-    private ZonedDateTime collapseLoadedHorizon;
+    // Carga incremental por bloques de fecha real para COLAPSO y 5 DÍAS (evita precargar
+    // todo el volumen de una sola vez). null para día a día (no usa dataset histórico).
+    private java.util.function.BiFunction<ZonedDateTime, ZonedDateTime, List<ShipmentBatch>> chunkLoader;
+    private ZonedDateTime chunkLoadedHorizon;
     private List<ShipmentBatch> collapseLastNonEmptyChunk;
+    /** Tope de carga por bloques (solo 5 días: inicio + 5 días). Null = sin tope (colapso). */
+    private ZonedDateTime chunkLoadEndBound;
 
     // Condiciones del colapso (cuándo, qué lo provocó y por qué) capturadas al detectarlo.
     private volatile CollapseInfo collapseInfo;
@@ -135,12 +145,13 @@ public class SimulationController {
     /**
      * Define la función que carga un bloque de envíos reales por rango de fecha
      * [start, end). Debe llamarse ANTES de {@link #startSimulation} para
-     * {@link ScenarioType#COLLAPSE_SIMULATION} — permite cargar la semilla y los
-     * refuerzos posteriores en bloques pequeños en vez de todo de una vez.
+     * {@link ScenarioType#COLLAPSE_SIMULATION} y {@link ScenarioType#PERIOD_SIMULATION}
+     * — permite cargar la semilla y los refuerzos posteriores en bloques pequeños en
+     * vez de todo de una vez (arranque mucho más rápido).
      */
-    public void setCollapseChunkLoader(
+    public void setChunkLoader(
             java.util.function.BiFunction<ZonedDateTime, ZonedDateTime, List<ShipmentBatch>> loader) {
-        this.collapseChunkLoader = loader;
+        this.chunkLoader = loader;
     }
 
     /**
@@ -186,7 +197,7 @@ public class SimulationController {
             : null;
         this.scheduler = SchedulerFactory.createGATSScheduler(
             ga, tabu, queue, evaluator, validator,
-            scenario.getTa(), scenario.getSa(), scenario.getK(),
+            scenario.getTaSeconds(), scenario.getSaSeconds(), scenario.getK(),
             flightPlan, PARTIAL_FILL_ENABLED, fillRouteGen
         );
         
@@ -561,12 +572,16 @@ public class SimulationController {
                 // Actualizar estadísticas
                 updateBatchCounters(planningCursor);
 
-                // 1b. Colapso: si el reloj de planificación se acerca al borde de lo cargado,
-                //     pedir el siguiente bloque de datos reales (+ crecimiento) e inyectarlo a
-                //     la cola en marcha — así colapso puede correr indefinidamente sin tope.
-                if (scenario == ScenarioType.COLLAPSE_SIMULATION && collapseChunkLoader != null
-                        && !planningCursor.isBefore(collapseLoadedHorizon.minusDays(COLLAPSE_REFILL_MARGIN_DAYS))) {
-                    refillCollapseChunk();
+                // 1b. Colapso y 5 días: si el reloj de planificación se acerca al borde de lo
+                //     cargado, pedir el siguiente bloque de datos reales e inyectarlo a la cola
+                //     en marcha — colapso corre indefinidamente; 5 días se acota a su ventana.
+                if (chunkLoader != null && chunkLoadedHorizon != null) {
+                    ZonedDateTime refillTrigger = scenario == ScenarioType.COLLAPSE_SIMULATION
+                        ? chunkLoadedHorizon.minusDays(COLLAPSE_REFILL_MARGIN_DAYS)
+                        : chunkLoadedHorizon.minusHours(PERIOD_REFILL_MARGIN_HOURS);
+                    if (!planningCursor.isBefore(refillTrigger)) {
+                        refillChunk(scenario);
+                    }
                 }
 
                 // 2. Avanzar tiempo simulado: basado en tiempo real transcurrido × K
@@ -591,7 +606,7 @@ public class SimulationController {
                 // así que el "colapso por complejidad algorítmica" deja de ser un gatillo válido
                 // (daría falsos positivos). El colapso se declara solo por SATURACIÓN logística.
                 if (scenario == ScenarioType.COLLAPSE_SIMULATION
-                        && algorithmMs > scenario.getTa() * 60_000L * 3) {
+                        && algorithmMs > scenario.getTaSeconds() * 1000L * 3) {
                     System.out.println("\n⚠️  Ciclo de colapso muy lento (>3×Ta) — posible sobrecarga de la VM");
                 }
 
@@ -667,19 +682,19 @@ public class SimulationController {
                     break;
                 }
 
-                // 6. Esperar Sa minutos reales desde el INICIO del ciclo (no desde el fin del algoritmo)
-                //    Esto mantiene el ritmo constante: ciclos cada Sa minutos reales
-                long saMs = scenario.getSa() * 60_000L;
+                // 6. Esperar Sa segundos reales desde el INICIO del ciclo (no desde el fin del algoritmo)
+                //    Esto mantiene el ritmo constante: ciclos cada Sa segundos reales
+                long saMs = scenario.getSaSeconds() * 1000L;
                 long elapsedInCycleMs = System.currentTimeMillis() - cycleStartRealMs;
                 long remainingMs = saMs - elapsedInCycleMs;
 
                 if (remainingMs > 0) {
-                    System.out.printf("⏳ Algoritmo terminó en %.1fs — esperando %.1fs hasta el siguiente ciclo (Sa=%d min)%n",
-                        algorithmMs / 1000.0, remainingMs / 1000.0, scenario.getSa());
+                    System.out.printf("⏳ Algoritmo terminó en %.1fs — esperando %.1fs hasta el siguiente ciclo (Sa=%ds)%n",
+                        algorithmMs / 1000.0, remainingMs / 1000.0, scenario.getSaSeconds());
                     sleepUntilNextCycle(remainingMs);
                 } else {
-                    System.out.printf("⚠️ Algoritmo tardó %.1fs (> Sa=%d min) — siguiente ciclo inmediato%n",
-                        algorithmMs / 1000.0, scenario.getSa());
+                    System.out.printf("⚠️ Algoritmo tardó %.1fs (> Sa=%ds) — siguiente ciclo inmediato%n",
+                        algorithmMs / 1000.0, scenario.getSaSeconds());
                 }
             }
             
@@ -904,12 +919,23 @@ public class SimulationController {
                 // carga de archivo durante la ejecución — nunca del dataset de simulación.
                 return List.of();
                 
-            case PERIOD_SIMULATION:
-                // Usar todos los lotes reales cargados para la ventana seleccionada.
-                // El filtrado por fecha/hora se realiza antes, en SimulationService.
-                return historical;
-                
-            case COLLAPSE_SIMULATION:
+            case PERIOD_SIMULATION: {
+                // Carga por bloques también aquí: el ciclo 1 arranca tras cargar SOLO el
+                // primer día de datos; los 4 días restantes se piden durante la simulación
+                // (el mismo mecanismo que colapso, sin crecimiento y acotado a 5 días).
+                // Fallback: sin chunkLoader o sin fecha de inicio, usa lo precargado.
+                if (chunkLoader == null || startDate == null) {
+                    return historical;
+                }
+                ZonedDateTime chunkStart = startDate;
+                ZonedDateTime chunkEnd = chunkStart.plusDays(PERIOD_CHUNK_DAYS);
+                chunkLoadEndBound = chunkStart.plusDays(5);
+                List<ShipmentBatch> firstChunk = chunkLoader.apply(chunkStart, chunkEnd);
+                chunkLoadedHorizon = chunkEnd;
+                return firstChunk;
+            }
+
+            case COLLAPSE_SIMULATION: {
                 // Carga incremental por bloques de fecha real (COLLAPSE_CHUNK_DAYS días a la
                 // vez) en vez de precargar TODO el volumen de golpe: evita la ráfaga enorme en
                 // el ciclo 1 y el riesgo de memoria de materializar cientos de miles de lotes
@@ -917,14 +943,16 @@ public class SimulationController {
                 // durante la simulación (ver runSimulation) a medida que el reloj avanza.
                 ZonedDateTime chunkStart = startDate != null ? startDate : ZonedDateTime.now();
                 ZonedDateTime chunkEnd = chunkStart.plusDays(COLLAPSE_CHUNK_DAYS);
-                List<ShipmentBatch> firstChunk = collapseChunkLoader != null
-                    ? collapseChunkLoader.apply(chunkStart, chunkEnd)
+                List<ShipmentBatch> firstChunk = chunkLoader != null
+                    ? chunkLoader.apply(chunkStart, chunkEnd)
                     : historical;
-                collapseLoadedHorizon = chunkEnd;
+                chunkLoadedHorizon = chunkEnd;
+                chunkLoadEndBound = null; // colapso no tiene tope: corre hasta colapsar
                 if (!firstChunk.isEmpty()) {
                     collapseLastNonEmptyChunk = firstChunk;
                 }
                 return buildCollapseBlock(firstChunk);
+            }
 
             default:
                 throw new IllegalArgumentException("Escenario desconocido: " + scenario);
@@ -951,25 +979,42 @@ public class SimulationController {
     }
 
     /**
-     * Pide el siguiente bloque de fecha real de colapso, le aplica el crecimiento y lo
-     * inyecta en la cola del scheduler EN MARCHA (sin reiniciar nada). Se llama desde el
-     * bucle principal cuando el reloj simulado se acerca al borde de lo ya cargado.
+     * Pide el siguiente bloque de fecha real (colapso: + crecimiento; 5 días: tal cual,
+     * acotado al fin de la ventana) y lo inyecta en la cola del scheduler EN MARCHA.
+     * Se llama desde el bucle principal cuando el reloj simulado se acerca al borde
+     * de lo ya cargado.
      */
-    private void refillCollapseChunk() {
-        ZonedDateTime nextStart = collapseLoadedHorizon;
-        ZonedDateTime nextEnd = nextStart.plusDays(COLLAPSE_CHUNK_DAYS);
-        List<ShipmentBatch> nextChunk = collapseChunkLoader.apply(nextStart, nextEnd);
-        if (!nextChunk.isEmpty()) {
-            collapseLastNonEmptyChunk = nextChunk;
+    private void refillChunk(ScenarioType scenario) {
+        ZonedDateTime nextStart = chunkLoadedHorizon;
+        int chunkDays = scenario == ScenarioType.COLLAPSE_SIMULATION ? COLLAPSE_CHUNK_DAYS : PERIOD_CHUNK_DAYS;
+        ZonedDateTime nextEnd = nextStart.plusDays(chunkDays);
+        if (chunkLoadEndBound != null && nextEnd.isAfter(chunkLoadEndBound)) {
+            nextEnd = chunkLoadEndBound;
         }
-        List<ShipmentBatch> block = buildCollapseBlock(nextChunk);
+        if (!nextStart.isBefore(nextEnd)) {
+            return; // 5 días: ya se cargó toda la ventana
+        }
+
+        List<ShipmentBatch> nextChunk = chunkLoader.apply(nextStart, nextEnd);
+        List<ShipmentBatch> block;
+        if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+            if (!nextChunk.isEmpty()) {
+                collapseLastNonEmptyChunk = nextChunk;
+            }
+            block = buildCollapseBlock(nextChunk);
+        } else {
+            block = nextChunk;
+        }
         for (ShipmentBatch batch : block) {
             scheduler.addShipment(batch);
         }
         currentBatches.addAll(block);
-        collapseLoadedHorizon = nextEnd;
-        System.out.printf("➕ Colapso: bloque [%s → %s) cargado — %,d lotes reales + crecimiento (%,d total)%n",
-            nextStart.toLocalDate(), nextEnd.toLocalDate(), nextChunk.size(), block.size());
+        chunkLoadedHorizon = nextEnd;
+        System.out.printf("➕ %s: bloque [%s → %s) cargado — %,d lotes reales%s (%,d total)%n",
+            scenario == ScenarioType.COLLAPSE_SIMULATION ? "Colapso" : "5 días",
+            nextStart.toLocalDate(), nextEnd.toLocalDate(), nextChunk.size(),
+            scenario == ScenarioType.COLLAPSE_SIMULATION ? " + crecimiento" : "",
+            block.size());
     }
 
     /**
@@ -996,7 +1041,7 @@ public class SimulationController {
                 gaConfig.setInt("populationSize", 20);
                 gaConfig.setInt("generations", 10);
                 gaConfig.setDouble("mutationRate", 0.1);
-                gaConfig.setInt("stagnationLimit", 4);
+                gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 10);
                 gaConfig.setInt("routeCachedVariants", 3);
@@ -1013,7 +1058,7 @@ public class SimulationController {
                 gaConfig.setInt("populationSize", 20);
                 gaConfig.setInt("generations", 10);
                 gaConfig.setDouble("mutationRate", 0.1);
-                gaConfig.setInt("stagnationLimit", 4);
+                gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 10);
                 gaConfig.setInt("routeCachedVariants", 3);
@@ -1027,7 +1072,7 @@ public class SimulationController {
 
         // Presupuesto de tiempo duro por ciclo (deadline): el algoritmo nunca excede Ta.
         // GA ~70% y Tabú ~25% de Ta (5% de margen para evaluación/acumulación).
-        long taMs = scenario.getTa() * 60_000L;
+        long taMs = scenario.getTaSeconds() * 1000L;
         gaConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.70));
         tabuConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.25));
 

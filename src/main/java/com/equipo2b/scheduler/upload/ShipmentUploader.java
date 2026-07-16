@@ -5,10 +5,17 @@ import com.equipo2b.scheduler.model.AirportManager;
 import com.equipo2b.scheduler.model.ClientRegistry;
 import com.equipo2b.scheduler.model.ShipmentBatch;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -77,23 +84,32 @@ public class ShipmentUploader {
         String startDateStr = start != null ? String.format("%04d%02d%02d", start.getYear(), start.getMonthValue(), start.getDayOfMonth()) : null;
         String endDateStr = end != null ? String.format("%04d%02d%02d", end.getYear(), end.getMonthValue(), end.getDayOfMonth()) : null;
 
-        // Lectura en streaming con corte temprano (no se puede romper un forEach,
-        // por eso iteramos explícitamente y paramos al alcanzar maxRecords).
-        try (Stream<String> lines = Files.lines(path)) {
-            java.util.Iterator<String> it = lines.iterator();
-            while (it.hasNext() && shipments.size() < maxRecords) {
-                String line = it.next();
+        // Los archivos _envios_*.txt están ordenados cronológicamente y cubren ~3 años
+        // (ene-2026 → ene-2029). El corte por fecha fin (break) ya evitaba leer la cola,
+        // pero llegar a una fecha de inicio TARDÍA obligaba a leer y descartar línea por
+        // línea todo lo anterior (para nov-2028: 8.4M de 9.5M líneas, el 87% del dataset)
+        // — ese salto lineal dominaba el arranque de la simulación. La búsqueda binaria
+        // por offset de bytes posiciona la lectura directamente en la primera línea de la
+        // ventana (~20 seeks por archivo), así el costo depende SOLO del tamaño de la
+        // ventana pedida y no de qué tan tardía sea la fecha elegida.
+        long startOffset = startDateStr != null ? findStartOffset(path, startDateStr) : 0L;
+        if (startOffset >= Files.size(path)) {
+            return shipments; // todo el archivo es anterior a la ventana pedida
+        }
+
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            channel.position(startOffset);
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(Channels.newInputStream(channel), StandardCharsets.UTF_8));
+            String line;
+            while ((line = reader.readLine()) != null && shipments.size() < maxRecords) {
                 int currentLine = lineNumber.incrementAndGet();
 
                 if (line.isBlank()) {
                     continue;
                 }
 
-                // Filtrado temprano ultra-rápido por fecha (formato YYYYMMDD).
-                // Los archivos _envios_*.txt están ordenados cronológicamente, así que
-                // una vez superada la fecha de fin podemos CORTAR el archivo (no seguir
-                // leyendo millones de líneas posteriores fuera de la ventana). Esto reduce
-                // drásticamente el arranque de la simulación de 5 días.
+                // Filtro exacto por línea (red de seguridad tras el seek) + corte por fecha fin.
                 if (startDateStr != null || endDateStr != null) {
                     int firstDash = line.indexOf('-');
                     if (firstDash > 0 && line.length() >= firstDash + 9) {
@@ -109,7 +125,8 @@ public class ShipmentUploader {
                     shipments.add(batch);
                 } catch (Exception e) {
                     throw new IllegalArgumentException(
-                        String.format("Error en línea %d: %s", currentLine, e.getMessage()),
+                        String.format("Error en línea %d (desde offset %d): %s",
+                            currentLine, startOffset, e.getMessage()),
                         e
                     );
                 }
@@ -117,6 +134,152 @@ public class ShipmentUploader {
         }
 
         return shipments;
+    }
+
+    /**
+     * Offset de bytes de la PRIMERA línea cuya fecha (YYYYMMDD tras el primer '-') es
+     * mayor o igual a {@code startDateStr}, mediante búsqueda binaria sobre el archivo
+     * ordenado cronológicamente. Devuelve el tamaño del archivo si todas las líneas son
+     * anteriores a la fecha. Tolera líneas en blanco y CRLF/LF.
+     *
+     * <p>Los probes leen BLOQUES de 8 KB (no byte a byte): RandomAccessFile.readLine()
+     * hace un syscall por byte, y sobre sistemas de archivos con syscalls caros (el mount
+     * 9P de WSL, discos de red) eso convertía los ~20 probes por archivo en segundos.</p>
+     */
+    static long findStartOffset(Path path, String startDateStr) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r")) {
+            long length = raf.length();
+            if (length == 0) return 0;
+            BlockReader reader = new BlockReader(raf, length);
+
+            String firstDate = reader.dateOfLineAt(0);
+            if (firstDate == null || firstDate.compareTo(startDateStr) >= 0) {
+                return 0;
+            }
+
+            // Invariante: en `lo` empieza una línea con fecha < objetivo; la respuesta está
+            // detrás de `lo`. `hi` acota por la derecha (la respuesta es <= primera línea
+            // completa después de `hi`). Se bisecta hasta ventana chica y se remata lineal.
+            long lo = 0;
+            long hi = length;
+            while (hi - lo > 4096) {
+                long mid = (lo + hi) >>> 1;
+                long lineStart = reader.nextLineStart(mid);
+                if (lineStart >= length) {
+                    hi = mid;
+                    continue;
+                }
+                String date = reader.dateOfLineAt(lineStart);
+                if (date == null || date.compareTo(startDateStr) >= 0) {
+                    hi = mid;
+                } else {
+                    lo = lineStart;
+                }
+            }
+
+            // Remate lineal desde `lo` (inicio de línea garantizado) hasta la primera fecha >= objetivo.
+            long lineStart = lo;
+            while (lineStart < length) {
+                String line = reader.lineAt(lineStart);
+                if (line == null) break;
+                String date = extractLineDate(line);
+                if (date != null && date.compareTo(startDateStr) >= 0) {
+                    return lineStart;
+                }
+                lineStart = reader.afterLine(lineStart, line);
+            }
+            return length;
+        }
+    }
+
+    /**
+     * Lector posicional con buffer de bloque sobre RandomAccessFile: cada probe de la
+     * búsqueda binaria cuesta a lo sumo una lectura de 8 KB en vez de un syscall por byte.
+     */
+    private static final class BlockReader {
+        private static final int BLOCK = 8_192;
+        private final RandomAccessFile raf;
+        private final long length;
+        private final byte[] buf = new byte[BLOCK];
+        private long bufStart = -1;
+        private int bufLen = 0;
+
+        BlockReader(RandomAccessFile raf, long length) {
+            this.raf = raf;
+            this.length = length;
+        }
+
+        private int byteAt(long pos) throws IOException {
+            if (pos >= length) return -1;
+            if (bufStart < 0 || pos < bufStart || pos >= bufStart + bufLen) {
+                raf.seek(pos);
+                bufLen = raf.read(buf);
+                bufStart = pos;
+                if (bufLen <= 0) return -1;
+            }
+            return buf[(int) (pos - bufStart)] & 0xFF;
+        }
+
+        /** Línea que EMPIEZA en {@code pos} (sin terminador, con \r final removido); null en EOF. */
+        String lineAt(long pos) throws IOException {
+            if (pos >= length) return null;
+            StringBuilder sb = new StringBuilder(64);
+            long p = pos;
+            int b;
+            while ((b = byteAt(p)) != -1 && b != '\n') {
+                sb.append((char) b);
+                p++;
+            }
+            int len = sb.length();
+            if (len > 0 && sb.charAt(len - 1) == '\r') sb.setLength(len - 1);
+            return sb.toString();
+        }
+
+        /** Offset inmediatamente después de la línea {@code line} que empieza en {@code pos}. */
+        long afterLine(long pos, String line) throws IOException {
+            long p = pos + line.length();
+            int b = byteAt(p);
+            if (b == '\r') { p++; b = byteAt(p); }
+            if (b == '\n') p++;
+            return p;
+        }
+
+        /** Offset del inicio de la primera línea COMPLETA estrictamente después de {@code pos}. */
+        long nextLineStart(long pos) throws IOException {
+            long p = pos;
+            int b;
+            while ((b = byteAt(p)) != -1 && b != '\n') {
+                p++;
+            }
+            return b == -1 ? length : p + 1;
+        }
+
+        /**
+         * Fecha (YYYYMMDD) de la primera línea parseable desde {@code lineStart}; salta hasta
+         * 5 líneas en blanco/malformadas. Null si no encuentra ninguna (se trata como fin).
+         */
+        String dateOfLineAt(long lineStart) throws IOException {
+            long p = lineStart;
+            for (int i = 0; i < 5 && p < length; i++) {
+                String line = lineAt(p);
+                if (line == null) return null;
+                String date = extractLineDate(line);
+                if (date != null) return date;
+                p = afterLine(p, line);
+            }
+            return null;
+        }
+    }
+
+    /** Extrae la fecha YYYYMMDD tras el primer '-' de una línea de envíos, o null. */
+    private static String extractLineDate(String line) {
+        int firstDash = line.indexOf('-');
+        if (firstDash <= 0 || line.length() < firstDash + 9) return null;
+        String date = line.substring(firstDash + 1, firstDash + 9);
+        for (int i = 0; i < 8; i++) {
+            if (!Character.isDigit(date.charAt(i))) return null;
+        }
+        return date;
     }
     
     /**

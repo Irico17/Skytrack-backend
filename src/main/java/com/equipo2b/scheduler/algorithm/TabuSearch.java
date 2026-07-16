@@ -35,16 +35,20 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int routeCachedVariants = 2;
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
 
+    // Recalibrado para la ventana de consumo de 1.5h (~1,000-1,600 rutas por ciclo en época
+    // pico): el refinamiento tiene su propio presupuesto duro (deadline=25% de Ta) que corta
+    // a tiempo, así que puede explorar más vecinos que con los topes ultraconservadores
+    // pensados para ventanas de 6h. Sobre 2,500 rutas se sigue omitiendo por costo de copia.
     private int effectiveMaxIterations(int routeCount) {
-        if (routeCount >= 2_000) return 0;
-        if (routeCount >= 1_000) return Math.min(maxIterations, 4);
-        if (routeCount >= 500) return Math.min(maxIterations, 8);
+        if (routeCount >= 2_500) return 0;
+        if (routeCount >= 1_000) return Math.min(maxIterations, 10);
+        if (routeCount >= 500) return Math.min(maxIterations, 14);
         return maxIterations;
     }
 
     private int effectiveNeighborhoodSize(int routeCount) {
-        if (routeCount >= 1_000) return Math.min(neighborhoodSize, 3);
-        if (routeCount >= 500) return Math.min(neighborhoodSize, 4);
+        if (routeCount >= 1_000) return Math.min(neighborhoodSize, 4);
+        if (routeCount >= 500) return Math.min(neighborhoodSize, 5);
         return neighborhoodSize;
     }
     

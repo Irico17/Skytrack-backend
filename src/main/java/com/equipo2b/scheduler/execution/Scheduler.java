@@ -22,10 +22,10 @@ import java.util.*;
  * </ul>
  * 
  * Parámetros:
- * - Ta: Tiempo máximo de ejecución del algoritmo (minutos)
- * - Sa: Salto entre ejecuciones del algoritmo (minutos)
+ * - Ta: Presupuesto máximo de ejecución del algoritmo (segundos; deadline duro)
+ * - Sa: Salto entre ejecuciones del algoritmo (segundos)
  * - K: Constante de proporcionalidad para consumo de datos
- * - Sc = Sa × K: Salto de consumo de datos (minutos)
+ * - Sc = Sa × K: Salto de consumo de datos (minutos simulados)
  * 
  * **Validates: Requirements 21.5, 22.4, 23.1, 34.1, 34.2, Caso de estudio punto a, b**
  */
@@ -47,10 +47,10 @@ public class Scheduler {
     private static final int MIN_FILL_BAGS = 1;
     
     // Parámetros de configuración
-    private final int Ta;  // Tiempo algoritmo (minutos)
-    private final int Sa;  // Salto algoritmo (minutos)
-    private final int K;   // Constante proporcionalidad
-    private final int Sc;  // Salto consumo = Sa × K (minutos)
+    private final int taSeconds;  // Presupuesto del algoritmo (segundos)
+    private final int saSeconds;  // Salto entre ejecuciones (segundos)
+    private final int K;          // Constante proporcionalidad
+    private final int Sc;         // Salto consumo = Sa × K (minutos simulados)
     
     // Solución actual del sistema
     private Solution currentSolution;
@@ -65,8 +65,8 @@ public class Scheduler {
      * @param shipmentQueue Cola de pedidos pendientes
      * @param evaluator Evaluador de fitness
      * @param validator Validador de soluciones
-     * @param Ta Tiempo máximo de algoritmo (minutos)
-     * @param Sa Salto entre ejecuciones (minutos)
+     * @param taSeconds Presupuesto máximo del algoritmo (segundos)
+     * @param saSeconds Salto entre ejecuciones (segundos)
      * @param K Constante de proporcionalidad
      * 
      * **Validates: Requirements 21.5, 22.4, 23.1, 34.1, 34.2, Caso de estudio punto a, b**
@@ -78,9 +78,9 @@ public class Scheduler {
                     ShipmentQueue shipmentQueue,
                     SolutionEvaluator evaluator,
                     RouteValidator validator,
-                    int Ta, int Sa, int K) {
+                    int taSeconds, int saSeconds, int K) {
         this(primaryAlgorithm, tabuSearch, algorithmType, useRefinement,
-             shipmentQueue, evaluator, validator, Ta, Sa, K, null, false, null);
+             shipmentQueue, evaluator, validator, taSeconds, saSeconds, K, null, false, null);
     }
 
     /** Constructor con relleno de capacidad por sub-lotes opcional (directo + multi-hop). */
@@ -91,7 +91,7 @@ public class Scheduler {
                     ShipmentQueue shipmentQueue,
                     SolutionEvaluator evaluator,
                     RouteValidator validator,
-                    int Ta, int Sa, int K,
+                    int taSeconds, int saSeconds, int K,
                     FlightPlan flightPlan,
                     boolean partialFillEnabled,
                     RouteGenerator fillRouteGenerator) {
@@ -105,21 +105,28 @@ public class Scheduler {
         this.shipmentQueue = Objects.requireNonNull(shipmentQueue, "Shipment queue cannot be null");
         this.evaluator = Objects.requireNonNull(evaluator, "Evaluator cannot be null");
         this.validator = Objects.requireNonNull(validator, "Validator cannot be null");
-        
-        this.Ta = Ta;
-        this.Sa = Sa;
+
+        this.taSeconds = taSeconds;
+        this.saSeconds = saSeconds;
         this.K = K;
-        this.Sc = Sa * K;
-        
+        // Sc en minutos simulados; Sa ahora es segundos → Sa×K debe ser múltiplo de 60
+        long scSeconds = (long) saSeconds * K;
+        if (scSeconds % 60 != 0) {
+            throw new IllegalArgumentException(
+                String.format("Sa (%ds) × K (%d) = %ds no es un número entero de minutos", saSeconds, K, scSeconds)
+            );
+        }
+        this.Sc = (int) (scSeconds / 60);
+
         // Validar Sa >= Ta. Se permite Sa == Ta porque el algoritmo respeta un
         // presupuesto de tiempo duro (deadline = Ta) dentro de GA/Tabu: nunca excede Ta,
         // y la cadencia (Sa) puede igualar Ta para usar todo el CPU sin tiempo muerto.
-        if (Sa < Ta) {
+        if (saSeconds < taSeconds) {
             throw new IllegalArgumentException(
-                String.format("Sa (%d) must be >= Ta (%d)", Sa, Ta)
+                String.format("Sa (%ds) must be >= Ta (%ds)", saSeconds, taSeconds)
             );
         }
-        
+
         this.currentSolution = new Solution();
     }
     
@@ -228,7 +235,7 @@ public class Scheduler {
         
         // 8. Registrar tiempo de ejecución y verificar que sea <= Ta
         long totalTime = primaryTime + refinementTime;
-        long taMillis = Ta * 60 * 1000L;
+        long taMillis = taSeconds * 1000L;
         
         System.out.println("\nTiempo total: " + totalTime + " ms (límite: " + taMillis + " ms)");
         
@@ -532,7 +539,7 @@ public class Scheduler {
         System.out.println("=".repeat(80));
         System.out.println("INICIANDO SCHEDULER");
         System.out.println("Algoritmo: " + algorithmType.getDisplayName());
-        System.out.println("Parámetros: Ta=" + Ta + " min, Sa=" + Sa + " min, K=" + K + ", Sc=" + Sc + " min");
+        System.out.println("Parámetros: Ta=" + taSeconds + "s, Sa=" + saSeconds + "s, K=" + K + ", Sc=" + Sc + " min");
         System.out.println("=".repeat(80));
         
         ZonedDateTime currentTime = startTime;

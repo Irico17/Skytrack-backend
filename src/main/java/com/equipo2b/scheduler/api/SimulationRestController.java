@@ -71,8 +71,9 @@ public class SimulationRestController {
             response.put("message", result.joinedExisting() ? "Unido a la simulación activa" : "Simulación iniciada exitosamente");
             response.put("scenario", req.scenario());
             response.put("K", scenario.getK());
-            response.put("Ta", scenario.getTa());
-            response.put("Sa", scenario.getSa());
+            // Ta y Sa ahora se expresan en SEGUNDOS (antes minutos); Sc sigue en minutos.
+            response.put("Ta", scenario.getTaSeconds());
+            response.put("Sa", scenario.getSaSeconds());
             response.put("Sc", scenario.getSc());
             response.put("simStartTime", simStartTime);
             response.put("totalRealMinutes", totalRealMinutes);
