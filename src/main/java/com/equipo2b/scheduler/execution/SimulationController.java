@@ -558,6 +558,18 @@ public class SimulationController {
                 ZonedDateTime cycleHorizon = cyclePlanningTime.plusMinutes(scenario.getSc());
                 simulatedClockHorizon = cycleHorizon;
                 
+                // 0b. Línea base de almacenes: ocupación REAL de cada aeropuerto al inicio de
+                //     la ventana, según las rutas YA planificadas en ciclos anteriores. Sin
+                //     esto, el GA/Tabú evaluaba cada ciclo en el vacío (un hub casi lleno por
+                //     rutas previas parecía vacío) y seguía concentrando carga hasta el
+                //     colapso. Con la base, el desborde duro y el balanceo convexo del
+                //     evaluador ven la ocupación absoluta.
+                if (currentCycle > 1 && inventoryService != null && currentSolution != null
+                        && !currentSolution.getRoutes().isEmpty()) {
+                    scheduler.setStorageBaseline(inventoryService.calculateCurrentBags(
+                        currentSolution, cyclePlanningTime, currentBatches));
+                }
+
                 // 1. Ejecutar algoritmo sobre una ventana de consumo discreta y secuencial.
                 //    Si el algoritmo se demora, el siguiente ciclo no salta datos: continúa
                 //    desde cycleHorizon, no desde el reloj de pared.

@@ -165,29 +165,37 @@ public class Scheduler {
             return currentSolution;
         }
         
-        // 3. Ejecutar algoritmo primario con pedidos consumidos
+        // 3. Ejecutar algoritmo primario con pedidos consumidos.
+        //    La línea base de almacenes (carga de ciclos previos) se aplica SOLO durante
+        //    la optimización de la ventana nueva: los candidatos del ciclo se evalúan
+        //    contra la ocupación absoluta real de cada almacén.
+        applyStorageBaseline(pendingStorageBaseline);
         long startTime = System.currentTimeMillis();
         String algorithmName = algorithmType == AlgorithmType.GATS ? "Algoritmo Genético" : "Búsqueda Tabú";
         System.out.println("\nEjecutando " + algorithmName + "...");
         Solution primarySolution = primaryAlgorithm.optimize(batches);
         long primaryTime = System.currentTimeMillis() - startTime;
-        
+
         System.out.println("✓ " + algorithmName + " completado en " + primaryTime + " ms");
         System.out.println("  Fitness: " + String.format("%.2f", primarySolution.getFitness()));
-        
+
         Solution finalSolution = primarySolution;
         long refinementTime = 0;
-        
+
         // 4. Refinar con Búsqueda Tabú (solo para GATS)
         if (useRefinement) {
             startTime = System.currentTimeMillis();
             System.out.println("\nRefinando con Búsqueda Tabú...");
             finalSolution = tabuSearch.refine(primarySolution);
             refinementTime = System.currentTimeMillis() - startTime;
-            
+
             System.out.println("✓ Refinamiento completado en " + refinementTime + " ms");
             System.out.println("  Fitness mejorado: " + String.format("%.2f", finalSolution.getFitness()));
         }
+
+        // Retirar la línea base ANTES de evaluar la solución ACUMULADA: la acumulada ya
+        // contiene las rutas de ciclos previos — mantener la base contaría su carga 2 veces.
+        applyStorageBaseline(null);
         
         // 5. ACUMULAR rutas nuevas a la solución existente (PLANIFICACIÓN INCREMENTAL)
         Solution accumulatedSolution = new Solution(currentSolution);
@@ -586,6 +594,29 @@ public class Scheduler {
      */
     public void addShipment(ShipmentBatch batch) {
         shipmentQueue.addShipment(batch);
+    }
+
+    /**
+     * Registra la ocupación de almacén preexistente (rutas ya planificadas en ciclos
+     * anteriores) para el PRÓXIMO ciclo. Se aplica a los evaluadores de GA/Tabú solo
+     * mientras se optimiza la ventana nueva, y se retira antes de re-evaluar la solución
+     * ACUMULADA (que ya contiene esas rutas — mantenerla contaría la carga dos veces).
+     */
+    public void setStorageBaseline(Map<Airport, Integer> baseline) {
+        this.pendingStorageBaseline = baseline;
+    }
+
+    private Map<Airport, Integer> pendingStorageBaseline;
+
+    /** Aplica (o retira, con null) la línea base en TODOS los evaluadores involucrados. */
+    private void applyStorageBaseline(Map<Airport, Integer> baseline) {
+        evaluator.setStorageBaseline(baseline);
+        if (primaryAlgorithm instanceof GeneticAlgorithm ga) {
+            ga.setStorageBaseline(baseline);
+        } else if (primaryAlgorithm instanceof TabuSearch tabuPrimary) {
+            tabuPrimary.setStorageBaseline(baseline);
+        }
+        tabuSearch.setStorageBaseline(baseline);
     }
 
     /**

@@ -180,6 +180,22 @@ public class SolutionEvaluator {
      * búsqueda sin sacrificar jamás SLA ni factibilidad (que valen 10k-50k pts).
      */
     public static final double PENALTY_LOAD_CONVEX_FACTOR = 2.0;
+
+    /**
+     * Costo marginal CONVEXO por ocupación PICO de almacén: β · pico²/capacidad por aeropuerto.
+     *
+     * <p>Requisito del curso: la red debe repartir la carga entre TODOS los almacenes —
+     * un aeropuerto al 90% mientras otros cinco están al 10% es una mala solución aunque
+     * nadie exceda su capacidad (por eso existen las rutas con escalas). La penalización
+     * dura de almacén solo castiga el DESBORDE; entre 0% y 100% el algoritmo era
+     * indiferente y concentraba tránsito en los mismos hubs. Igual que el término convexo
+     * de vuelos: concentrar 400 maletas en un almacén de 440 cuesta β·400²/440 ≈ 727 pts,
+     * repartirlas 200/200 entre dos hubs ≈ 363 pts → el GA/Tabú prefiere repartir.</p>
+     *
+     * <p>Del mismo orden que los premios (cientos de puntos) y muy por debajo de las
+     * restricciones duras (10k-50k): balancea sin sacrificar SLA ni factibilidad.</p>
+     */
+    public static final double PENALTY_STORAGE_CONVEX_FACTOR = 2.0;
     
     // ==================== Dependencias ====================
     
@@ -192,6 +208,20 @@ public class SolutionEvaluator {
      * Usar setExpectedBatchCount() para configurar antes de la evaluación.
      */
     private volatile int expectedBatchCount = 0;
+
+    /**
+     * Ocupación de almacén YA EXISTENTE por aeropuerto al inicio de la ventana del ciclo
+     * (maletas de rutas planificadas en ciclos anteriores que están físicamente en tránsito).
+     *
+     * <p>Sin esto, el GA/Tabú evaluaba cada ciclo EN EL VACÍO: un almacén al borde del
+     * desborde por rutas de ciclos previos parecía vacío al planificar rutas nuevas, y el
+     * algoritmo seguía metiéndole carga hasta el colapso. Con la línea base, tanto el
+     * desborde duro como el término convexo de balanceo ven la ocupación absoluta real.</p>
+     *
+     * <p>Mapa de solo lectura (se reemplaza por referencia cada ciclo) → seguro para las
+     * evaluaciones concurrentes del GA.</p>
+     */
+    private volatile java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> storageBaseline = java.util.Map.of();
     
     /**
      * Constructor que inicializa el evaluador con las dependencias necesarias.
@@ -214,11 +244,19 @@ public class SolutionEvaluator {
     /**
      * Establece la cantidad esperada de lotes para penalizar lotes no asignados.
      * Llamar antes de las evaluaciones en el loop de optimización.
-     * 
+     *
      * @param count Cantidad total de lotes esperados (0 = no penalizar)
      */
     public void setExpectedBatchCount(int count) {
         this.expectedBatchCount = count;
+    }
+
+    /**
+     * Fija la ocupación de almacén preexistente por aeropuerto (rutas de ciclos previos)
+     * para que las evaluaciones del ciclo vean la carga absoluta real. Null = sin base.
+     */
+    public void setStorageBaseline(java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> baseline) {
+        this.storageBaseline = baseline != null ? baseline : java.util.Map.of();
     }
     
     // ==================== Métodos de Evaluación ====================
@@ -284,34 +322,50 @@ public class SolutionEvaluator {
         for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
             allEvents.addAll(route.getStorageEvents());
         }
-        
+
         // Ordenar eventos por timestamp
         allEvents.sort(java.util.Comparator.comparing(com.equipo2b.scheduler.model.StorageEvent::timestamp));
-        
-        // Simular ocupación a lo largo del tiempo
+
+        // Simular ocupación a lo largo del tiempo, partiendo de la carga preexistente
+        // (rutas de ciclos anteriores) para que el ciclo vea la ocupación absoluta real.
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> baseline = this.storageBaseline;
         java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> currentOccupancy = new java.util.HashMap<>();
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> peakOccupancy = new java.util.HashMap<>();
         double penalty = 0.0;
-        
+
         for (com.equipo2b.scheduler.model.StorageEvent event : allEvents) {
             com.equipo2b.scheduler.model.Airport airport = event.airport();
             int quantity = event.quantity();
-            
-            // Actualizar ocupación según tipo de evento
-            int newOccupancy;
-            if (event.type() == com.equipo2b.scheduler.model.StorageEventType.ARRIVAL) {
-                newOccupancy = currentOccupancy.getOrDefault(airport, 0) + quantity;
-            } else { // DEPARTURE
-                newOccupancy = currentOccupancy.getOrDefault(airport, 0) - quantity;
-            }
+
+            // Actualizar ocupación según tipo de evento (arranca desde la línea base)
+            int previous = currentOccupancy.computeIfAbsent(
+                airport, a -> baseline.getOrDefault(a, 0));
+            int newOccupancy = event.type() == com.equipo2b.scheduler.model.StorageEventType.ARRIVAL
+                ? previous + quantity
+                : previous - quantity;
             currentOccupancy.put(airport, newOccupancy);
-            
+            peakOccupancy.merge(airport, newOccupancy, Math::max);
+
             // Calcular exceso respecto a capacidad
             int excess = newOccupancy - airport.storageCapacity();
             if (excess > 0) {
                 penalty += excess * PENALTY_STORAGE_CAPACITY;
             }
         }
-        
+
+        // Balanceo de almacenes (requisito del curso): costo convexo β·pico²/capacidad por
+        // aeropuerto tocado por la solución — repartir la carga entre hubs cuesta menos que
+        // concentrarla, incluso sin desborde. Solo aeropuertos con eventos del ciclo: los
+        // no tocados no aportan gradiente (su ocupación no depende de esta solución).
+        for (java.util.Map.Entry<com.equipo2b.scheduler.model.Airport, Integer> entry : peakOccupancy.entrySet()) {
+            int capacity = entry.getKey().storageCapacity();
+            int peak = entry.getValue();
+            if (capacity > 0 && peak > 0) {
+                double p = peak;
+                penalty += PENALTY_STORAGE_CONVEX_FACTOR * (p * p) / capacity;
+            }
+        }
+
         return penalty;
     }
     

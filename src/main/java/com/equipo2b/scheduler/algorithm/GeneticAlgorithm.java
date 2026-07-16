@@ -541,6 +541,14 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     }
     
     /**
+     * Propaga la ocupación de almacén preexistente (rutas de ciclos previos) al evaluador
+     * interno, para que las evaluaciones de este ciclo vean la carga absoluta real.
+     */
+    public void setStorageBaseline(Map<Airport, Integer> baseline) {
+        this.evaluator.setStorageBaseline(baseline);
+    }
+
+    /**
      * Configura parámetros del algoritmo genético.
      * 
      * <p>Lee parámetros de AlgorithmConfig y actualiza los campos correspondientes.
