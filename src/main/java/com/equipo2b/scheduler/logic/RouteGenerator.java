@@ -167,6 +167,20 @@ public class RouteGenerator {
         return generateFeasibleRoute(batch, null);
     }
 
+    /**
+     * Genera una ruta factible IGNORANDO el cache de rutas (BFS aleatorizado fresco).
+     *
+     * <p>El cache limita la diversidad a ≤{@code maxCachedVariants} variantes por
+     * (origen, destino, ingreso): suficiente para CPU bajo carga, pero mata la exploración
+     * del GA/Tabú (la población converge a 2-3 rutas y el fitness se estanca). Este método
+     * inyecta rutas genuinamente nuevas al pool genético; usarlo con probabilidad acotada
+     * en mutación (el costo del BFS sin cache solo importa con miles de lotes).</p>
+     */
+    public AssignedRoute generateFeasibleRouteNoCache(ShipmentBatch batch) {
+        Objects.requireNonNull(batch, "Batch cannot be null");
+        return generateFeasibleRouteUncached(batch, batch.calculateSLA(), null, maxAttempts);
+    }
+
     public AssignedRoute generateEarliestFeasibleRoute(ShipmentBatch batch) {
         Objects.requireNonNull(batch, "Batch cannot be null");
         Duration sla = batch.calculateSLA();
@@ -212,7 +226,16 @@ public class RouteGenerator {
 
         if (allowedFlights == null) {
             if (routePathCache.size() > MAX_ROUTE_CACHE_ENTRIES) {
-                routePathCache.clear();
+                // Desalojo PARCIAL (~25%) en vez de clear() total: el clear destruía todo el
+                // cache de golpe y el ciclo siguiente pagaba un "acantilado" de recomputación
+                // (picos de CPU/latencia). Podar una fracción mantiene la tasa de aciertos
+                // estable con costo O(n/4) acotado y sin pausas visibles.
+                int toEvict = MAX_ROUTE_CACHE_ENTRIES / 4;
+                var it = routePathCache.keySet().iterator();
+                while (toEvict-- > 0 && it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
             }
             RouteCacheKey key = RouteCacheKey.from(batch, sla);
             List<List<Flight>> cachedPaths = routePathCache.computeIfAbsent(

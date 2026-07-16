@@ -315,6 +315,10 @@ public class Scheduler {
 
             for (AssignedRoute r : routesHere) {
                 if (overflow <= 0) break;
+                // FRENTE CALIENTE: solo se modifican rutas cuyo primer vuelo aún NO salió.
+                // Una ruta con salida en el pasado es físicamente inmutable (las maletas ya
+                // volaron); tocarla sería retroactivo y además desperdicia CPU en el ciclo.
+                if (r.getFlights().get(0).departureTime().isBefore(windowStart)) continue;
                 ShipmentBatch b = r.getBatch();
                 int peel = Math.min(overflow, b.quantity());
                 if (peel <= 0) continue;

@@ -11,6 +11,7 @@ import com.equipo2b.scheduler.persistence.service.SolutionPersistenceService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -47,9 +48,6 @@ public class SimulationService implements SimulationController.SimulationListene
 
     @Autowired(required = false)
     private SimulationWebSocketHandler webSocketHandler;
-
-    /** Tope de la semilla de envíos para el escenario de colapso (streaming, sin materializar 9,5 M). */
-    private static final int COLLAPSE_SEED_MAX_RECORDS = 50_000;
 
     // Componentes en memoria — se recrean al iniciar cada simulación
     private SimulationController activeController;
@@ -151,11 +149,11 @@ public class SimulationService implements SimulationController.SimulationListene
                     currentAirportManager, clientRegistry, currentStartDate, endDate
                 );
             } else if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
-                // Colapso: semilla acotada en streaming desde la fecha de inicio.
-                // Evita materializar los ~9,5 M de registros en una VM de 2 GB.
-                batches = dataService.loadShipmentSeed(
-                    currentAirportManager, clientRegistry, currentStartDate, COLLAPSE_SEED_MAX_RECORDS
-                );
+                // Colapso: carga incremental por bloques de fecha real (ver
+                // SimulationController.setCollapseChunkLoader) en vez de precargar toda la
+                // semilla de una sola vez — evita materializar los ~9,5 M de registros del
+                // dataset completo en la VM de 2 GB, y evita la ráfaga de datos en el ciclo 1.
+                batches = new ArrayList<>();
             } else {
                 batches = dataService.loadAllShipments(currentAirportManager, clientRegistry);
             }
@@ -176,6 +174,21 @@ public class SimulationService implements SimulationController.SimulationListene
                 currentFlightPlan, currentAirportManager, clientRegistry
             );
             activeController.setStartDate(currentStartDate);
+
+            if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                // Carga incremental: cada bloque reutiliza el mismo loadShipmentsInRange que
+                // ya usa 5 días, solo que en ventanas chicas repetidas en vez de una sola vez.
+                AirportManager loaderAirportManager = currentAirportManager;
+                ClientRegistry loaderClientRegistry = clientRegistry;
+                activeController.setCollapseChunkLoader((start, end) -> {
+                    try {
+                        return dataService.loadShipmentsInRange(loaderAirportManager, loaderClientRegistry, start, end);
+                    } catch (IOException e) {
+                        System.err.println("⚠️ Error cargando bloque de colapso [" + start + " → " + end + "): " + e.getMessage());
+                        return new ArrayList<>();
+                    }
+                });
+            }
 
             // 6. Escuchar eventos de la simulación (this implementa SimulationListener)
             //    ANTES de startSimulation() para no perder ciclos
@@ -279,7 +292,43 @@ public class SimulationService implements SimulationController.SimulationListene
             } catch (Exception e) {
                 System.err.println("❌ Error exportando reporte día a día: " + e.getMessage());
             }
+
+            // Persistencia en BD también en el CIERRE MANUAL: día a día siempre termina con
+            // stop del usuario (no hay fin natural), así que sin esto la solución nunca
+            // llegaba a MySQL. Async y de baja prioridad: no retrasa el reporte en la UI.
+            persistDayToDayAsync(
+                controllerBeforeStop.getSimulationId(),
+                controllerBeforeStop.getStatus(),
+                controllerBeforeStop.getCurrentSolution(),
+                controllerBeforeStop.getCurrentBatches()
+            );
         }
+    }
+
+    /** Persiste la solución día a día en BD en un hilo daemon de baja prioridad. */
+    private void persistDayToDayAsync(
+            String simId,
+            SimulationStatus status,
+            Solution solution,
+            List<ShipmentBatch> batches) {
+        if (solution == null) return;
+        SimulationEntity simulationEntity = buildSimulationEntity(simId, status, solution, batches, "PERSISTING");
+        Thread persister = new Thread(() -> {
+            try {
+                simulationRepository.save(simulationEntity);
+                persistenceService.persistSolution(simId, solution, batches);
+                simulationEntity.setStatus("COMPLETED");
+                simulationEntity.setFinishedAt(LocalDateTime.now());
+                simulationRepository.save(simulationEntity);
+                System.out.println("✓ Persistencia en BD completada (async): " + simId);
+            } catch (Exception e) {
+                System.err.println("❌ Error persistiendo en BD: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }, "d2d-persister");
+        persister.setDaemon(true);
+        persister.setPriority(Thread.MIN_PRIORITY);
+        persister.start();
     }
 
     /** Pausa la simulación activa. */
@@ -413,6 +462,19 @@ public class SimulationService implements SimulationController.SimulationListene
             && simId.equals(activeController.getSimulationId());
     }
 
+    /**
+     * Huso horario del aeropuerto indicado, o null si no existe/no hay datos cargados.
+     * Usado por la carga de archivo de envíos día a día: la fecha/hora de cada línea
+     * (aaaammdd-hh-mm) está expresada en la hora LOCAL del aeropuerto de origen.
+     */
+    public java.time.ZoneId getAirportZoneId(String airportId) {
+        if (currentAirportManager == null || airportId == null) {
+            return null;
+        }
+        Airport airport = currentAirportManager.getAirport(airportId);
+        return airport != null ? airport.zoneId() : null;
+    }
+
     // ===== MÉTODOS DE SimulationListener =====
 
     @Override
@@ -438,18 +500,36 @@ public class SimulationService implements SimulationController.SimulationListene
         long onTime  = solution.getRoutes().values().stream().filter(AssignedRoute::meetsSLA).count();
         long delayed = solution.getRoutes().values().stream().filter(r -> !r.meetsSLA()).count();
         List<ShipmentBatch> currentBatchesSnapshot = getCurrentBatchesSnapshot();
-        long released = status.simulatedTime() != null
-            ? currentBatchesSnapshot.stream()
+        // "Sin ruta" por ids-base (sin sufijo -S de sub-lotes), no "released - rutas":
+        // las entradas del mapa de solución se inflan con los sub-lotes de la división
+        // por capacidad y la resta enmascaraba lotes realmente sin ruta.
+        java.util.Set<String> routedBaseIds = new java.util.HashSet<>();
+        for (String key : solution.getRoutes().keySet()) {
+            routedBaseIds.add(key.replaceAll("(-S\\d+)+$", ""));
+        }
+        int unrouted = status.simulatedTime() != null
+            ? Math.toIntExact(currentBatchesSnapshot.stream()
                 .filter(batch -> !batch.ingressTime().isAfter(status.simulatedTime()))
-                .count()
-            : solution.getRoutes().size();
-        int unrouted = Math.toIntExact(Math.min(Integer.MAX_VALUE,
-            Math.max(0, released - solution.getRoutes().size())));
+                .filter(batch -> !routedBaseIds.contains(batch.batchId()))
+                .count())
+            : 0;
 
-        // Construir vuelos activos para animación (deduplicado por flightId)
+        // Construir vuelos activos para animación (deduplicado por flightId).
+        // Solo interesan los vuelos recientes/próximos al reloj simulado — el mapa en vivo
+        // no necesita vuelos que ya aterrizaron hace días. Sin este corte, en colapso (sin
+        // límite de duración) esta lista crece sin fin con TODA la historia acumulada de
+        // rutas, agrandando el payload de cada CYCLE_UPDATE por WebSocket ciclo tras ciclo
+        // hasta que el front deja de verse fluido (en 5 días no se nota porque la duración
+        // total está acotada a 5 días).
+        ZonedDateTime activeFlightsCutoff = status.simulatedTime() != null
+            ? status.simulatedTime().minusDays(3)
+            : null;
         java.util.Map<String, CycleUpdateDTO.ActiveFlightDTO> flightMap = new java.util.LinkedHashMap<>();
         for (AssignedRoute route : solution.getRoutes().values()) {
             for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
+                if (activeFlightsCutoff != null && flight.arrivalTime().isBefore(activeFlightsCutoff)) {
+                    continue;
+                }
                 String fid = flight.flightId();
                 CycleUpdateDTO.ActiveFlightDTO existing = flightMap.get(fid);
                 if (existing != null) {
@@ -646,23 +726,9 @@ public class SimulationService implements SimulationController.SimulationListene
                 System.err.println("❌ Error exportando resultados: " + e.getMessage());
             }
         } else if (currentScenario == ScenarioType.DAY_TO_DAY) {
-            // DAY_TO_DAY: persistir en BD
-            try {
-                SimulationEntity simulationEntity = buildSimulationEntity(
-                    simId, status, solution, batches, "PERSISTING"
-                );
-                simulationRepository.save(simulationEntity);
-
-                persistenceService.persistSolution(simId, solution, batches);
-
-                simulationEntity.setStatus("COMPLETED");
-                simulationEntity.setFinishedAt(LocalDateTime.now());
-                simulationRepository.save(simulationEntity);
-                System.out.println("✓ Persistencia en BD completada: " + simId);
-            } catch (Exception e) {
-                System.err.println("❌ Error persistiendo en BD: " + e.getMessage());
-                e.printStackTrace();
-            }
+            // DAY_TO_DAY: persistir en BD async (el reporte del frontend usa el último ciclo
+            // + solución REST, no la BD) — notificar primero, persistir después.
+            persistDayToDayAsync(simId, status, solution, batches);
         }
 
         // Notificar WebSocket que terminó después de dejar el archivo disponible para /results.

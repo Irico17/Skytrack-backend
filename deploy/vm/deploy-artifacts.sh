@@ -7,24 +7,91 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUNDLE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Raíz del paquete: tar en ~/skytrack-deploy/current/ o carpeta scheduling-core/ del zip.
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PARENT="$(cd "$ROOT/.." && pwd)"
 
-JAR_SRC="$BUNDLE_ROOT/backend/scheduling-core.jar"
-FRONTEND_SRC="$BUNDLE_ROOT/frontend/dist"
-DATA_SRC="$BUNDLE_ROOT/backend/data"
+resolve_jar() {
+  # Layout tar (redeploy-vm.ps1 / package-local.ps1): current/backend/scheduling-core.jar
+  if [ -f "$ROOT/backend/scheduling-core.jar" ]; then
+    echo "$ROOT/backend/scheduling-core.jar"
+    return 0
+  fi
+  # Layout zip: scheduling-core/build/libs/*.jar
+  local jar
+  jar="$(find "$ROOT/build/libs" -maxdepth 1 -name '*.jar' ! -name '*-plain.jar' 2>/dev/null | head -n 1 || true)"
+  if [ -n "$jar" ] && [ -f "$jar" ]; then
+    echo "$jar"
+    return 0
+  fi
+  # Fallback legacy
+  if [ -f "$PARENT/backend/scheduling-core.jar" ]; then
+    echo "$PARENT/backend/scheduling-core.jar"
+    return 0
+  fi
+  return 1
+}
 
-if [ ! -f "$JAR_SRC" ]; then
-  echo "Missing backend jar: $JAR_SRC"
+resolve_frontend() {
+  if [ -d "$ROOT/frontend/dist" ]; then
+    echo "$ROOT/frontend/dist"
+    return 0
+  fi
+  if [ -d "$PARENT/Skytrack-Frontend/dist" ]; then
+    echo "$PARENT/Skytrack-Frontend/dist"
+    return 0
+  fi
+  if [ -d "$PARENT/frontend/dist" ]; then
+    echo "$PARENT/frontend/dist"
+    return 0
+  fi
+  return 1
+}
+
+resolve_data() {
+  if [ -d "$ROOT/backend/data" ]; then
+    echo "$ROOT/backend/data"
+    return 0
+  fi
+  if [ -d "$ROOT/data" ]; then
+    echo "$ROOT/data"
+    return 0
+  fi
+  if [ -d "$PARENT/backend/data" ]; then
+    echo "$PARENT/backend/data"
+    return 0
+  fi
+  return 1
+}
+
+JAR_SRC=""
+FRONTEND_SRC=""
+DATA_SRC=""
+
+if ! JAR_SRC="$(resolve_jar)"; then
+  echo "Missing backend jar."
+  echo "  Tar layout expected : $ROOT/backend/scheduling-core.jar"
+  echo "  Zip layout expected : $ROOT/build/libs/*.jar"
+  echo "Build first: cd $ROOT && ./gradlew bootJar -x test"
   exit 1
 fi
-if [ ! -d "$FRONTEND_SRC" ]; then
-  echo "Missing frontend dist: $FRONTEND_SRC"
+
+if ! FRONTEND_SRC="$(resolve_frontend)"; then
+  echo "Missing frontend dist."
+  echo "  Tar layout expected : $ROOT/frontend/dist/"
+  echo "  Zip layout expected : $PARENT/Skytrack-Frontend/dist/"
   exit 1
 fi
-if [ ! -d "$DATA_SRC" ]; then
-  echo "Missing backend data: $DATA_SRC"
+
+if ! DATA_SRC="$(resolve_data)"; then
+  echo "Missing backend data."
+  echo "  Expected: $ROOT/backend/data/ or $ROOT/data/"
   exit 1
 fi
+
+echo "Using jar      : $JAR_SRC"
+echo "Using frontend : $FRONTEND_SRC"
+echo "Using data     : $DATA_SRC"
 
 install -d -m 0755 /opt/skytrack/backend
 install -d -m 0755 /opt/skytrack/backend/data
@@ -63,6 +130,13 @@ install -d -m 0755 /opt/skytrack/backend/data/results
 
 chown -R skytrack:skytrack /opt/skytrack
 chown -R www-data:www-data /var/www/skytrack
+
+# Actualizar también la config de nginx en cada redeploy: install-dependencies.sh solo la
+# copia la PRIMERA vez, así que cambios posteriores (límites de tamaño/timeouts, etc.) se
+# quedaban en el repo sin aplicarse nunca en la VM salvo copia manual.
+if [ -f "$SCRIPT_DIR/nginx-skytrack.conf" ]; then
+  install -m 0644 "$SCRIPT_DIR/nginx-skytrack.conf" /etc/nginx/sites-available/skytrack
+fi
 
 systemctl daemon-reload
 systemctl enable skytrack-backend

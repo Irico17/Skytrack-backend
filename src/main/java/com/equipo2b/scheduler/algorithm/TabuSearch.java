@@ -456,6 +456,14 @@ public class TabuSearch implements OptimizationAlgorithm {
     
     /** MULTI_REGENERATE: Regenera 2-3 lotes simultáneamente (salto grande en vecindario). */
     private Move generateMultiRegenerateMove(Solution current, List<ShipmentBatch> batches) {
+        if (batches.size() < 2) {
+            // Con 0 o 1 lotes disponibles no hay "salto múltiple" posible: antes,
+            // ThreadLocalRandom.nextInt(2, Math.min(4, size+1)) quedaba con bound<=origin
+            // (size=0 → nextInt(2,1); size=1 → nextInt(2,2)) y lanzaba
+            // IllegalArgumentException, tumbando TODA la simulación (visto en ciclos con
+            // ventanas de consumo muy pequeñas, p.ej. 1 solo lote). Cae a un solo lote.
+            return batches.isEmpty() ? new Move(new Solution(current), "") : generateRegenerateMove(current, batches);
+        }
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
         int count = random.nextInt(2, Math.min(4, batches.size() + 1));
@@ -474,12 +482,16 @@ public class TabuSearch implements OptimizationAlgorithm {
     
     /** MULTI_REGENERATE desde solución existente. */
     private Move generateMultiRegenerateMoveFromSolution(Solution current) {
-        ThreadLocalRandom random = ThreadLocalRandom.current();
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
-        if (batchIds.isEmpty()) {
-            return new Move(new Solution(current), "");
+        if (batchIds.size() < 2) {
+            // Mismo caso que generateMultiRegenerateMove: con 0 o 1 rutas en la solución
+            // (típico en ciclos con ventana de consumo muy pequeña, p.ej. el remanente final
+            // de datos) el rango nextInt(2, Math.min(4, size+1)) era inválido y crasheaba
+            // toda la simulación con IllegalArgumentException. Cae a un solo lote regenerado.
+            return batchIds.isEmpty() ? new Move(new Solution(current), "") : generateRegenerateMoveFromSolution(current);
         }
-        
+
+        ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
         int count = random.nextInt(2, Math.min(4, batchIds.size() + 1));
         String firstBatchId = null;

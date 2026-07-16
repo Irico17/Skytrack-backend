@@ -132,26 +132,50 @@ public class ShipmentGenerator {
      * Analiza la distribución temporal de envíos históricos.
      * Calcula la proporción de envíos por hora del día.
      */
+    /**
+     * Fracción del peso "promedio por hora" que se usa como piso mínimo para horas sin
+     * representación en la muestra histórica (o poco representadas). Sin este piso, una
+     * muestra chica (p.ej. la semilla de colapso, acotada a 1000 registros) puede dejar
+     * horas del día en 0% exacto — y como el patrón horario se repite igual todos los
+     * días, esa franja queda VACÍA de forma permanente y sistemática (visto en producción:
+     * el mismo ciclo de cada día, ej. 12:00-18:00, consumía 0 lotes durante varios días
+     * seguidos). El piso sigue respetando las horas pico (mantienen su peso proporcional
+     * más alto), solo evita que una hora quede en probabilidad cero.
+     */
+    private static final double MIN_HOUR_WEIGHT_FLOOR_RATIO = 0.10;
+
     private TemporalPattern analyzeTemporalPattern(List<ShipmentBatch> historical) {
         Map<Integer, Integer> hourlyDistribution = new HashMap<>();
-        
+
         // Contar envíos por hora del día
         for (ShipmentBatch batch : historical) {
             int hour = batch.ingressTime().getHour();
             hourlyDistribution.merge(hour, batch.quantity(), Integer::sum);
         }
-        
+
         // Calcular total
         int total = hourlyDistribution.values().stream()
                 .mapToInt(Integer::intValue)
                 .sum();
-        
-        // Calcular proporciones
+
+        // Piso mínimo por hora: una fracción del promedio "si todas las horas pesaran igual"
+        // (total/24). Las horas con datos reales mantienen su peso real (que domina sobre
+        // el piso cuando hay actividad); las horas sin datos reciben este piso en vez de 0.
+        int floor = Math.max(1, (int) Math.round((total / 24.0) * MIN_HOUR_WEIGHT_FLOOR_RATIO));
+
+        // Calcular proporciones para las 24 horas, aplicando el piso a las que falten.
         Map<Integer, Double> hourlyProportions = new HashMap<>();
-        for (Map.Entry<Integer, Integer> entry : hourlyDistribution.entrySet()) {
-            hourlyProportions.put(entry.getKey(), (double) entry.getValue() / total);
+        int smoothedTotal = total;
+        for (int h = 0; h < 24; h++) {
+            if (!hourlyDistribution.containsKey(h)) {
+                smoothedTotal += floor;
+            }
         }
-        
+        for (int h = 0; h < 24; h++) {
+            int count = hourlyDistribution.getOrDefault(h, floor);
+            hourlyProportions.put(h, (double) count / smoothedTotal);
+        }
+
         return new TemporalPattern(hourlyProportions);
     }
     
@@ -169,19 +193,25 @@ public class ShipmentGenerator {
         
         // Agrupar históricos por origen-destino-cliente
         Map<RouteKey, List<ShipmentBatch>> routeGroups = groupByRoute(historical);
-        
+
+        // Se calcula UNA sola vez fuera del bucle: no cambia entre grupos. Antes se
+        // recalculaba recorriendo TODO "historical" en cada iteración — con la semilla
+        // acotada a 1000 registros no se notaba, pero al quitar ese tope (ahora hasta
+        // 500,000 registros) con miles de grupos distintos esto se volvía O(n × grupos),
+        // suficiente para colgar el arranque de la simulación por varios minutos.
+        int historicalTotal = historical.stream()
+                .mapToInt(ShipmentBatch::quantity)
+                .sum();
+
         // Calcular cuántos envíos generar por grupo
         int remainingQuantity = totalQuantity;
-        
+
         for (Map.Entry<RouteKey, List<ShipmentBatch>> entry : routeGroups.entrySet()) {
             RouteKey key = entry.getKey();
             List<ShipmentBatch> groupBatches = entry.getValue();
-            
+
             // Calcular proporción de este grupo
             int groupHistoricalTotal = groupBatches.stream()
-                    .mapToInt(ShipmentBatch::quantity)
-                    .sum();
-            int historicalTotal = historical.stream()
                     .mapToInt(ShipmentBatch::quantity)
                     .sum();
             double groupProportion = (double) groupHistoricalTotal / historicalTotal;
@@ -219,28 +249,42 @@ public class ShipmentGenerator {
         ShipmentBatch reference = historicalBatches.get(0);
         
         // Calcular número de días en el período futuro
-        long totalDays = ChronoUnit.DAYS.between(start, end);
-        
+        long totalDays = Math.max(1, ChronoUnit.DAYS.between(start, end));
+
         // Distribuir cantidad a lo largo de los días
         int remainingQuantity = totalQuantity;
         ZonedDateTime currentTime = start;
-        
+
+        // Cantidad por batch (uniforme sobre el total de horas del período).
+        int batchQuantity = Math.max(1, totalQuantity / (int) (totalDays * 24));
+
+        // Paso de tiempo entre batches: antes era un incremento FIJO de 1-3h sin importar
+        // cuántas iteraciones hicieran falta. Con grupos pequeños (la mayoría, al agrupar
+        // por origen-destino-CLIENTE hay muchísimos grupos con pocas unidades cada uno),
+        // esas pocas iteraciones a 1-3h agotaban el grupo en apenas 1-2 días, dejando TODO
+        // el crecimiento generado concentrado al inicio de la ventana de "days" días en vez
+        // de repartido a lo largo de toda ella (colapso caía en el primer ciclo por una
+        // avalancha de datos que en realidad correspondía a varios días futuros).
+        // Ahora el paso se escala según cuántas iteraciones hacen falta para ESTE grupo,
+        // de modo que el grupo — grande o chico — siempre abarque proporcionalmente todo
+        // el período [start, end), con algo de aleatoriedad (±50%) para no ser perfectamente
+        // regular.
+        int estimatedIterations = Math.max(1, (int) Math.ceil((double) totalQuantity / batchQuantity));
+        long totalWindowHours = Math.max(1, ChronoUnit.HOURS.between(start, end));
+        long baseStepHours = Math.max(1, totalWindowHours / estimatedIterations);
+
         while (remainingQuantity > 0 && currentTime.isBefore(end)) {
             // Determinar hora según patrón temporal
             int hour = selectHourByPattern(pattern);
             ZonedDateTime batchTime = currentTime.withHour(hour).withMinute(0).withSecond(0);
-            
+
             // Asegurar que no excedemos el período
             if (batchTime.isAfter(end)) {
                 break;
             }
-            
-            // Calcular cantidad para este batch (distribuir uniformemente)
-            int batchQuantity = Math.min(
-                remainingQuantity,
-                Math.max(1, totalQuantity / (int) (totalDays * 24))
-            );
-            
+
+            int thisBatchQuantity = Math.min(remainingQuantity, batchQuantity);
+
             // Generar nuevo batch
             String newBatchId = generateUniqueBatchId(reference);
             ShipmentBatch newBatch = new ShipmentBatch(
@@ -249,17 +293,18 @@ public class ShipmentGenerator {
                 reference.clientId(),
                 reference.origin(),
                 reference.destination(),
-                batchQuantity,
+                thisBatchQuantity,
                 batchTime
             );
-            
+
             result.add(newBatch);
-            remainingQuantity -= batchQuantity;
-            
-            // Avanzar tiempo (cada 1-3 horas según patrón)
-            currentTime = currentTime.plusHours(1 + (int) (random.nextDouble() * 3));
+            remainingQuantity -= thisBatchQuantity;
+
+            // Avanzar tiempo proporcionalmente (±50% de aleatoriedad sobre el paso base)
+            long jitteredStep = Math.max(1, (long) (baseStepHours * (0.5 + random.nextDouble())));
+            currentTime = currentTime.plusHours(jitteredStep);
         }
-        
+
         return result;
     }
     

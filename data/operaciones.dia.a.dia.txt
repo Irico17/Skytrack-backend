@@ -1,0 +1,279 @@
+INDICACIONES SOBRE DATOS DEL ESCENARIO DIA A DIA
+
+
+AEROPUERTOS Y CAPACIDADES
+
+Capacidades de aeropuertos para prueba de Operaciones día a día
+Se deben fijar los siguientes aeropuertos a una capacidad de 999.
+ 
+SPIM 999 Lima (Perú)
+SABE 999 Buenos Aires (Argentina)
+EKCH 999 Copenhague (Dinamarca)
+VIDP 999 Delhi (India)
+
+
+PLANES DE VUELOS ADICIONAL
+
+Patrón definido al inicio del curso (ver Site del curso): ORIG-DEST-HO:MO-HD:MD-####,  #### capacidad del vuelo.
+Recuerde que los datos de la hora de inicio y llegada están en el uso horario local del origen y destino correspondientemente.
+
+Además considerar lo siguiente:
+Vuelos de origen en SPIM y SABE dentro de América del sur 6 horas.
+Vuelos de origen en SPIM y SABE fuera de América del sur 12 horas.
+Vuelos de origen en EKCH y VIDP dentro de Europa-Asia 4 horas.
+Vuelos de origen en EKCH y VIDP fuera de Europa-Asia 13 horas.
+
+Las HO y HD deben ser ajustados según la hora de su presentación. Se presentan ejemplos como parte del bloque
+
+************* inicio de archivo base de planes de vuelos adicionales
+**Vuelos de origen en SPIM dentro de América del sur 6 horas.
+SPIM-SCEL-HO:12-HD:12-0150
+SPIM-SVMI-HO:12-HD:12-0150
+SPIM-SBBR-HO:13-HD:13-0150
+SPIM-SKBO-HO:13-HD:13-0150
+SPIM-SGAS-HO:14-HD:14-0150
+SPIM-SUAA-HO:14-HD:14-0150
+**
+**Vuelos de origen en SPIM fuera de América del sur 12 horas.
+SPIM-EBCI-HO:12-HD:12-0150
+SPIM-LBSF-HO:12-HD:12-0150
+SPIM-OAKB-HO:13-HD:13-0150
+SPIM-OPKC-HO:13-HD:13-0150
+SPIM-EHAM-HO:14-HD:14-0150
+SPIM-OMDB-HO:14-HD:14-0150
+**
+**Vuelos de origen en SABE dentro de América del sur 6 horas.
+SABE-SCEL-HO:12-HD:12-0150
+SABE-SVMI-HO:12-HD:12-0150
+SABE-SBBR-HO:13-HD:13-0150
+SABE-SKBO-HO:13-HD:13-0150
+SABE-SGAS-HO:14-HD:14-0150
+SABE-SUAA-HO:14-HD:14-0150
+**
+**Vuelos de origen en SABE fuera de América del sur 12 horas.
+SABE-EBCI-HO:12-HD:12-0150
+SABE-LBSF-HO:12-HD:12-0150
+SABE-OAKB-HO:13-HD:13-0150
+SABE-OPKC-HO:13-HD:13-0150
+SABE-EHAM-HO:14-HD:14-0150
+SABE-OMDB-HO:14-HD:14-0150
+**
+**Vuelos de origen en EKCH dentro de Europa-Asia 4 horas.
+EKCH-EBCI-HO:12-HD:12-0150
+EKCH-LBSF-HO:12-HD:12-0150
+EKCH-OAKB-HO:13-HD:13-0150
+EKCH-OPKC-HO:13-HD:13-0150
+EKCH-EHAM-HO:14-HD:14-0150
+EKCH-OMDB-HO:14-HD:14-0150
+**
+**Vuelos de origen en EKCH fuera de Europa-Asia 13 horas.
+EKCH-SCEL-HO:12-HD:12-0150
+EKCH-SVMI-HO:12-HD:12-0150
+EKCH-SBBR-HO:13-HD:13-0150
+EKCH-SKBO-HO:13-HD:13-0150
+EKCH-SGAS-HO:14-HD:14-0150
+EKCH-SUAA-HO:14-HD:14-0150
+**
+**Vuelos de origen en VIDP dentro de Europa-Asia 4 horas.
+VIDP-EBCI-HO:12-HD:12-0150
+VIDP-LBSF-HO:12-HD:12-0150
+VIDP-OAKB-HO:13-HD:13-0150
+VIDP-OPKC-HO:13-HD:13-0150
+VIDP-EHAM-HO:14-HD:14-0150
+VIDP-OMDB-HO:14-HD:14-0150
+**
+**Vuelos de origen en VIDP fuera de Europa-Asia 13 horas.
+VIDP-SCEL-HO:12-HD:12-0150
+VIDP-SVMI-HO:12-HD:12-0150
+VIDP-SBBR-HO:13-HD:13-0150
+VIDP-SKBO-HO:13-HD:13-0150
+VIDP-SGAS-HO:14-HD:14-0150
+VIDP-SUAA-HO:14-HD:14-0150
+**
+**  Las pruebas comienzan en hora exacta: 08:00, 14:00 o 17:00 entre otras posibilidades
+**  Según la hora de su presentación hacer lo siguiente para este grupo de planes de vuelos adicionales de la prueba:
+**  Si su hora de presentación es 11:00  entonces
+**  
+**  Ejemplo 1
+**
+**  El vuelo:    SPIM-SVMI-HO:12-HD:12-0150 que es en América del sur tiene como llegada la duración (6 horas), más en el huso horario del destino. 
+**               HO = hora de su presentación en el huso horario local, el HD = H0 + duración + dif.Husos, para que esté en su horario local. 
+**               HO = 11
+**               HD = 11 + 6 + 1 = 18 (diferencia horario entre SPIM y SVMI)
+**  queda como:  SPIM-SVMI-09:12-18:12-0150
+**  
+**  Ejemplo 2
+**
+**  El vuelo:    SPIM-EBCI-HO:12-HD:12-0150 que es fuera de América del sur tiene como llegada la duración (12 horas) más en el huso horario del destino. 
+**               HO = hora de su presentación en el huso horario local, el HD = H0 + duración + dif.Husos 
+**               HO = 11
+**               HD = 11 + 12 + 7 = 30, pero se entiende 06 del día siguiente (diferencia horario entre SPIM y SVMI)
+**  queda como:  SPIM-EBCI-09:12-06:12-0150
+**
+**
+**  Debe acondicionar el archivo a su hora de presentación en formato de 24h.
+**  El archivo de presentarlo antes de agregarlo a los planes de vuelo.
+**  No se preocupe si coincide con algún vuelo existente.
+**  Este bloque, desde el inicio y fin de archivo base de planes de vuelos adicionales, puede tomarlo como base y eliminar todas las lineas que tienen como inicio "**"
+**
+************* fin de archivo base de planes de vuelos adicionales
+
+
+REGISTROS INDIVIDUALES DE ENVÍO
+
+Estructura base de los registros de envíos, basado en la data histórica/futura. Cada equipo debe ajustarlo a su solución.
+
+id_envío-aaaammdd-hh-mm-dest-###-IdClien 
+
+id_envío: Id del envío, puede comenzar en 00000001 o el que le asigne en automático su solución.
+aaaammdd: Fecha de hoy. Debe ser del sistema (tener en cuenta que debe estar en su huso horario como local).
+hh-mm:    Hora actual. Debe ser del sistema (tener en cuenta que debe estar en su huso horario como local).
+dest:     Destino será lo que se indique. 
+###:      Cantidad será lo que se indique.
+IdClien   Se trabaja sólo con uno 0007729. Pero no es un dato relevante
+
+
+Para 1er estudiante (SPIM en Perú). Se entiende que sólo son útiles para el registro destino, cantidad y cliente.
+id_envío-aaaammdd-hh-mm-dest-###-IdClien 
+00000001-202607##-hh-mm-SCEL-180-0007729
+00000002-202607##-hh-mm-SVMI-180-0007729
+00000003-202607##-hh-mm-SBBR-010-0007729
+00000004-202607##-hh-mm-SKBO-010-0007729
+00000005-202607##-hh-mm-SGAS-015-0007729
+00000006-202607##-hh-mm-SUAA-015-0007729
+00000007-202607##-hh-mm-EBCI-180-0007729
+00000008-202607##-hh-mm-LBSF-180-0007729
+00000009-202607##-hh-mm-OAKB-010-0007729
+00000010-202607##-hh-mm-OPKC-010-0007729
+00000011-202607##-hh-mm-EHAM-015-0007729
+00000012-202607##-hh-mm-OMDB-015-0007729
+
+
+Para 2do estudiante (SABE en Argentina). Se entiende que sólo son útiles para el registro destino, cantidad y cliente.
+id_envío-aaaammdd-hh-mm-dest-###-IdClien 
+00000001-202607##-hh-mm-SCEL-180-0007729
+00000002-202607##-hh-mm-SVMI-180-0007729
+00000003-202607##-hh-mm-SBBR-010-0007729
+00000004-202607##-hh-mm-SKBO-010-0007729
+00000005-202607##-hh-mm-SGAS-015-0007729
+00000006-202607##-hh-mm-SUAA-015-0007729
+00000007-202607##-hh-mm-EBCI-180-0007729
+00000008-202607##-hh-mm-LBSF-180-0007729
+00000009-202607##-hh-mm-OAKB-010-0007729
+00000010-202607##-hh-mm-OPKC-010-0007729
+00000011-202607##-hh-mm-EHAM-015-0007729
+00000012-202607##-hh-mm-OMDB-015-0007729
+
+
+Para 3er estudiante (EKCH en Dinamarca). Se entiende que sólo son útiles para el registro destino, cantidad y cliente.
+id_envío-aaaammdd-hh-mm-dest-###-IdClien 
+00000001-202607##-hh-mm-SCEL-180-0007729
+00000002-202607##-hh-mm-SVMI-180-0007729
+00000003-202607##-hh-mm-SBBR-010-0007729
+00000004-202607##-hh-mm-SKBO-010-0007729
+00000005-202607##-hh-mm-SGAS-015-0007729
+00000006-202607##-hh-mm-SUAA-015-0007729
+00000007-202607##-hh-mm-EBCI-180-0007729
+00000008-202607##-hh-mm-LBSF-180-0007729
+00000009-202607##-hh-mm-OAKB-010-0007729
+00000010-202607##-hh-mm-OPKC-010-0007729
+00000011-202607##-hh-mm-EHAM-015-0007729
+00000012-202607##-hh-mm-OMDB-015-0007729
+
+
+Para 4to estudiante (VIDP en India). Se entiende que sólo son útiles para el registro destino, cantidad y cliente.
+id_envío-aaaammdd-hh-mm-dest-###-IdClien 
+00000001-202607##-hh-mm-SCEL-180-0007729
+00000002-202607##-hh-mm-SVMI-180-0007729
+00000003-202607##-hh-mm-SBBR-010-0007729
+00000004-202607##-hh-mm-SKBO-010-0007729
+00000005-202607##-hh-mm-SGAS-015-0007729
+00000006-202607##-hh-mm-SUAA-015-0007729
+00000007-202607##-hh-mm-EBCI-180-0007729
+00000008-202607##-hh-mm-LBSF-180-0007729
+00000009-202607##-hh-mm-OAKB-010-0007729
+00000010-202607##-hh-mm-OPKC-010-0007729
+00000011-202607##-hh-mm-EHAM-015-0007729
+00000012-202607##-hh-mm-OMDB-015-0007729
+
+
+
+
+
+REGISTROS EN ARCHIVO DE ENVÍOS  
+
+Estructura base de los registros de envíos, basado en la data histórica/futura. Cada equipo debe ajustarlo a su solución.
+Las HO y HD deben ser determinados previamente según la hora de presentación.
+
+id_envío-aaaammdd-hh-mm-dest-###-IdClien 
+
+id_envío: Id del envío, puede comenzar en 10000001 o el que le asigne en automático su solución. PUEDE SER OMITIDO según su solución.
+aaaammdd: Fecha de hoy. Debe ser del sistema (tener en cuenta que debe estar en su huso horario como local).
+hh-mm:    Hora actual. Debe ser del sistema (tener en cuenta que debe estar en su huso horario como local).
+dest:     Destino será lo que se indique. 
+###:      Cantidad será lo que se indique. 
+IdClien   Se trabaja sólo con uno 0007729. Pero no es un dato relevante
+
+Cada archivo (los 4 SPIM, SABE, EKCH, VIDP) deben ser subidos en sus sedes. En caso de 3 estudiantes no aplica VIDP.
+Según la sede las hh-mm deben estar en el Huso horario correspondiente.
+
+*** SPIM. El archivo se carga en Lima y entonces la hh-mm debe ser la de la prueba misma.
+10000001-202607##-hh-mm-SCEL-180-0007729
+10000002-202607##-hh-mm-SVMI-180-0007729
+10000003-202607##-hh-mm-SBBR-010-0007729
+10000004-202607##-hh-mm-SKBO-010-0007729
+10000005-202607##-hh-mm-SGAS-015-0007729
+10000006-202607##-hh-mm-SUAA-015-0007729
+10000007-202607##-hh-mm-EBCI-180-0007729
+10000008-202607##-hh-mm-LBSF-180-0007729
+10000009-202607##-hh-mm-OAKB-010-0007729
+10000010-202607##-hh-mm-OPKC-010-0007729
+10000011-202607##-hh-mm-EHAM-015-0007729
+10000012-202607##-hh-mm-OMDB-015-0007729
+
+*** SABE El archivo se carga en Lima y entonces la hh-mm debe ajustarse por el huso horario.
+10000001-202607##-hh-mm-SCEL-180-0007729
+10000002-202607##-hh-mm-SVMI-180-0007729
+10000003-202607##-hh-mm-SBBR-010-0007729
+10000004-202607##-hh-mm-SKBO-010-0007729
+10000005-202607##-hh-mm-SGAS-015-0007729
+10000006-202607##-hh-mm-SUAA-015-0007729
+10000007-202607##-hh-mm-EBCI-180-0007729
+10000008-202607##-hh-mm-LBSF-180-0007729
+10000009-202607##-hh-mm-OAKB-010-0007729
+10000010-202607##-hh-mm-OPKC-010-0007729
+10000011-202607##-hh-mm-EHAM-015-0007729
+10000012-202607##-hh-mm-OMDB-015-0007729
+
+
+*** EKCH El archivo se carga en Lima y entonces la hh-mm debe ajustarse por el huso horario.
+10000001-202607##-hh-mm-SCEL-180-0007729
+10000002-202607##-hh-mm-SVMI-180-0007729
+10000003-202607##-hh-mm-SBBR-010-0007729
+10000004-202607##-hh-mm-SKBO-010-0007729
+10000005-202607##-hh-mm-SGAS-015-0007729
+10000006-202607##-hh-mm-SUAA-015-0007729
+10000007-202607##-hh-mm-EBCI-180-0007729
+10000008-202607##-hh-mm-LBSF-180-0007729
+10000009-202607##-hh-mm-OAKB-010-0007729
+10000010-202607##-hh-mm-OPKC-010-0007729
+10000011-202607##-hh-mm-EHAM-015-0007729
+10000012-202607##-hh-mm-OMDB-015-0007729
+
+
+*** VIDP El archivo se carga en Lima y entonces la hh-mm debe ajustarse por el huso horario.
+10000001-202607##-hh-mm-SCEL-180-0007729
+10000002-202607##-hh-mm-SVMI-180-0007729
+10000003-202607##-hh-mm-SBBR-010-0007729
+10000004-202607##-hh-mm-SKBO-010-0007729
+10000005-202607##-hh-mm-SGAS-015-0007729
+10000006-202607##-hh-mm-SUAA-015-0007729
+10000007-202607##-hh-mm-EBCI-180-0007729
+10000008-202607##-hh-mm-LBSF-180-0007729
+10000009-202607##-hh-mm-OAKB-010-0007729
+10000010-202607##-hh-mm-OPKC-010-0007729
+10000011-202607##-hh-mm-EHAM-015-0007729
+10000012-202607##-hh-mm-OMDB-015-0007729
+
+
+

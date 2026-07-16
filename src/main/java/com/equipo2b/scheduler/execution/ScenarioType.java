@@ -20,7 +20,7 @@ public enum ScenarioType {
     DAY_TO_DAY(
         1,    // K: Factor de aceleración
         2,    // Ta: Tiempo máximo de algoritmo (minutos)
-        5,    // Sa: Salto entre ejecuciones (minutos)
+        2,    // Sa: Salto entre ejecuciones (minutos) — antes 5; alineado con los otros 2 escenarios
         "Escenario 1: Operación Día a Día (K=1)"
     ),
     
@@ -41,7 +41,7 @@ public enum ScenarioType {
         2,    // Sa: Salto entre ejecuciones (minutos reales) — Sc=2×180=360min(6h)
         "Escenario 2: Simulación 5 Días (K=180, Ta=2, Sa=2)"
     ),
-    
+
     /**
      * Escenario 3: Simulación hasta Colapso.
      * - Mismos parámetros de velocidad que PERIOD (decisión PO): K=180, Ta=2, Sa=2 (Sc=6h).

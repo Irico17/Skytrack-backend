@@ -44,7 +44,7 @@ public class StaticDataStorageService {
     private static final int VALIDATION_SAMPLE_SIZE = 200;
 
     /** Máximo de archivos de envíos por lote en upload por sesión. */
-    public static final int MAX_SHIPMENTS_PER_BATCH = 10;
+    public static final int MAX_SHIPMENTS_PER_BATCH = 5;
 
     private final AirportUploader airportUploader = new AirportUploader();
     private final FlightPlanUploader flightUploader = new FlightPlanUploader();
@@ -89,6 +89,249 @@ public class StaticDataStorageService {
             );
         } finally {
             deleteRecursively(stagingRoot);
+        }
+    }
+
+    /**
+     * Actualización PARCIAL de datos estáticos: cada parte es opcional y solo se reemplaza
+     * lo que se sube (solo aeropuertos, solo vuelos, solo envíos, o combinaciones).
+     *
+     * <p>Motivación (prueba de operaciones día a día): el flujo real exige subir SOLO el plan
+     * de vuelos ajustado a la hora de la prueba, o SOLO aeropuertos con capacidades cambiadas,
+     * sin tocar el resto. El reemplazo total ({@link #replaceStaticData}) además BORRA todos
+     * los archivos de envíos existentes — subir 1 archivo eliminaba los otros 29 del dataset
+     * (visto en campo: "solo salen vuelos de un aeropuerto").</p>
+     *
+     * @param appendShipments true (default recomendado) = los archivos de envíos subidos se
+     *        AGREGAN/actualizan por nombre sin borrar los existentes; false = reemplazo total
+     *        del directorio de envíos (comportamiento del replace clásico).
+     */
+    public StaticDataUploadDTO updateStaticDataPartial(
+            MultipartFile airportsFile,
+            MultipartFile flightsFile,
+            List<MultipartFile> shipmentFiles,
+            boolean appendShipments) throws IOException {
+
+        boolean hasAirports = airportsFile != null && !airportsFile.isEmpty();
+        boolean hasFlights = flightsFile != null && !flightsFile.isEmpty();
+        boolean hasShipments = shipmentFiles != null && shipmentFiles.stream().anyMatch(f -> f != null && !f.isEmpty());
+        if (!hasAirports && !hasFlights && !hasShipments) {
+            throw new IllegalArgumentException("Debe subir al menos un archivo (aeropuertos, vuelos o envios)");
+        }
+
+        Path targetAirports = Paths.get(airportsPath);
+        Path targetFlights = Paths.get(flightsPath);
+        Path targetShipmentsDir = Paths.get(shipmentsDir);
+        Path stagingRoot = Files.createTempDirectory(
+            resolveDataRoot(targetAirports, targetFlights, targetShipmentsDir), "static-data-partial-");
+
+        try {
+            UploadSession session = createStagingSession(stagingRoot, targetAirports, targetFlights, targetShipmentsDir);
+            if (hasAirports) copyUpload(airportsFile, session.stagedAirports);
+            if (hasFlights) copyUpload(flightsFile, session.stagedFlights);
+            int stagedShipments = 0;
+            if (hasShipments) {
+                stagedShipments = stageShipmentFiles(session,
+                    shipmentFiles.stream().filter(f -> f != null && !f.isEmpty()).toList());
+            }
+
+            // Validar lo subido contra el estado EFECTIVO (staged si vino; actual si no):
+            // p.ej. un plan de vuelos nuevo se valida contra los aeropuertos vigentes.
+            Path effectiveAirports = hasAirports ? session.stagedAirports : targetAirports;
+            List<Airport> airports = airportUploader.loadAirports(effectiveAirports.toString());
+            if (airports.isEmpty()) {
+                throw new IllegalArgumentException("El archivo de aeropuertos no contiene aeropuertos validos");
+            }
+            AirportManager manager = new AirportManager();
+            airports.forEach(manager::addAirport);
+
+            int flightsLoaded = 0;
+            if (hasFlights) {
+                FlightPlan plan = flightUploader.loadFlights(session.stagedFlights.toString(), manager);
+                if (plan.getTotalFlights() == 0) {
+                    throw new IllegalArgumentException("El plan de vuelos no contiene vuelos validos");
+                }
+                flightsLoaded = plan.getTotalFlights();
+            }
+
+            long shipmentsLoaded = 0;
+            if (hasShipments) {
+                ClientRegistry registry = new ClientRegistry();
+                airports.forEach(a -> registry.addClient(
+                    new com.equipo2b.scheduler.model.AirlineClient(a.id(), a.city(), "", "")));
+                try (Stream<Path> files = Files.list(session.stagedShipmentsDir)) {
+                    for (Path file : files.toList()) {
+                        shipmentUploader.loadShipments(file.toString(), manager, registry, null, null, VALIDATION_SAMPLE_SIZE);
+                        try (Stream<String> lines = Files.lines(file)) {
+                            shipmentsLoaded += lines.filter(line -> !line.isBlank()).count();
+                        }
+                    }
+                }
+            }
+
+            // Commit selectivo: solo lo subido. Envíos en modo append NO borran los existentes.
+            if (hasAirports) {
+                Files.createDirectories(targetAirports.getParent());
+                Files.copy(session.stagedAirports, targetAirports, StandardCopyOption.REPLACE_EXISTING);
+            }
+            if (hasFlights) {
+                Files.createDirectories(targetFlights.getParent());
+                Files.copy(session.stagedFlights, targetFlights, StandardCopyOption.REPLACE_EXISTING);
+            }
+            if (hasShipments) {
+                Files.createDirectories(targetShipmentsDir);
+                if (!appendShipments) {
+                    deleteContents(targetShipmentsDir);
+                }
+                try (Stream<Path> files = Files.list(session.stagedShipmentsDir)) {
+                    for (Path file : files.toList()) {
+                        Files.copy(file, targetShipmentsDir.resolve(file.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+            }
+
+            String parts = (hasAirports ? "aeropuertos " : "") + (hasFlights ? "vuelos " : "")
+                + (hasShipments ? (appendShipments ? "envios(+)" : "envios(reemplazo)") : "");
+            return new StaticDataUploadDTO(
+                "Datos actualizados parcialmente: " + parts.trim(),
+                hasAirports ? targetAirports.getFileName().toString() : null,
+                hasFlights ? targetFlights.getFileName().toString() : null,
+                stagedShipments,
+                hasAirports ? airports.size() : 0,
+                flightsLoaded,
+                Math.toIntExact(shipmentsLoaded),
+                0,
+                0
+            );
+        } finally {
+            deleteRecursively(stagingRoot);
+        }
+    }
+
+    /**
+     * Igual que {@link #startBatchUpload}, pero para actualización PARCIAL: aeropuertos y
+     * vuelos son OPCIONALES (a diferencia del batch de reemplazo total, que los exige).
+     * Necesario para poder subir SOLO envíos en lotes de {@link #MAX_SHIPMENTS_PER_BATCH}
+     * cuando hay muchos archivos — una sola petición con los 30 a la vez puede superar
+     * límites de un proxy/balanceador delante del backend (visto en despliegue real: 413
+     * con cuerpo vacío pese a que nginx y Spring ya aceptaban el tamaño total).
+     */
+    public StaticDataBatchStartDTO startPartialBatchUpload(
+            String sessionId, MultipartFile airportsFile, MultipartFile flightsFile) throws IOException {
+        if (sessionId != null && !sessionId.isBlank()) {
+            UploadSession existing = uploadSessions.get(sessionId);
+            if (existing != null) {
+                return new StaticDataBatchStartDTO(sessionId, "Sesion de carga reutilizada", existing.shipmentNames.size());
+            }
+        }
+
+        Path targetAirports = Paths.get(airportsPath);
+        Path targetFlights = Paths.get(flightsPath);
+        Path targetShipmentsDir = Paths.get(shipmentsDir);
+        Path stagingRoot = Files.createTempDirectory(
+            resolveDataRoot(targetAirports, targetFlights, targetShipmentsDir), "static-data-partial-batch-");
+
+        UploadSession session = createStagingSession(stagingRoot, targetAirports, targetFlights, targetShipmentsDir);
+        boolean hasAirports = airportsFile != null && !airportsFile.isEmpty();
+        boolean hasFlights = flightsFile != null && !flightsFile.isEmpty();
+        if (hasAirports) copyUpload(airportsFile, session.stagedAirports);
+        if (hasFlights) copyUpload(flightsFile, session.stagedFlights);
+
+        String newSessionId = UUID.randomUUID().toString();
+        uploadSessions.put(newSessionId, session);
+        return new StaticDataBatchStartDTO(newSessionId, "Sesion de carga parcial iniciada", 0);
+    }
+
+    /**
+     * Finaliza una sesión de carga parcial en lotes: valida y aplica solo lo que se subió
+     * (aeropuertos y/o vuelos y/o envíos), igual que {@link #updateStaticDataPartial} pero
+     * a partir de una sesión ya escalonada por lotes.
+     */
+    public StaticDataUploadDTO finalizePartialBatchUpload(String sessionId, boolean appendShipments) throws IOException {
+        UploadSession session = uploadSessions.remove(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Sesion de carga invalida o expirada: " + sessionId);
+        }
+
+        Path targetAirports = Paths.get(airportsPath);
+        Path targetFlights = Paths.get(flightsPath);
+        Path targetShipmentsDir = Paths.get(shipmentsDir);
+
+        try {
+            boolean hasAirports = Files.exists(session.stagedAirports);
+            boolean hasFlights = Files.exists(session.stagedFlights);
+            boolean hasShipments = !session.shipmentNames.isEmpty();
+            if (!hasAirports && !hasFlights && !hasShipments) {
+                throw new IllegalArgumentException("Debe subir al menos un archivo (aeropuertos, vuelos o envios)");
+            }
+
+            Path effectiveAirports = hasAirports ? session.stagedAirports : targetAirports;
+            List<Airport> airports = airportUploader.loadAirports(effectiveAirports.toString());
+            if (airports.isEmpty()) {
+                throw new IllegalArgumentException("El archivo de aeropuertos no contiene aeropuertos validos");
+            }
+            AirportManager manager = new AirportManager();
+            airports.forEach(manager::addAirport);
+
+            int flightsLoaded = 0;
+            if (hasFlights) {
+                FlightPlan plan = flightUploader.loadFlights(session.stagedFlights.toString(), manager);
+                if (plan.getTotalFlights() == 0) {
+                    throw new IllegalArgumentException("El plan de vuelos no contiene vuelos validos");
+                }
+                flightsLoaded = plan.getTotalFlights();
+            }
+
+            long shipmentsLoaded = 0;
+            if (hasShipments) {
+                ClientRegistry registry = new ClientRegistry();
+                airports.forEach(a -> registry.addClient(
+                    new com.equipo2b.scheduler.model.AirlineClient(a.id(), a.city(), "", "")));
+                try (Stream<Path> files = Files.list(session.stagedShipmentsDir)) {
+                    for (Path file : files.toList()) {
+                        shipmentUploader.loadShipments(file.toString(), manager, registry, null, null, VALIDATION_SAMPLE_SIZE);
+                        try (Stream<String> lines = Files.lines(file)) {
+                            shipmentsLoaded += lines.filter(line -> !line.isBlank()).count();
+                        }
+                    }
+                }
+            }
+
+            if (hasAirports) {
+                Files.createDirectories(targetAirports.getParent());
+                Files.copy(session.stagedAirports, targetAirports, StandardCopyOption.REPLACE_EXISTING);
+            }
+            if (hasFlights) {
+                Files.createDirectories(targetFlights.getParent());
+                Files.copy(session.stagedFlights, targetFlights, StandardCopyOption.REPLACE_EXISTING);
+            }
+            if (hasShipments) {
+                Files.createDirectories(targetShipmentsDir);
+                if (!appendShipments) {
+                    deleteContents(targetShipmentsDir);
+                }
+                try (Stream<Path> files = Files.list(session.stagedShipmentsDir)) {
+                    for (Path file : files.toList()) {
+                        Files.copy(file, targetShipmentsDir.resolve(file.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+            }
+
+            String parts = (hasAirports ? "aeropuertos " : "") + (hasFlights ? "vuelos " : "")
+                + (hasShipments ? (appendShipments ? "envios(+)" : "envios(reemplazo)") : "");
+            return new StaticDataUploadDTO(
+                "Datos actualizados parcialmente: " + parts.trim(),
+                hasAirports ? targetAirports.getFileName().toString() : null,
+                hasFlights ? targetFlights.getFileName().toString() : null,
+                session.shipmentNames.size(),
+                hasAirports ? airports.size() : 0,
+                flightsLoaded,
+                Math.toIntExact(shipmentsLoaded),
+                0,
+                0
+            );
+        } finally {
+            deleteRecursively(session.stagingRoot);
         }
     }
 

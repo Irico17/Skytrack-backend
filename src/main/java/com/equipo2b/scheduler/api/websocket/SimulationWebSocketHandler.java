@@ -10,6 +10,7 @@ import com.equipo2b.scheduler.execution.SimulationStatus;
 import com.equipo2b.scheduler.model.Solution;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.web.socket.*;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.net.URI;
@@ -18,7 +19,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -36,7 +36,14 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
 
     private static final String FOLLOW_ACTIVE = "__ACTIVE__";
 
-    private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
+    /** Presupuesto de envío por cliente antes de desconectarlo (cliente lento ≠ simulador lento). */
+    private static final int SEND_TIME_LIMIT_MS = 2_000;
+    private static final int SEND_BUFFER_LIMIT_BYTES = 1024 * 1024; // 1 MB por sesión
+
+    // Sesiones DECORADAS (ConcurrentWebSocketSessionDecorator) indexadas por id: el decorador
+    // encola y serializa los envíos por sesión, de modo que un cliente lento no bloquea el hilo
+    // del simulador ni a los demás clientes (clave con 2 vCPUs).
+    private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, String> sessionSubscriptions = new ConcurrentHashMap<>();
     private final Map<String, String> lastCycleUpdateBySimId = new ConcurrentHashMap<>();
     private final Map<String, String> lastStorageUpdateBySimId = new ConcurrentHashMap<>();
@@ -49,8 +56,14 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
     }
 
     @Override
-    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
-        sessions.add(session);
+    public void afterConnectionEstablished(WebSocketSession rawSession) throws Exception {
+        // OVERFLOW_DROP: si el buffer del cliente se llena, se descartan mensajes viejos en vez
+        // de cerrar la sesión — para un stream de estado (el siguiente update reemplaza al
+        // anterior) es la política correcta.
+        WebSocketSession session = new ConcurrentWebSocketSessionDecorator(
+            rawSession, SEND_TIME_LIMIT_MS, SEND_BUFFER_LIMIT_BYTES,
+            ConcurrentWebSocketSessionDecorator.OverflowStrategy.DROP);
+        sessions.put(session.getId(), session);
         String requestedSimId = extractSimulationId(session.getUri());
         String subscription = requestedSimId != null && !requestedSimId.isBlank()
             ? requestedSimId
@@ -69,7 +82,7 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        sessions.remove(session);
+        sessions.remove(session.getId());
         sessionSubscriptions.remove(session.getId());
         System.out.println("🔌 WebSocket desconectado: " + session.getId()
             + " (total: " + sessions.size() + ")");
@@ -184,6 +197,12 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
 
     public void setActiveSimId(String simId) {
         this.activeSimId = simId;
+        // Poda de caches "último update": sin esto, cada simulación histórica deja un JSON
+        // (potencialmente >1 MB con ~15k vuelos) retenido para siempre → fuga lenta en Old Gen.
+        if (simId != null && !simId.isBlank()) {
+            lastCycleUpdateBySimId.keySet().removeIf(k -> !k.equals(simId));
+            lastStorageUpdateBySimId.keySet().removeIf(k -> !k.equals(simId));
+        }
     }
 
     private void sendSnapshot(WebSocketSession session) {
@@ -195,11 +214,8 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
     private void sendIfOpen(WebSocketSession session, String json) {
         if (json == null || !session.isOpen()) return;
         try {
-            synchronized (session) {
-                if (session.isOpen()) {
-                    session.sendMessage(new TextMessage(json));
-                }
-            }
+            // El decorador concurrente serializa/encola internamente: no requiere synchronized.
+            session.sendMessage(new TextMessage(json));
         } catch (Exception e) {
             System.err.println("⚠️ Error enviando snapshot WebSocket a " + session.getId()
                 + ": " + e.getMessage());
@@ -208,16 +224,14 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
 
     private void broadcast(String simId, String json) {
         TextMessage msg = new TextMessage(json);
-        sessions.removeIf(session -> !session.isOpen());
-        sessions.forEach(session -> {
+        sessions.values().removeIf(session -> !session.isOpen());
+        sessions.values().forEach(session -> {
             String subscription = sessionSubscriptions.getOrDefault(session.getId(), FOLLOW_ACTIVE);
             if (!shouldReceive(subscription, simId)) return;
             try {
-                synchronized (session) {
-                    if (session.isOpen()) {
-                        session.sendMessage(msg);
-                    }
-                }
+                // sendMessage sobre el decorador NO bloquea al hilo del simulador por un cliente
+                // lento: encola y, si excede el presupuesto (2s / 1MB), descarta o desconecta.
+                session.sendMessage(msg);
             } catch (Exception e) {
                 System.err.println("⚠️ Error enviando WebSocket a " + session.getId()
                     + ": " + e.getMessage());
@@ -234,7 +248,7 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
             return getConnectedClients();
         }
         int count = 0;
-        for (WebSocketSession session : sessions) {
+        for (WebSocketSession session : sessions.values()) {
             if (!session.isOpen()) continue;
             String subscription = sessionSubscriptions.getOrDefault(session.getId(), FOLLOW_ACTIVE);
             if (shouldReceive(subscription, simId)) {

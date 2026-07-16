@@ -108,7 +108,19 @@ public class SimulationResultExporter {
 
         // Calcular métricas desde la solución
         int routedBatches   = solution.getRoutes().size();
-        int unroutable      = Math.max(0, totalBatches - routedBatches);
+        // "Sin ruta" = LOTES ORIGINALES distintos sin ninguna ruta (ni siquiera parcial vía
+        // sub-lote), no "totalBatches - routedBatches": esa resta mezcla unidades distintas
+        // (lotes originales vs. entradas del mapa de solución, infladas por -S1/-S2 de
+        // applyCapacityAwareSplitting) y podía enmascarar el conteo real con Math.max(0, ...).
+        int unroutable;
+        if (batches != null) {
+            java.util.Set<String> routedBaseIds = routedBaseIds(solution.getRoutes());
+            unroutable = (int) batches.stream()
+                .filter(b -> !routedBaseIds.contains(b.batchId()))
+                .count();
+        } else {
+            unroutable = Math.max(0, totalBatches - routedBatches); // fallback legacy sin lista de lotes
+        }
         long slaOk          = solution.getRoutes().values().stream()
                                 .filter(AssignedRoute::meetsSLA).count();
         double slaCompliance = routedBatches > 0 ? (slaOk * 100.0 / routedBatches) : 0.0;
@@ -282,5 +294,30 @@ public class SimulationResultExporter {
             .orElse(startDate.plusDays(1));
         long minutes = java.time.Duration.between(startDate, lastArrival).toMinutes();
         return Math.max(1, (int) Math.ceil(minutes / (24.0 * 60.0)));
+    }
+
+    /**
+     * Ids base (sin sufijo "-S&lt;n&gt;") de todos los lotes que tienen AL MENOS una ruta en
+     * la solución, incluyendo los ubicados solo parcialmente vía sub-lotes de capacidad.
+     */
+    private static java.util.Set<String> routedBaseIds(Map<String, AssignedRoute> routes) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (String key : routes.keySet()) {
+            ids.add(stripSplitSuffix(key));
+        }
+        return ids;
+    }
+
+    /** Quita los sufijos "-S&lt;n&gt;" finales de un id de lote (mismo criterio que Scheduler). */
+    private static String stripSplitSuffix(String id) {
+        String s = id;
+        while (true) {
+            int idx = s.lastIndexOf("-S");
+            if (idx < 0 || idx + 2 >= s.length()) break;
+            String suffix = s.substring(idx + 2);
+            if (!suffix.chars().allMatch(Character::isDigit)) break;
+            s = s.substring(0, idx);
+        }
+        return s;
     }
 }

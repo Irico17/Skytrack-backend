@@ -1,3 +1,9 @@
+param(
+  # Forzar recompilación aunque ya existan jar y dist (por defecto se REUTILIZAN si existen,
+  # para poder redesplegar desde una PC sin Java/Node — p.ej. extraída de los zips de release).
+  [switch]$ForceBuild
+)
+
 $ErrorActionPreference = 'Stop'
 
 $BackendRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -6,22 +12,61 @@ $DeployRoot = Join-Path $BackendRoot 'deploy'
 $BundleRoot = Join-Path $DeployRoot 'bundle'
 $TarPath = Join-Path $DeployRoot 'skytrack-vm-deploy.tar.gz'
 
-Write-Host 'Building backend jar...'
-Push-Location $BackendRoot
-try {
-  .\gradlew.bat bootJar -x test
-} finally {
-  Pop-Location
+function Find-Jar {
+  Get-ChildItem (Join-Path $BackendRoot 'build\libs\*.jar') -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike '*-plain.jar' } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 }
 
-Write-Host 'Building frontend dist...'
-Push-Location $FrontendRoot
-try {
-  npm run build
-} finally {
-  Pop-Location
+$Jar = Find-Jar
+$DistIndex = Join-Path $FrontendRoot 'dist\index.html'
+$HasDist = Test-Path $DistIndex
+
+# ── Backend: compilar SOLO si falta el jar (o -ForceBuild) ──────────────────
+if ($ForceBuild -or -not $Jar) {
+  if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
+    throw 'No hay jar compilado y Java no está instalado en esta PC. Usa los zips de release (traen el jar) o instala JDK 17.'
+  }
+  Write-Host 'Building backend jar...'
+  Push-Location $BackendRoot
+  try {
+    .\gradlew.bat bootJar -x test
+    if ($LASTEXITCODE -ne 0) { throw "gradlew bootJar failed ($LASTEXITCODE)" }
+  } finally {
+    Pop-Location
+  }
+  $Jar = Find-Jar
+} else {
+  Write-Host "Reutilizando jar compilado: $($Jar.Name) ($($Jar.LastWriteTime))"
 }
 
+# ── Frontend: compilar SOLO si falta dist/ (o -ForceBuild) ──────────────────
+if ($ForceBuild -or -not $HasDist) {
+  if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    throw 'No hay dist/ compilado y npm no está instalado en esta PC. Usa los zips de release (traen dist/) o instala Node.'
+  }
+  Write-Host 'Building frontend dist...'
+  Push-Location $FrontendRoot
+  try {
+    if (-not (Test-Path (Join-Path $FrontendRoot 'node_modules'))) {
+      # cmd /c evita que PowerShell 5.1 convierta el stderr informativo de npm en error fatal.
+      cmd /c "npm ci 2>&1"
+      if ($LASTEXITCODE -ne 0) { throw "npm ci failed ($LASTEXITCODE)" }
+    }
+    cmd /c "npm run build 2>&1"
+    if ($LASTEXITCODE -ne 0) { throw "npm run build failed ($LASTEXITCODE)" }
+  } finally {
+    Pop-Location
+  }
+} else {
+  Write-Host "Reutilizando frontend compilado: dist/ ($((Get-Item $DistIndex).LastWriteTime))"
+}
+
+if (-not $Jar) { throw 'Could not find Spring Boot jar in build\libs' }
+if (-not (Test-Path $DistIndex)) { throw 'Could not find Skytrack-Frontend\dist\index.html' }
+
+# ── Armar el bundle ──────────────────────────────────────────────────────────
 if (Test-Path $BundleRoot) {
   Remove-Item $BundleRoot -Recurse -Force
 }
@@ -31,13 +76,6 @@ New-Item -ItemType Directory -Force -Path (Join-Path $BundleRoot 'backend\data')
 New-Item -ItemType Directory -Force -Path (Join-Path $BundleRoot 'frontend') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $BundleRoot 'deploy') | Out-Null
 
-$Jar = Get-ChildItem (Join-Path $BackendRoot 'build\libs\*.jar') |
-  Where-Object { $_.Name -notlike '*-plain.jar' } |
-  Sort-Object LastWriteTime -Descending |
-  Select-Object -First 1
-if (-not $Jar) {
-  throw 'Could not find Spring Boot jar in build\libs'
-}
 Copy-Item $Jar.FullName (Join-Path $BundleRoot 'backend\scheduling-core.jar') -Force
 
 $DataRoot = Join-Path $BackendRoot 'data'
@@ -55,6 +93,9 @@ if (Test-Path $BundleDeploySsh) {
 
 if (Test-Path $TarPath) {
   Remove-Item $TarPath -Force
+}
+if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
+  throw 'tar no está disponible (viene con Windows 10+). Actualiza Windows o instala bsdtar.'
 }
 tar -czf $TarPath -C $BundleRoot .
 if ($LASTEXITCODE -ne 0) {

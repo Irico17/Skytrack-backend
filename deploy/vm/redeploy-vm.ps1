@@ -2,10 +2,21 @@ param(
   [string]$VmUser = '1inf54.981.2b',
   [string]$VmHost = '200.16.7.142',
   [switch]$OverwriteData,
+  # Recompilar aunque existan jar y dist. Por defecto se REUTILIZAN los compilados si
+  # existen — así el redeploy funciona en cualquier PC sin Java/Node (p.ej. con las
+  # carpetas extraídas de los zips de release, que ya traen todo compilado).
+  [switch]$ForceBuild,
   [string]$SudoPassword = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Requisitos mínimos de esta PC: solo ssh/scp/tar (Windows 10+ los trae de fábrica).
+foreach ($tool in @('ssh', 'scp', 'tar')) {
+  if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+    throw "'$tool' no está disponible en esta PC. En Windows: Configuración > Aplicaciones > Características opcionales > Cliente OpenSSH."
+  }
+}
 
 # Si no se pasó -SudoPassword, leer de variable de entorno SKYTRACK_SUDO_PASS
 if (-not $SudoPassword) {
@@ -24,7 +35,11 @@ $TarPath = Join-Path $BackendRoot 'deploy\skytrack-vm-deploy.tar.gz'
 $Remote = "$VmUser@$VmHost"
 
 Write-Host '==> Building local package'
-& $PackageScript
+if ($ForceBuild) {
+  & $PackageScript -ForceBuild
+} else {
+  & $PackageScript   # reutiliza jar/dist existentes; compila solo si faltan
+}
 
 if (-not (Test-Path $TarPath)) {
   throw "Package was not created: $TarPath"

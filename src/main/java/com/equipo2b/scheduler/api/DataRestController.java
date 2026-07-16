@@ -190,40 +190,75 @@ public class DataRestController {
     }
 
     /**
-     * Reemplaza los archivos estaticos usados por simulacion de 5 dias/colapso.
-     * Espera multipart/form-data con: airports, flights, shipments[]
+     * Carga de datos estaticos. TODAS las partes son OPCIONALES:
+     * - Las 3 juntas → reemplazo TOTAL atomico (comportamiento clasico; los envios
+     *   existentes se borran y quedan solo los subidos).
+     * - Un subconjunto → actualizacion PARCIAL: solo se reemplaza lo subido. Los envios
+     *   subidos en parcial se AGREGAN por nombre sin borrar los existentes, salvo
+     *   shipmentsMode=replace.
+     *
+     * multipart/form-data: airports?, flights?, shipments[]?  +  ?shipmentsMode=append|replace
      */
     @PostMapping(value = "/static", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> replaceStaticData(
-            @RequestPart("airports") MultipartFile airportsFile,
-            @RequestPart("flights") MultipartFile flightsFile,
-            @RequestPart("shipments") MultipartFile[] shipmentFiles) {
+            @RequestPart(value = "airports", required = false) MultipartFile airportsFile,
+            @RequestPart(value = "flights", required = false) MultipartFile flightsFile,
+            @RequestPart(value = "shipments", required = false) MultipartFile[] shipmentFiles,
+            @RequestParam(value = "shipmentsMode", defaultValue = "auto") String shipmentsMode) {
         try {
-            StaticDataUploadDTO saved = staticDataStorageService.replaceStaticData(
-                airportsFile,
-                flightsFile,
-                Arrays.asList(shipmentFiles)
-            );
-            dataService.invalidateCaches();
-            projectedFlightsCache.clear();
-            var imported = dataImportService.replaceReferenceData();
+            boolean hasAirports = airportsFile != null && !airportsFile.isEmpty();
+            boolean hasFlights = flightsFile != null && !flightsFile.isEmpty();
+            List<MultipartFile> shipments = shipmentFiles != null ? Arrays.asList(shipmentFiles) : List.of();
+            boolean hasShipments = shipments.stream().anyMatch(f -> f != null && !f.isEmpty());
 
-            return ResponseEntity.ok(new StaticDataUploadDTO(
-                saved.message(),
-                saved.airportsFile(),
-                saved.flightsFile(),
-                saved.shipmentFiles(),
-                saved.airportsLoaded(),
-                saved.flightsLoaded(),
-                saved.shipmentsLoaded(),
-                imported.airports(),
-                imported.flights()
-            ));
+            // Modo "auto": si vienen LAS TRES partes la intencion evidente es reponer el
+            // dataset completo → reemplazo total (borra envios viejos, sin residuos).
+            // Si es carga parcial, lo seguro es AGREGAR envios (no borrar los otros 29
+            // por subir 1 archivo — el error visto en campo). "replace"/"append" explicitos
+            // fuerzan el comportamiento.
+            boolean fullReplace;
+            if ("replace".equalsIgnoreCase(shipmentsMode)) {
+                fullReplace = true;
+            } else if ("append".equalsIgnoreCase(shipmentsMode)) {
+                fullReplace = false;
+            } else { // auto
+                fullReplace = hasAirports && hasFlights && hasShipments;
+            }
+
+            StaticDataUploadDTO saved;
+            if (hasAirports && hasFlights && hasShipments && fullReplace) {
+                // Reemplazo total atomico (dataset completo de simulaciones)
+                saved = staticDataStorageService.replaceStaticData(airportsFile, flightsFile, shipments);
+            } else {
+                saved = staticDataStorageService.updateStaticDataPartial(
+                    airportsFile, flightsFile, shipments, !fullReplace
+                );
+            }
+
+            // Invalidar caches / re-importar referencia solo si cambio la data de referencia.
+            if (hasAirports || hasFlights) {
+                dataService.invalidateCaches();
+                projectedFlightsCache.clear();
+                var imported = dataImportService.replaceReferenceData();
+                return ResponseEntity.ok(new StaticDataUploadDTO(
+                    saved.message(),
+                    saved.airportsFile(),
+                    saved.flightsFile(),
+                    saved.shipmentFiles(),
+                    saved.airportsLoaded(),
+                    saved.flightsLoaded(),
+                    saved.shipmentsLoaded(),
+                    imported.airports(),
+                    imported.flights()
+                ));
+            }
+            dataService.invalidateCaches();
+            return ResponseEntity.ok(saved);
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
-                .body(Map.of("error", "Error reemplazando datos estaticos: " + e.getMessage()));
+                .body(Map.of("error", "Error actualizando datos estaticos: " + e.getMessage()));
         }
     }
 
@@ -304,6 +339,69 @@ public class DataRestController {
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Error finalizando carga por lotes: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Inicia una sesion de carga PARCIAL por lotes: aeropuertos y vuelos son OPCIONALES
+     * (a diferencia de /static/batch/start, que los exige). Pensado para subir muchos
+     * archivos de envios en lotes de a 10 sin tocar aeropuertos/vuelos existentes — evita
+     * mandar los 30 en una sola peticion gigante, que puede chocar con límites de un
+     * proxy/balanceador delante del backend (413 con cuerpo vacío visto en despliegue real).
+     */
+    @PostMapping(value = "/static/batch/partial/start", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<?> startPartialStaticDataBatch(
+            @RequestPart(value = "sessionId", required = false) String sessionId,
+            @RequestPart(value = "airports", required = false) MultipartFile airportsFile,
+            @RequestPart(value = "flights", required = false) MultipartFile flightsFile) {
+        try {
+            StaticDataBatchStartDTO started = staticDataStorageService.startPartialBatchUpload(
+                sessionId, airportsFile, flightsFile
+            );
+            return ResponseEntity.ok(started);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error iniciando carga parcial por lotes: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Finaliza una sesion de carga PARCIAL por lotes: aplica solo lo subido (aeropuertos
+     * y/o vuelos y/o envios). shipmentsMode=append (default) agrega sin borrar los envios
+     * existentes; shipmentsMode=replace borra el directorio de envios antes de aplicar.
+     */
+    @PostMapping("/static/batch/partial/finalize")
+    public ResponseEntity<?> finalizePartialStaticDataBatch(@RequestBody Map<String, String> body) {
+        try {
+            String sessionId = body != null ? body.get("sessionId") : null;
+            if (sessionId == null || sessionId.isBlank()) {
+                return ResponseEntity.badRequest().body(Map.of("error", "sessionId es requerido"));
+            }
+            boolean appendShipments = !"replace".equalsIgnoreCase(body.get("shipmentsMode"));
+
+            StaticDataUploadDTO saved = staticDataStorageService.finalizePartialBatchUpload(sessionId, appendShipments);
+            dataService.invalidateCaches();
+            projectedFlightsCache.clear();
+            var imported = dataImportService.replaceReferenceData();
+
+            return ResponseEntity.ok(new StaticDataUploadDTO(
+                saved.message(),
+                saved.airportsFile(),
+                saved.flightsFile(),
+                saved.shipmentFiles(),
+                saved.airportsLoaded(),
+                saved.flightsLoaded(),
+                saved.shipmentsLoaded(),
+                imported.airports(),
+                imported.flights()
+            ));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                .body(Map.of("error", "Error finalizando carga parcial por lotes: " + e.getMessage()));
         }
     }
 

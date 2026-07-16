@@ -101,16 +101,24 @@ final class BagTraceabilityReadModel {
             List<ShipmentBatch> knownBatches,
             Map<String, AssignedRoute> routeByBatch) {
         Map<String, ShipmentBatch> batches = new LinkedHashMap<>();
+        // IMPORTANTE: las rutas de la solución van PRIMERO. Cuando applyCapacityAwareSplitting
+        // divide un lote, la clave original conserva una ruta con cantidad REDUCIDA (el resto
+        // se reubica en sub-lotes -S1/-S2 con claves nuevas). Si knownBatches (la lista
+        // PRÍSTINA, sin reducir) se procesara primero, putIfAbsent se quedaría con la cantidad
+        // original completa para esa clave y el sub-lote se sumaría aparte — contando las
+        // maletas divididas DOS VECES y mostrándolas en el vuelo equivocado (el de antes de
+        // dividir). Procesando las rutas primero, cada clave refleja su cantidad y vuelo
+        // reales; knownBatches solo aporta los lotes que NO tienen ninguna ruta (pendientes).
+        for (AssignedRoute route : routeByBatch.values()) {
+            ShipmentBatch batch = route.getBatch();
+            batches.putIfAbsent(batch.batchId(), batch);
+        }
         if (knownBatches != null) {
             for (ShipmentBatch batch : knownBatches) {
                 if (batch != null) {
                     batches.putIfAbsent(batch.batchId(), batch);
                 }
             }
-        }
-        for (AssignedRoute route : routeByBatch.values()) {
-            ShipmentBatch batch = route.getBatch();
-            batches.putIfAbsent(batch.batchId(), batch);
         }
         return batches;
     }
