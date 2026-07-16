@@ -110,7 +110,7 @@ public class FlightPlan {
             ? 0
             : java.time.temporal.ChronoUnit.DAYS.between(
                 baseFlights.get(0).departureTime().toLocalDate(),
-                start.toLocalDate()
+                start.withZoneSameInstant(origin.zoneId()).toLocalDate()
             );
         
         // Para cada vuelo base, crear instancias ajustadas que caigan en la ventana temporal
@@ -165,9 +165,13 @@ public class FlightPlan {
     public List<Flight> getAllFlightsProjected(ZonedDateTime start, ZonedDateTime end) {
         List<Flight> projected = new ArrayList<>();
         for (Flight baseFlight : allFlights) {
+            // El rango llega como instante UTC. Para proyectar un horario diario recurrente,
+            // el número de día debe calcularse en el huso del aeropuerto de salida; usar la
+            // fecha UTC desplaza un día los vuelos cercanos a medianoche en América/Asia.
+            ZonedDateTime startAtOrigin = start.withZoneSameInstant(baseFlight.origin().zoneId());
             long daysDiff = java.time.temporal.ChronoUnit.DAYS.between(
                 baseFlight.departureTime().toLocalDate(),
-                start.toLocalDate()
+                startAtOrigin.toLocalDate()
             );
             for (long dayOffset = daysDiff - 2; dayOffset <= daysDiff + 7; dayOffset++) {
                 ZonedDateTime adjustedDep = baseFlight.departureTime().plusDays(dayOffset);

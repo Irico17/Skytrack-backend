@@ -3,6 +3,7 @@ package com.equipo2b.scheduler.api;
 import com.equipo2b.scheduler.api.dto.*;
 import com.equipo2b.scheduler.service.SimulationResultExporter;
 import com.equipo2b.scheduler.service.SimulationService;
+import com.equipo2b.scheduler.util.SimulationTimeParser;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -37,7 +38,7 @@ public class SimulationRestController {
 
     /**
      * Inicia una nueva simulación.
-     * Body: { "scenario": "PERIOD_SIMULATION", "startDateTime": "2026-01-15T08:00" }
+     * Body: { "scenario": "PERIOD_SIMULATION", "startDateTime": "2026-01-15T13:00:00Z" }
      * startDate/startDateTime es opcional: si se omite, usa todos los datos disponibles.
      */
     @PostMapping("/start")
@@ -54,7 +55,7 @@ public class SimulationRestController {
             // Calcular hora de inicio simulada, o ahora si no se especificó
             String simStartTime;
             if (requestedStart != null && !requestedStart.isBlank()) {
-                simStartTime = parseStartDateTime(requestedStart).toString();
+                simStartTime = SimulationTimeParser.parseToUtc(requestedStart).toString();
             } else {
                 simStartTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).toString();
             }
@@ -77,6 +78,10 @@ public class SimulationRestController {
             response.put("totalRealMinutes", totalRealMinutes);
             return ResponseEntity.ok(response);
         } catch (IllegalArgumentException e) {
+            if (e.getMessage() != null && e.getMessage().startsWith("Fecha/hora inválida")) {
+                return ResponseEntity.badRequest()
+                    .body(Map.of("error", (Object) e.getMessage()));
+            }
             return ResponseEntity.badRequest()
                 .body(Map.of("error", "Escenario inválido: " + req.scenario()
                     + ". Use: DAY_TO_DAY, PERIOD_SIMULATION, COLLAPSE_SIMULATION"));
@@ -96,21 +101,6 @@ public class SimulationRestController {
     public ResponseEntity<ActiveSimulationDTO> getActiveSimulation() {
         ActiveSimulationDTO active = simulationService.getActiveSimulation();
         return active != null ? ResponseEntity.ok(active) : ResponseEntity.noContent().build();
-    }
-
-    private static java.time.ZonedDateTime parseStartDateTime(String value) {
-        String trimmed = value.trim();
-        try {
-            return java.time.ZonedDateTime.parse(trimmed);
-        } catch (Exception ignored) {
-            // Intentar formatos sin zona horaria abajo.
-        }
-        if (trimmed.contains("T")) {
-            return java.time.LocalDateTime.parse(trimmed, java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                .atZone(java.time.ZoneOffset.UTC);
-        }
-        return java.time.LocalDate.parse(trimmed, java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
-            .atStartOfDay(java.time.ZoneOffset.UTC);
     }
 
     @PostMapping("/{id}/stop")

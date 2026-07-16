@@ -9,8 +9,10 @@ import java.util.List;
 public record SimulationResultsDTO(
     String simulationId,
     String scenario,
-    String startDate,
-    String endDate,
+    String startDate,             // Compatibilidad: fecha UTC sin hora
+    String endDate,               // Compatibilidad: fecha UTC sin hora
+    String startDateTime,         // ISO-8601 UTC
+    String endDateTime,           // ISO-8601 UTC
     String completedAt,           // ISO-8601 timestamp
     double fitness,
     int totalBatches,
@@ -25,7 +27,9 @@ public record SimulationResultsDTO(
     /** Snapshot de métricas al cierre de cada día simulado */
     public record DaySnapshotDTO(
         int day,
-        String date,
+        String date,              // Compatibilidad: fecha UTC sin hora
+        String windowStart,       // ISO-8601 UTC, inclusivo
+        String windowEnd,         // ISO-8601 UTC, exclusivo
         int routesCompleted,
         int totalBags,
         int batchesOnTime,

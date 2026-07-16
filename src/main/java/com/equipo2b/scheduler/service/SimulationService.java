@@ -8,11 +8,11 @@ import com.equipo2b.scheduler.monitoring.*;
 import com.equipo2b.scheduler.persistence.entity.SimulationEntity;
 import com.equipo2b.scheduler.persistence.repository.SimulationRepository;
 import com.equipo2b.scheduler.persistence.service.SolutionPersistenceService;
+import com.equipo2b.scheduler.util.SimulationTimeParser;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -81,8 +81,8 @@ public class SimulationService implements SimulationController.SimulationListene
      * Inicia una nueva simulación del escenario indicado.
      *
      * @param scenarioName "DAY_TO_DAY", "PERIOD_SIMULATION" o "COLLAPSE_SIMULATION"
-    * @param startDateStr Fecha/hora de inicio del rango de datos. Acepta yyyy-MM-dd,
-    *                     yyyy-MM-dd'T'HH:mm o ISO-8601 con zona horaria. Null = todos los datos.
+     * @param startDateStr Instante de inicio ISO-8601 con zona horaria. Los formatos
+    *                     legacy sin zona se interpretan como UTC. Null = todos los datos.
     *                     Para PERIOD_SIMULATION filtra [inicio, inicio+5días].
      * @return simulationId único de la simulación iniciada
      */
@@ -968,23 +968,11 @@ public class SimulationService implements SimulationController.SimulationListene
     }
 
     private ZonedDateTime parseStartDate(String startDateStr) {
-        if (startDateStr == null || startDateStr.isBlank()) return null;
-        String value = startDateStr.trim();
         try {
-            return ZonedDateTime.parse(value);
-        } catch (Exception ignored) {
-            // Intentar formatos sin zona horaria abajo.
-        }
-        try {
-            if (value.contains("T")) {
-                return LocalDateTime.parse(value, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                    .atZone(ZoneOffset.UTC);
-            }
-            LocalDate date = LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE);
-            return date.atStartOfDay(ZoneOffset.UTC);
+            return SimulationTimeParser.parseToUtc(startDateStr);
         } catch (Exception e) {
             System.err.println("⚠️ No se pudo parsear startDate/startDateTime '" + startDateStr + "': " + e.getMessage());
-            return null;
+            throw e;
         }
     }
 

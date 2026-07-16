@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -136,6 +137,12 @@ public class SimulationResultExporter {
             .orElse(scenario == ScenarioType.PERIOD_SIMULATION ? 5 : 1);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+        ZonedDateTime resultStart = startDate != null
+            ? startDate.withZoneSameInstant(ZoneOffset.UTC)
+            : null;
+        ZonedDateTime resultEnd = resultStart != null
+            ? resultStart.plusDays(daysCovered)
+            : null;
         SimulationResultsDTO.CollapseInfoDTO collapseInfoDto = collapseInfo == null ? null
             : new SimulationResultsDTO.CollapseInfoDTO(
                 collapseInfo.causeCode(),
@@ -152,9 +159,11 @@ public class SimulationResultExporter {
         SimulationResultsDTO dto = new SimulationResultsDTO(
             simId,
             scenario.name(),
-            startDate != null ? startDate.toLocalDate().toString() : "N/A",
-            startDate != null ? startDate.plusDays(daysCovered).toLocalDate().toString() : "N/A",
-            ZonedDateTime.now().format(fmt),
+            resultStart != null ? resultStart.toLocalDate().toString() : "N/A",
+            resultEnd != null ? resultEnd.toLocalDate().toString() : "N/A",
+            resultStart != null ? resultStart.format(fmt) : null,
+            resultEnd != null ? resultEnd.format(fmt) : null,
+            ZonedDateTime.now(ZoneOffset.UTC).format(fmt),
             solution.getFitness(),
             totalBatches,
             routedBatches,
@@ -254,6 +263,12 @@ public class SimulationResultExporter {
             snapshots.add(new SimulationResultsDTO.DaySnapshotDTO(
                 d,
                 dateStr,
+                dayStart != null
+                    ? dayStart.withZoneSameInstant(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                    : null,
+                dayEnd != null
+                    ? dayEnd.withZoneSameInstant(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                    : null,
                 (int) routesCompleted,      // routesCompleted
                 totalBags,
                 (int) onTime,

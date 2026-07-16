@@ -10,14 +10,13 @@ import com.equipo2b.scheduler.api.dto.StaticDataUploadDTO;
 import com.equipo2b.scheduler.persistence.DataImportService;
 import com.equipo2b.scheduler.service.DataLoadingService;
 import com.equipo2b.scheduler.service.StaticDataStorageService;
+import com.equipo2b.scheduler.util.SimulationTimeParser;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.time.LocalDate;
-import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.Arrays;
 import java.util.ArrayList;
@@ -76,7 +75,7 @@ public class DataRestController {
      * Los vuelos se repiten cada día. Cada instancia tiene un ID único (base-D{day}).
      *
      * @param startDate Fecha de inicio (yyyy-MM-dd), compatibilidad con clientes antiguos
-     * @param startDateTime Fecha/hora de inicio (yyyy-MM-ddTHH:mm)
+     * @param startDateTime Instante ISO-8601 con zona (recomendado UTC/Z)
      * @param days Número de días a proyectar (default 5)
      */
     @GetMapping("/flights")
@@ -94,7 +93,7 @@ public class DataRestController {
                 ));
             }
 
-            ZonedDateTime windowStart = parseStartDateTime(requestedStart);
+            ZonedDateTime windowStart = SimulationTimeParser.parseToUtc(requestedStart);
             ZonedDateTime windowEnd = windowStart.plusDays(days);
             String cacheKey = windowStart.toInstant() + ":" + days;
             Map<String, Object> cached = projectedFlightsCache.get(cacheKey);
@@ -129,25 +128,13 @@ public class DataRestController {
             );
             projectedFlightsCache.put(cacheKey, response);
             return ResponseEntity.ok(response);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest()
+                .body(Map.of("error", e.getMessage()));
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                 .body(Map.of("error", "Error proyectando vuelos: " + e.getMessage()));
         }
-    }
-
-    private static ZonedDateTime parseStartDateTime(String value) {
-        String trimmed = value.trim();
-        try {
-            return ZonedDateTime.parse(trimmed);
-        } catch (Exception ignored) {
-            // Intentar formatos sin zona horaria abajo.
-        }
-        if (trimmed.contains("T")) {
-            return java.time.LocalDateTime.parse(trimmed, java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                .atZone(ZoneOffset.UTC);
-        }
-        LocalDate date = LocalDate.parse(trimmed);
-        return date.atStartOfDay(ZoneOffset.UTC);
     }
 
     /**
