@@ -49,6 +49,12 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private int routeSearchAttempts = 12;
     private int routeCachedVariants = 5;
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro por ciclo (presupuesto Ta)
+    /**
+     * Fracción del presupuesto usada SOLO en el primer optimize() (primer ciclo de la
+     * simulación). 1.0 = sin recorte. Ver comentario "PRIMER CICLO RÁPIDO" en optimize().
+     */
+    private double firstCycleBudgetRatio = 1.0;
+    private boolean firstOptimizeDone = false;
     /** Línea base de almacén del ciclo (para CapacityContext en construcción de rutas). */
     private volatile Map<Airport, Integer> storageBaseline = Map.of();
     
@@ -454,17 +460,29 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             );
         }
 
+        // PRIMER CICLO RÁPIDO: en el ciclo 1 la red está vacía — la semilla greedy ya es
+        // casi óptima y la búsqueda profunda no aporta (medido: 28 generaciones y 2
+        // corridas SIN ninguna mejora de fitness, 12-14s desperdiciados que el usuario ve
+        // como "Preparando simulación…"). Ese primer optimize() usa un presupuesto
+        // recortado y sin reinicios; del segundo en adelante (red ya cargada, donde la
+        // exploración SÍ paga) corre con el presupuesto completo.
+        final boolean firstCall = !firstOptimizeDone;
+        firstOptimizeDone = true;
+        final long effectiveBudgetMs = maxTimeMillis > 0 && firstCall && firstCycleBudgetRatio < 1.0
+            ? Math.max(2_000L, Math.round(maxTimeMillis * firstCycleBudgetRatio))
+            : maxTimeMillis;
+
         // Deadline duro global: nunca exceder el presupuesto de tiempo (Ta).
         final long startMs = System.currentTimeMillis();
-        final long deadline = maxTimeMillis > 0 ? startMs + maxTimeMillis : Long.MAX_VALUE;
+        final long deadline = effectiveBudgetMs > 0 ? startMs + effectiveBudgetMs : Long.MAX_VALUE;
 
         // PACIENCIA ADAPTATIVA AL PRESUPUESTO: con carga ligera/media el presupuesto Ta
         // queda subutilizado; cortar tras pocas generaciones sin mejora desperdicia tiempo
         // útil para explorar rutas multi-hop alternativas.
-        if (maxTimeMillis > 0 && batches.size() < 500) {
+        if (effectiveBudgetMs > 0 && batches.size() < 500) {
             effectiveStagnationLimit = Math.max(effectiveStagnationLimit, 12);
             effectiveGenerations = Math.max(effectiveGenerations, 40);
-        } else if (maxTimeMillis > 0 && batches.size() < 2_000) {
+        } else if (effectiveBudgetMs > 0 && batches.size() < 2_000) {
             // Banda Sc=90min (~500–1600): más exploración sin reinicios agresivos
             effectiveStagnationLimit = Math.max(effectiveStagnationLimit, 8);
             effectiveGenerations = Math.max(effectiveGenerations, 14);
@@ -472,8 +490,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
 
         // REINICIOS ITERADOS: cuando la evolución converge y sobra presupuesto, relanzar
         // con población fresca. Extendido a <2000 (antes solo <500) con menos reinicios
-        // en la banda media para no comerse el Ta.
-        final boolean restartsEnabled = maxTimeMillis > 0 && batches.size() < 2_000;
+        // en la banda media para no comerse el Ta. Sin reinicios en el primer ciclo.
+        final boolean restartsEnabled = effectiveBudgetMs > 0 && batches.size() < 2_000
+            && !(firstCall && firstCycleBudgetRatio < 1.0);
         final int maxRestarts = !restartsEnabled ? 1 : (batches.size() < 500 ? 6 : 3);
         final int maxRestartsWithoutImprovement = batches.size() < 500 ? 2 : 1;
 
@@ -487,7 +506,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         while (runs < maxRestarts) {
             long remaining = deadline - System.currentTimeMillis();
             // Reiniciar solo si queda al menos ~30% del presupuesto (evita corridas truncadas).
-            if (runs > 0 && (remaining < maxTimeMillis * 0.30 || runsWithoutImprovement >= maxRestartsWithoutImprovement)) {
+            if (runs > 0 && (remaining < effectiveBudgetMs * 0.30 || runsWithoutImprovement >= maxRestartsWithoutImprovement)) {
                 break;
             }
 
@@ -654,6 +673,8 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.routeSearchAttempts = config.getInt("routeSearchAttempts", 12);
         this.routeCachedVariants = config.getInt("routeCachedVariants", 5);
         this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
+        this.firstCycleBudgetRatio = config.getDouble("firstCycleBudgetRatio", 1.0);
+        this.firstOptimizeDone = false;
         this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
 }

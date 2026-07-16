@@ -1057,6 +1057,8 @@ public class SimulationController {
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 12);
                 gaConfig.setInt("routeCachedVariants", 5);
+                // Primer ciclo con presupuesto recortado: red vacia, la semilla ya es casi optima
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.35);
                 tabuConfig.setInt("maxIterations", 32);
                 tabuConfig.setInt("tabuTenure", 12);
                 tabuConfig.setInt("neighborhoodSize", 8);
@@ -1074,6 +1076,8 @@ public class SimulationController {
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 12);
                 gaConfig.setInt("routeCachedVariants", 5);
+                // Primer ciclo con presupuesto recortado: red vacia, la semilla ya es casi optima
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.35);
                 tabuConfig.setInt("maxIterations", 32);
                 tabuConfig.setInt("tabuTenure", 12);
                 tabuConfig.setInt("neighborhoodSize", 8);
