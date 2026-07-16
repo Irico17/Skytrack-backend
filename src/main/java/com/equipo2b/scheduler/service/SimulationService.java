@@ -541,8 +541,8 @@ public class SimulationService implements SimulationController.SimulationListene
                         fid,
                         flight.origin().id(),
                         flight.destination().id(),
-                        flight.departureTime().toString(),
-                        flight.arrivalTime().toString(),
+                        formatDate(flight.departureTime()),
+                        formatDate(flight.arrivalTime()),
                         route.getBatch().quantity(),
                         route.meetsSLA()
                     ));
@@ -560,7 +560,7 @@ public class SimulationService implements SimulationController.SimulationListene
             "CYCLE_UPDATE",
             activeController.getSimulationId(),
             status.currentCycle(),
-            status.simulatedTime() != null ? status.simulatedTime().toString() : null,
+            formatDate(status.simulatedTime()),
             daysElapsed,
             false,  // simulationComplete
             status.currentFitness(),
@@ -592,7 +592,7 @@ public class SimulationService implements SimulationController.SimulationListene
             "STORAGE_UPDATE",
             activeController.getSimulationId(),
             status.currentCycle(),
-            status.simulatedTime() != null ? status.simulatedTime().toString() : null,
+            formatDate(status.simulatedTime()),
             activeController.getDaysElapsed(),
             airportCapacities,
             buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities)

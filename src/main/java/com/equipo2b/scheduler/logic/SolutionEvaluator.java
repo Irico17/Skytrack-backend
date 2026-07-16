@@ -27,7 +27,7 @@ import com.equipo2b.scheduler.model.AirportManager;
  * <h2>Premios (Optimización)</h2>
  * <ul>
  *   <li><strong>Holgura de tiempo:</strong> 100 puntos por cada hora de holgura respecto al SLA (máximo 500 puntos por ruta)</li>
- *   <li><strong>Vuelos no utilizados:</strong> 50 puntos por cada vuelo del plan que no se utiliza</li>
+ *   <li><strong>Vuelos no utilizados:</strong> 5 puntos por vuelo no usado (desactivado bajo saturación; ver {@link #REWARD_UNUSED_FLIGHT})</li>
  * </ul>
  * 
  * <h2>Justificación del Diseño</h2>
@@ -42,7 +42,7 @@ import com.equipo2b.scheduler.model.AirportManager;
  * <p>Los premios incentivan:
  * <ol>
  *   <li>Rutas con holgura temporal (mayor robustez ante disrupciones)</li>
- *   <li>Uso eficiente de recursos (minimizar vuelos utilizados)</li>
+ *   <li>Uso eficiente de recursos solo cuando la red no está saturada (evitar concentración)</li>
  * </ol>
  * 
  * <p><strong>Validates: Requirements 9.2, 9.3, 9.4, 9.5, 9.6, 9.7</strong>
@@ -132,15 +132,30 @@ public class SolutionEvaluator {
     
     /**
      * Premio por cada vuelo del plan que no se utiliza en la solución.
-     * 
-     * <p>Valor: 50 puntos por vuelo no utilizado
-     * 
-     * <p>Este premio incentiva el uso eficiente de recursos, minimizando el número
-     * total de vuelos necesarios para transportar todos los lotes de maletas.
-     * 
+     *
+     * <p>Valor: 5 puntos por vuelo no utilizado (antes 50).
+     *
+     * <p><strong>Por qué se redujo:</strong> un premio alto empuja a concentrar carga
+     * en pocos vuelos ("usar menos vuelos = más premio"), lo cual pelea directamente
+     * con el balanceo de red y con {@link #PENALTY_LOAD_CONVEX_FACTOR}. Bajo saturación
+     * (vuelos o almacenes cargados) el premio se anula por completo — ver
+     * {@link #calculateUnusedFlightRewards}.
+     *
      * <p><strong>Validates: Requirement 9.7</strong>
      */
-    public static final double REWARD_UNUSED_FLIGHT = 50.0;
+    public static final double REWARD_UNUSED_FLIGHT = 5.0;
+
+    /**
+     * Umbral de ocupación media de vuelos usados por encima del cual se desactiva
+     * {@link #REWARD_UNUSED_FLIGHT} (evita premios que concentran carga).
+     */
+    public static final double UNUSED_FLIGHT_SATURATION_LOAD_RATIO = 0.70;
+
+    /**
+     * Umbral de ocupación relativa pico de almacén por encima del cual se desactiva
+     * el premio por vuelos no usados.
+     */
+    public static final double UNUSED_FLIGHT_SATURATION_STORAGE_RATIO = 0.80;
     
     /**
      * Penalización por cada lote de maletas que no pudo ser asignado a una ruta.
@@ -196,6 +211,19 @@ public class SolutionEvaluator {
      * restricciones duras (10k-50k): balancea sin sacrificar SLA ni factibilidad.</p>
      */
     public static final double PENALTY_STORAGE_CONVEX_FACTOR = 2.0;
+
+    /**
+     * Penalización por desbalance GLOBAL de ocupación de almacenes (varianza de ratios).
+     *
+     * <p>El término convexo por aeropuerto tocado no castiga "un hub al 90% y cinco al 10%"
+     * si los vacíos nunca aparecen en la solución. Este término mira TODOS los aeropuertos
+     * de la red (ocupación = max(pico del ciclo, baseline)) y penaliza la varianza de
+     * ratios ocupación/capacidad → incentiva rutas multi-hop que usen hubs subutilizados.
+     *
+     * <p>Escala: con N≈30 aeropuertos y varianza 0.05 → ~180 pts; lejos de las restricciones
+     * duras (10k–50k). No puede superar factibilidad/SLA.
+     */
+    public static final double PENALTY_GLOBAL_IMBALANCE_FACTOR = 120.0;
     
     // ==================== Dependencias ====================
     
@@ -355,8 +383,7 @@ public class SolutionEvaluator {
 
         // Balanceo de almacenes (requisito del curso): costo convexo β·pico²/capacidad por
         // aeropuerto tocado por la solución — repartir la carga entre hubs cuesta menos que
-        // concentrarla, incluso sin desborde. Solo aeropuertos con eventos del ciclo: los
-        // no tocados no aportan gradiente (su ocupación no depende de esta solución).
+        // concentrarla, incluso sin desborde.
         for (java.util.Map.Entry<com.equipo2b.scheduler.model.Airport, Integer> entry : peakOccupancy.entrySet()) {
             int capacity = entry.getKey().storageCapacity();
             int peak = entry.getValue();
@@ -366,7 +393,53 @@ public class SolutionEvaluator {
             }
         }
 
+        // Desbalance GLOBAL: varianza de ratios en toda la red (incluye baseline / no tocados).
+        penalty += calculateGlobalStorageImbalancePenalty(peakOccupancy, baseline);
+
         return penalty;
+    }
+
+    /**
+     * Varianza de ocupación relativa entre todos los aeropuertos de la red.
+     * Premia soluciones que repartan carga (multi-hop hacia hubs libres).
+     */
+    double calculateGlobalStorageImbalancePenalty(
+            java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> peakOccupancy,
+            java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> baseline) {
+        java.util.Collection<com.equipo2b.scheduler.model.Airport> airports = airportManager.getAllAirports();
+        if (airports == null || airports.isEmpty()) {
+            return 0.0;
+        }
+
+        java.util.List<Double> ratios = new java.util.ArrayList<>(airports.size());
+        for (com.equipo2b.scheduler.model.Airport airport : airports) {
+            int capacity = airport.storageCapacity();
+            if (capacity <= 0) {
+                continue;
+            }
+            int peak = peakOccupancy.getOrDefault(airport, 0);
+            int base = baseline.getOrDefault(airport, 0);
+            int absolute = Math.max(peak, base);
+            ratios.add((double) absolute / capacity);
+        }
+
+        if (ratios.size() < 2) {
+            return 0.0;
+        }
+
+        double sum = 0.0;
+        for (double r : ratios) {
+            sum += r;
+        }
+        double mean = sum / ratios.size();
+        double variance = 0.0;
+        for (double r : ratios) {
+            double d = r - mean;
+            variance += d * d;
+        }
+        variance /= ratios.size();
+
+        return PENALTY_GLOBAL_IMBALANCE_FACTOR * variance * ratios.size();
     }
     
     /**
@@ -385,9 +458,10 @@ public class SolutionEvaluator {
         
         for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
             if (!route.meetsSLA()) {
-                // Calcular horas de retraso (valor negativo de slack)
+                // Horas CONTINUAS (minutos/60.0): toHours() truncaba 30–59 min a 0 y el
+                // retraso parcial no generaba gradiente (mismo bug que el premio de holgura).
                 java.time.Duration slack = route.getSLASlack();
-                long delayHours = Math.abs(slack.toHours());
+                double delayHours = Math.abs(slack.toMinutes()) / 60.0;
                 penalty += delayHours * PENALTY_SLA_VIOLATION;
             }
         }
@@ -465,21 +539,70 @@ public class SolutionEvaluator {
     
     /**
      * Calcula premios por vuelos no utilizados.
-     * 
-     * <p>Otorga 50 puntos por cada vuelo del plan que no se utiliza en la solución.
-     * Incentiva el uso eficiente de recursos.
-     * 
+     *
+     * <p>Premio reducido ({@link #REWARD_UNUSED_FLIGHT}=5). Se anula bajo saturación de
+     * vuelos o almacenes para no pelear contra el balanceo de carga.
+     *
      * <p><strong>Validates: Requirement 9.7</strong>
-     * 
+     *
      * @param solution La solución a evaluar
-     * @return Premio total por vuelos no utilizados
+     * @return Premio total por vuelos no utilizados (0 si saturado)
      */
     public double calculateUnusedFlightRewards(com.equipo2b.scheduler.model.Solution solution) {
+        if (isNetworkSaturated(solution)) {
+            return 0.0;
+        }
         int totalFlights = flightPlan.getTotalFlights();
         int usedFlights = solution.getUsedFlights().size();
         int unusedFlights = totalFlights - usedFlights;
-        
+        if (unusedFlights <= 0) {
+            return 0.0;
+        }
         return unusedFlights * REWARD_UNUSED_FLIGHT;
+    }
+
+    /**
+     * True si la red está saturada: carga media de vuelos usados alta o algún almacén
+     * cerca del límite (incluyendo baseline). En ese régimen el premio por "no usar
+     * vuelos" concentraría aún más la carga.
+     */
+    boolean isNetworkSaturated(com.equipo2b.scheduler.model.Solution solution) {
+        java.util.Map<com.equipo2b.scheduler.model.Flight, Integer> bagsPerFlight = new java.util.HashMap<>();
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            int qty = route.getBatch().quantity();
+            for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
+                bagsPerFlight.merge(flight, qty, Integer::sum);
+            }
+        }
+        if (!bagsPerFlight.isEmpty()) {
+            double loadSum = 0.0;
+            for (java.util.Map.Entry<com.equipo2b.scheduler.model.Flight, Integer> e : bagsPerFlight.entrySet()) {
+                int cap = e.getKey().capacity();
+                if (cap > 0) {
+                    loadSum += (double) e.getValue() / cap;
+                }
+            }
+            if (loadSum / bagsPerFlight.size() >= UNUSED_FLIGHT_SATURATION_LOAD_RATIO) {
+                return true;
+            }
+        }
+
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> baseline = this.storageBaseline;
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> occupancy = new java.util.HashMap<>(baseline);
+        for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
+            int qty = route.getBatch().quantity();
+            occupancy.merge(route.getBatch().origin(), qty, Integer::sum);
+            for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
+                occupancy.merge(flight.destination(), qty, Integer::sum);
+            }
+        }
+        for (java.util.Map.Entry<com.equipo2b.scheduler.model.Airport, Integer> e : occupancy.entrySet()) {
+            int cap = e.getKey().storageCapacity();
+            if (cap > 0 && (double) e.getValue() / cap >= UNUSED_FLIGHT_SATURATION_STORAGE_RATIO) {
+                return true;
+            }
+        }
+        return false;
     }
     
     /**
@@ -499,7 +622,7 @@ public class SolutionEvaluator {
      * <p>Premios:
      * <ul>
      *   <li>Holgura de tiempo: 100 puntos/hora (máx 500 por ruta)</li>
-     *   <li>Vuelos no utilizados: 50 puntos/vuelo</li>
+     *   <li>Vuelos no utilizados: 5 puntos/vuelo (0 bajo saturación)</li>
      * </ul>
      * 
      * <p><strong>Validates: Requirements 9.1, 9.8</strong>

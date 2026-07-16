@@ -1052,16 +1052,16 @@ public class SimulationController {
                 // Configuración ajustada para VM 2 CPU / 2 GB
                 gaConfig.setInt("populationSize", 20);
                 gaConfig.setInt("generations", 10);
-                gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setDouble("mutationRate", 0.15);
                 gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
-                gaConfig.setInt("routeSearchAttempts", 10);
-                gaConfig.setInt("routeCachedVariants", 3);
+                gaConfig.setInt("routeSearchAttempts", 12);
+                gaConfig.setInt("routeCachedVariants", 5);
                 tabuConfig.setInt("maxIterations", 32);
                 tabuConfig.setInt("tabuTenure", 12);
                 tabuConfig.setInt("neighborhoodSize", 8);
-                tabuConfig.setInt("routeSearchAttempts", 8);
-                tabuConfig.setInt("routeCachedVariants", 2);
+                tabuConfig.setInt("routeSearchAttempts", 10);
+                tabuConfig.setInt("routeCachedVariants", 4);
                 break;
                 
             case COLLAPSE_SIMULATION:
@@ -1069,16 +1069,16 @@ public class SimulationController {
                 // apta para VM 2 CPU / 2 GB; el deadline duro garantiza Ta.
                 gaConfig.setInt("populationSize", 20);
                 gaConfig.setInt("generations", 10);
-                gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setDouble("mutationRate", 0.15);
                 gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
-                gaConfig.setInt("routeSearchAttempts", 10);
-                gaConfig.setInt("routeCachedVariants", 3);
+                gaConfig.setInt("routeSearchAttempts", 12);
+                gaConfig.setInt("routeCachedVariants", 5);
                 tabuConfig.setInt("maxIterations", 32);
                 tabuConfig.setInt("tabuTenure", 12);
                 tabuConfig.setInt("neighborhoodSize", 8);
-                tabuConfig.setInt("routeSearchAttempts", 8);
-                tabuConfig.setInt("routeCachedVariants", 2);
+                tabuConfig.setInt("routeSearchAttempts", 10);
+                tabuConfig.setInt("routeCachedVariants", 4);
                 break;
         }
 

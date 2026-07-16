@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,6 +45,13 @@ public class DataRestController {
 
     private final Map<String, Map<String, Object>> projectedFlightsCache = new ConcurrentHashMap<>();
 
+    /**
+     * ISO-8601 con offset, sin sufijo {@code [ZoneId]}.
+     * {@link ZonedDateTime#toString()} incluye el id de zona (ej. {@code [America/Lima]}),
+     * que {@code new Date()} en el navegador no puede parsear → geometría de vuelos NaN
+     * y aviones que no animan / titilan en el mapa.
+     */
+    private static final DateTimeFormatter ISO_OFFSET = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
     /**
      * Retorna la lista de todos los aeropuertos.
@@ -113,8 +121,8 @@ public class DataRestController {
                     "flightId", f.flightId(),
                     "originId", f.origin().id(),
                     "destinationId", f.destination().id(),
-                    "departureTime", f.departureTime().toString(),
-                    "arrivalTime", f.arrivalTime().toString(),
+                    "departureTime", f.departureTime().format(ISO_OFFSET),
+                    "arrivalTime", f.arrivalTime().format(ISO_OFFSET),
                     "capacity", f.capacity(),
                     "type", f.type().name()
                 ));
@@ -123,7 +131,7 @@ public class DataRestController {
             Map<String, Object> response = Map.of(
                 "flights", result,
                 "totalFlights", result.size(),
-                "startDateTime", windowStart.toString(),
+                "startDateTime", windowStart.format(ISO_OFFSET),
                 "days", days
             );
             projectedFlightsCache.put(cacheKey, response);

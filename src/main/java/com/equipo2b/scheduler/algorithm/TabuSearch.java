@@ -32,8 +32,9 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int tabuTenure = 15;
     private int neighborhoodSize = 20;
     private int routeSearchAttempts = 8;
-    private int routeCachedVariants = 2;
+    private int routeCachedVariants = 4;
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
+    private volatile Map<Airport, Integer> storageBaseline = Map.of();
 
     // Recalibrado para la ventana de consumo de 1.5h (~1,000-1,600 rutas por ciclo en época
     // pico): el refinamiento tiene su propio presupuesto duro (deadline=25% de Ta) que corta
@@ -262,9 +263,12 @@ public class TabuSearch implements OptimizationAlgorithm {
         int failedCount = 0;
         
         for (ShipmentBatch batch : affectedBatches) {
+            CapacityContext capacity = CapacityContext.fromSolution(
+                updatedSolution.getRoutes().values(), storageBaseline);
             AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(
-                batch, 
-                alternatives
+                batch,
+                alternatives,
+                capacity
             );
             
             if (newRoute != null) {
@@ -303,11 +307,13 @@ public class TabuSearch implements OptimizationAlgorithm {
     public Solution replan(Solution currentSolution, List<ShipmentBatch> newBatches) {
         Solution updatedSolution = new Solution(currentSolution);
         
-        // Generar rutas para nuevos lotes
+        CapacityContext capacity = CapacityContext.fromSolution(
+            updatedSolution.getRoutes().values(), storageBaseline);
         for (ShipmentBatch batch : newBatches) {
-            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch, capacity);
             if (newRoute != null) {
                 updatedSolution.addRoute(newRoute);
+                capacity.applyRoute(newRoute);
             }
         }
         
@@ -325,10 +331,12 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     private Solution generateInitialSolution(List<ShipmentBatch> batches) {
         Solution solution = new Solution();
+        CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
         for (ShipmentBatch batch : batches) {
-            AssignedRoute route = routeGenerator.generateFeasibleRoute(batch);
+            AssignedRoute route = routeGenerator.generateFeasibleRoute(batch, capacity);
             if (route != null) {
                 solution.addRoute(route);
+                capacity.applyRoute(route);
             }
         }
         return solution;
@@ -345,22 +353,19 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     /**
      * Genera un movimiento eligiendo aleatoriamente entre tipos diversificados.
-     * REGENERATE (60%): Ruta aleatoria regenerada.
-     * CONGESTION_RELIEF (25%): Regenera batch del vuelo más congestionado.
+     * REGENERATE (45%): Ruta aleatoria regenerada.
+     * FLIGHT_CONGESTION (20%): Regenera batch del vuelo más congestionado.
+     * STORAGE_CONGESTION (20%): Regenera batches que saturan almacenes (multi-hop preferido).
      * MULTI_REGENERATE (15%): Regenera 2-3 batches simultáneamente.
-     *
-     * @param current Solución actual
-     * @param batches Lista de lotes disponibles
-     * @return Move con solución vecina y batch ID modificado
-     *
-     * **Validates: Requirements 11.2**
      */
     private Move generateMove(Solution current, List<ShipmentBatch> batches) {
         int moveType = ThreadLocalRandom.current().nextInt(100);
-        if (moveType < 60) {
+        if (moveType < 45) {
             return generateRegenerateMove(current, batches);
-        } else if (moveType < 85) {
+        } else if (moveType < 65) {
             return generateCongestionReliefMove(current);
+        } else if (moveType < 85) {
+            return generateStorageCongestionReliefMove(current);
         } else {
             return generateMultiRegenerateMove(current, batches);
         }
@@ -368,16 +373,15 @@ public class TabuSearch implements OptimizationAlgorithm {
     
     /**
      * Genera un movimiento desde solución existente con tipos diversificados.
-     *
-     * @param current Solución actual
-     * @return Move con solución vecina y batch ID modificado
      */
     private Move generateMoveFromSolution(Solution current) {
         int moveType = ThreadLocalRandom.current().nextInt(100);
-        if (moveType < 60) {
+        if (moveType < 45) {
             return generateRegenerateMoveFromSolution(current);
-        } else if (moveType < 85) {
+        } else if (moveType < 65) {
             return generateCongestionReliefMove(current);
+        } else if (moveType < 85) {
+            return generateStorageCongestionReliefMove(current);
         } else {
             return generateMultiRegenerateMoveFromSolution(current);
         }
@@ -389,7 +393,11 @@ public class TabuSearch implements OptimizationAlgorithm {
     private Move generateRegenerateMove(Solution current, List<ShipmentBatch> batches) {
         Solution neighbor = new Solution(current);
         ShipmentBatch batch = batches.get(ThreadLocalRandom.current().nextInt(batches.size()));
-        AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+        CapacityContext capacity = capacityWithoutBatch(current, batch.batchId());
+        boolean preferMultiHop = ThreadLocalRandom.current().nextBoolean();
+        AssignedRoute newRoute = preferMultiHop
+            ? routeGenerator.generateFeasibleRoutePreferMultiHop(batch, capacity)
+            : routeGenerator.generateFeasibleRoute(batch, capacity);
         if (newRoute != null) {
             neighbor.addRoute(newRoute);
         }
@@ -405,7 +413,11 @@ public class TabuSearch implements OptimizationAlgorithm {
         }
         String batchId = batchIds.get(ThreadLocalRandom.current().nextInt(batchIds.size()));
         ShipmentBatch batch = current.getRoute(batchId).getBatch();
-        AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+        CapacityContext capacity = capacityWithoutBatch(current, batchId);
+        boolean preferMultiHop = ThreadLocalRandom.current().nextBoolean();
+        AssignedRoute newRoute = preferMultiHop
+            ? routeGenerator.generateFeasibleRoutePreferMultiHop(batch, capacity)
+            : routeGenerator.generateFeasibleRoute(batch, capacity);
         if (newRoute != null) {
             neighbor.addRoute(newRoute);
         }
@@ -413,8 +425,8 @@ public class TabuSearch implements OptimizationAlgorithm {
     }
     
     /**
-     * CONGESTION_RELIEF: Encuentra el vuelo más utilizado (por número de lotes),
-     * elige un batch de ese vuelo y lo regenera para aliviar congestión.
+     * CONGESTION_RELIEF (vuelos): Encuentra el vuelo más utilizado, elige un batch
+     * de ese vuelo y lo regenera para aliviar congestión.
      */
     private Move generateCongestionReliefMove(Solution current) {
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
@@ -422,7 +434,6 @@ public class TabuSearch implements OptimizationAlgorithm {
             return new Move(new Solution(current), "");
         }
         
-        // Contar cuántos lotes usa cada vuelo (por flightId)
         Map<String, List<String>> flightToBatchIds = new HashMap<>();
         for (Map.Entry<String, AssignedRoute> entry : current.getRoutes().entrySet()) {
             for (Flight flight : entry.getValue().getFlights()) {
@@ -431,7 +442,6 @@ public class TabuSearch implements OptimizationAlgorithm {
             }
         }
         
-        // Encontrar vuelo con más lotes asignados
         String mostUsedFlightId = null;
         int maxUsage = 0;
         for (Map.Entry<String, List<String>> entry : flightToBatchIds.entrySet()) {
@@ -445,40 +455,158 @@ public class TabuSearch implements OptimizationAlgorithm {
             return generateRegenerateMoveFromSolution(current);
         }
         
-        // Elegir batch aleatorio del vuelo más congestionado y regenerar
         List<String> candidates = flightToBatchIds.get(mostUsedFlightId);
         String targetBatchId = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
         
         Solution neighbor = new Solution(current);
         ShipmentBatch batch = current.getRoute(targetBatchId).getBatch();
-        AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+        CapacityContext capacity = capacityWithoutBatch(current, targetBatchId);
+        AssignedRoute newRoute = routeGenerator.generateFeasibleRouteNoCache(batch, capacity, true);
         if (newRoute != null) {
             neighbor.addRoute(newRoute);
         }
         return new Move(neighbor, targetBatchId);
     }
+
+    /**
+     * STORAGE_CONGESTION_RELIEF: identifica el aeropuerto con mayor ocupación estimada
+     * (baseline + rutas), elige un lote que lo usa como hub intermedio (o origen) y
+     * regenera preferiendo multi-hop para desalojar carga hacia hubs alternativos.
+     */
+    private Move generateStorageCongestionReliefMove(Solution current) {
+        List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
+        if (batchIds.isEmpty()) {
+            return new Move(new Solution(current), "");
+        }
+
+        Map<Airport, Integer> occupancy = new HashMap<>(storageBaseline);
+        Map<Airport, List<String>> airportToBatches = new HashMap<>();
+        for (Map.Entry<String, AssignedRoute> entry : current.getRoutes().entrySet()) {
+            AssignedRoute route = entry.getValue();
+            int qty = route.getBatch().quantity();
+            Set<Airport> hubs = new LinkedHashSet<>();
+            hubs.add(route.getBatch().origin());
+            List<Flight> flights = route.getFlights();
+            for (int i = 0; i < flights.size(); i++) {
+                hubs.add(flights.get(i).destination());
+            }
+            for (Airport hub : hubs) {
+                occupancy.merge(hub, qty, Integer::sum);
+                // Preferir regenerar lotes que usan el hub como ESCALA (no solo O/D)
+                boolean intermediate = false;
+                for (int i = 0; i < flights.size() - 1; i++) {
+                    if (flights.get(i).destination().equals(hub)) {
+                        intermediate = true;
+                        break;
+                    }
+                }
+                if (intermediate || hub.equals(route.getBatch().origin())) {
+                    airportToBatches.computeIfAbsent(hub, k -> new ArrayList<>()).add(entry.getKey());
+                }
+            }
+        }
+
+        Airport mostLoaded = null;
+        double worstRatio = 0.0;
+        for (Map.Entry<Airport, Integer> e : occupancy.entrySet()) {
+            int cap = e.getKey().storageCapacity();
+            if (cap <= 0) continue;
+            double ratio = (double) e.getValue() / cap;
+            if (ratio > worstRatio) {
+                worstRatio = ratio;
+                mostLoaded = e.getKey();
+            }
+        }
+
+        if (mostLoaded == null) {
+            return generateRegenerateMoveFromSolution(current);
+        }
+
+        final Airport congestedHub = mostLoaded;
+        List<String> candidates = airportToBatches.getOrDefault(congestedHub, List.of());
+        if (candidates.isEmpty()) {
+            List<String> touching = new ArrayList<>();
+            for (Map.Entry<String, AssignedRoute> entry : current.getRoutes().entrySet()) {
+                AssignedRoute route = entry.getValue();
+                if (route.getBatch().origin().equals(congestedHub)
+                        || route.getBatch().destination().equals(congestedHub)
+                        || route.getFlights().stream().anyMatch(f -> f.destination().equals(congestedHub))) {
+                    touching.add(entry.getKey());
+                }
+            }
+            candidates = touching;
+        }
+        if (candidates.isEmpty()) {
+            return generateRegenerateMoveFromSolution(current);
+        }
+
+        // Regenerar 1–2 lotes del hub congestionado hacia alternativas multi-hop
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        List<String> shuffled = new ArrayList<>(candidates);
+        Collections.shuffle(shuffled, random);
+        int regenCount = Math.min(shuffled.size(), random.nextInt(1, 3));
+        Solution neighbor = new Solution(current);
+        String firstBatchId = null;
+        CapacityContext capacity = CapacityContext.fromSolution(
+            neighbor.getRoutes().values(), storageBaseline);
+
+        List<String> toRegen = new ArrayList<>(shuffled.subList(0, regenCount));
+        for (int i = 0; i < toRegen.size(); i++) {
+            String targetBatchId = toRegen.get(i);
+            if (firstBatchId == null) firstBatchId = targetBatchId;
+            AssignedRoute existing = neighbor.getRoute(targetBatchId);
+            if (existing == null) continue;
+            capacity.removeRoute(existing);
+            ShipmentBatch batch = existing.getBatch();
+            AssignedRoute newRoute = routeGenerator.generateFeasibleRouteNoCache(batch, capacity, true);
+            if (newRoute != null) {
+                neighbor.addRoute(newRoute);
+                capacity.applyRoute(newRoute);
+            } else {
+                capacity.applyRoute(existing);
+            }
+        }
+        return new Move(neighbor, firstBatchId != null ? firstBatchId : "");
+    }
+
+    private CapacityContext capacityWithoutBatch(Solution current, String batchId) {
+        CapacityContext capacity = CapacityContext.fromSolution(
+            current.getRoutes().values(), storageBaseline);
+        AssignedRoute existing = current.getRoute(batchId);
+        if (existing != null) {
+            capacity.removeRoute(existing);
+        }
+        return capacity;
+    }
     
     /** MULTI_REGENERATE: Regenera 2-3 lotes simultáneamente (salto grande en vecindario). */
     private Move generateMultiRegenerateMove(Solution current, List<ShipmentBatch> batches) {
         if (batches.size() < 2) {
-            // Con 0 o 1 lotes disponibles no hay "salto múltiple" posible: antes,
-            // ThreadLocalRandom.nextInt(2, Math.min(4, size+1)) quedaba con bound<=origin
-            // (size=0 → nextInt(2,1); size=1 → nextInt(2,2)) y lanzaba
-            // IllegalArgumentException, tumbando TODA la simulación (visto en ciclos con
-            // ventanas de consumo muy pequeñas, p.ej. 1 solo lote). Cae a un solo lote.
             return batches.isEmpty() ? new Move(new Solution(current), "") : generateRegenerateMove(current, batches);
         }
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
+        CapacityContext capacity = CapacityContext.fromSolution(
+            neighbor.getRoutes().values(), storageBaseline);
         int count = random.nextInt(2, Math.min(4, batches.size() + 1));
         String firstBatchId = null;
         
         for (int i = 0; i < count; i++) {
             ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
             if (firstBatchId == null) firstBatchId = batch.batchId();
-            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            AssignedRoute existing = neighbor.getRoute(batch.batchId());
+            if (existing != null) {
+                capacity.removeRoute(existing);
+            }
+            boolean preferMultiHop = random.nextBoolean();
+            AssignedRoute newRoute = preferMultiHop
+                ? routeGenerator.generateFeasibleRoutePreferMultiHop(batch, capacity)
+                : routeGenerator.generateFeasibleRoute(batch, capacity);
             if (newRoute != null) {
                 neighbor.addRoute(newRoute);
+                capacity.applyRoute(newRoute);
+            } else if (existing != null) {
+                capacity.applyRoute(existing);
             }
         }
         return new Move(neighbor, firstBatchId != null ? firstBatchId : "");
@@ -488,25 +616,32 @@ public class TabuSearch implements OptimizationAlgorithm {
     private Move generateMultiRegenerateMoveFromSolution(Solution current) {
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
         if (batchIds.size() < 2) {
-            // Mismo caso que generateMultiRegenerateMove: con 0 o 1 rutas en la solución
-            // (típico en ciclos con ventana de consumo muy pequeña, p.ej. el remanente final
-            // de datos) el rango nextInt(2, Math.min(4, size+1)) era inválido y crasheaba
-            // toda la simulación con IllegalArgumentException. Cae a un solo lote regenerado.
             return batchIds.isEmpty() ? new Move(new Solution(current), "") : generateRegenerateMoveFromSolution(current);
         }
 
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
+        CapacityContext capacity = CapacityContext.fromSolution(
+            neighbor.getRoutes().values(), storageBaseline);
         int count = random.nextInt(2, Math.min(4, batchIds.size() + 1));
         String firstBatchId = null;
         
         for (int i = 0; i < count; i++) {
             String batchId = batchIds.get(random.nextInt(batchIds.size()));
             if (firstBatchId == null) firstBatchId = batchId;
-            ShipmentBatch batch = current.getRoute(batchId).getBatch();
-            AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch);
+            AssignedRoute existing = neighbor.getRoute(batchId);
+            if (existing == null) continue;
+            capacity.removeRoute(existing);
+            ShipmentBatch batch = existing.getBatch();
+            boolean preferMultiHop = random.nextBoolean();
+            AssignedRoute newRoute = preferMultiHop
+                ? routeGenerator.generateFeasibleRoutePreferMultiHop(batch, capacity)
+                : routeGenerator.generateFeasibleRoute(batch, capacity);
             if (newRoute != null) {
                 neighbor.addRoute(newRoute);
+                capacity.applyRoute(newRoute);
+            } else {
+                capacity.applyRoute(existing);
             }
         }
         return new Move(neighbor, firstBatchId != null ? firstBatchId : "");
@@ -536,10 +671,11 @@ public class TabuSearch implements OptimizationAlgorithm {
     
     /**
      * Propaga la ocupación de almacén preexistente (rutas de ciclos previos) al evaluador
-     * interno, para que las evaluaciones de este ciclo vean la carga absoluta real.
+     * y a la construcción capacity-aware / alivio de congestión de almacén.
      */
     public void setStorageBaseline(Map<Airport, Integer> baseline) {
-        this.evaluator.setStorageBaseline(baseline);
+        this.storageBaseline = baseline != null ? baseline : Map.of();
+        this.evaluator.setStorageBaseline(this.storageBaseline);
     }
 
     /**
@@ -551,12 +687,11 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     @Override
     public void configure(AlgorithmConfig config) {
-        // Leer parámetros de AlgorithmConfig y actualizar campos
         this.maxIterations = config.getInt("maxIterations", 200);
         this.tabuTenure = config.getInt("tabuTenure", 15);
         this.neighborhoodSize = config.getInt("neighborhoodSize", 20);
         this.routeSearchAttempts = config.getInt("routeSearchAttempts", 8);
-        this.routeCachedVariants = config.getInt("routeCachedVariants", 2);
+        this.routeCachedVariants = config.getInt("routeCachedVariants", 4);
         this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
         this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }

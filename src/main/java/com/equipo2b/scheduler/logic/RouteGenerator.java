@@ -10,36 +10,42 @@ import java.util.*;
 
 /**
  * Genera rutas factibles para lotes de maletas.
- * Utiliza búsqueda de caminos (BFS) con validación de restricciones.
- * 
- * Restricciones verificadas:
- * - Capacidad de vuelos
- * - Capacidad de almacenes
- * - Tiempos de escala (mínimo 10 minutos)
- * - SLA (12h mismo continente, 24h diferentes continentes)
- * - Conexiones válidas entre vuelos
- * 
- * **Validates: Requirements 14.1, 14.6**
+ * Utiliza búsqueda de caminos (BFS) con validación de restricciones temporales.
+ *
+ * <p>Restricciones verificadas en BFS:
+ * <ul>
+ *   <li>Tiempos de escala (mínimo 10 minutos)</li>
+ *   <li>SLA (12h mismo continente, 24h diferentes continentes)</li>
+ *   <li>Conexiones válidas entre vuelos</li>
+ *   <li>Capacidad residual de vuelos y hubs (cuando se pasa {@link CapacityContext})</li>
+ * </ul>
+ *
+ * <p>Sin {@link CapacityContext}, la BFS solo valida topología/tiempo/SLA; la capacidad
+ * dura la evalúa {@link SolutionEvaluator}. Con contexto (construcción GA/Tabú), se
+ * filtran vuelos sin residual y hubs cerca del límite según ocupación parcial + baseline.
+ *
+ * <p><strong>Validates: Requirements 14.1, 14.6</strong>
  */
 public class RouteGenerator {
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
     private final Map<RouteCacheKey, List<List<Flight>>> routePathCache = new ConcurrentHashMap<>();
-    
+
     private int maxAttempts = 12;
-    private int maxCachedVariants = 3;
+    private int maxCachedVariants = 5;
     private static final int MAX_ROUTE_CACHE_ENTRIES = 20_000;
     // Tope práctico de tramos por ruta. No se limita "artificialmente" a pocos saltos:
     // el SLA (12h intra / 24h inter) ya poda los caminos largos y la BFS está acotada por
     // su set `visited` (aeropuerto+hora), así que subir a 5 no degrada el rendimiento.
     // 5 tramos es el máximo que el SLA permite en la práctica.
-    private static final int MAX_HOPS = 5;  // Máximo de tramos por ruta (acotado por SLA)
+    private static final int MAX_HOPS = 5;
+
+    /** Probabilidad de posponer vuelos directos cuando se pide explorar multi-hop. */
+    private static final double DEFER_DIRECT_PROBABILITY = 0.55;
 
     /**
-     * Constructor que inicializa el generador de rutas con el plan de vuelos y gestor de aeropuertos.
-     * 
      * @param flightPlan Plan maestro de vuelos disponibles
-     * @param airportManager Gestor de aeropuertos del sistema
+     * @param airportManager Gestor de aeropuertos (capacidades de almacén para filtros)
      */
     public RouteGenerator(FlightPlan flightPlan, AirportManager airportManager) {
         this.flightPlan = Objects.requireNonNull(flightPlan, "FlightPlan cannot be null");
@@ -52,94 +58,100 @@ public class RouteGenerator {
         routePathCache.clear();
     }
 
+    /** Tope de tramos por ruta (acotado por SLA en la práctica). */
+    public static int maxHops() {
+        return MAX_HOPS;
+    }
+
     /**
      * Búsqueda BFS de camino entre aeropuertos.
-     * Considera restricciones temporales y SLA.
-     * 
-     * @param origin Aeropuerto origen
-     * @param destination Aeropuerto destino
-     * @param startTime Tiempo de inicio de búsqueda
-     * @param sla Duración del SLA permitido
-     * @param allowedFlights Lista de vuelos permitidos (null = todos los vuelos)
-     * @param randomize Si true, shufflea vuelos disponibles para generar rutas diferentes
-     * @return Lista de vuelos que forman el camino, o null si no hay camino
-     * 
-     * **Validates: Requirements 14.1, 14.3, 14.4**
+     * Considera restricciones temporales, SLA y, si hay contexto, capacidad residual.
      */
     private List<Flight> findPath(Airport origin, Airport destination,
                                   ZonedDateTime startTime, Duration sla,
-                                  List<Flight> allowedFlights, boolean randomize) {
+                                  List<Flight> allowedFlights, boolean randomize,
+                                  int batchQuantity, CapacityContext capacity,
+                                  boolean preferMultiHop) {
         ZonedDateTime deadline = startTime.plus(sla);
-        
-        // Cola BFS: (aeropuerto actual, tiempo actual, camino recorrido)
+
         Queue<SearchNode> queue = new LinkedList<>();
         queue.add(new SearchNode(origin, startTime, new ArrayList<>()));
-        
-        // Visitados: (aeropuerto, tiempo aproximado) para evitar ciclos
+
         Set<String> visited = new HashSet<>();
-        
-        // Random para shufflear vuelos (si randomize = true)
         Random random = randomize ? ThreadLocalRandom.current() : null;
-        
+
         while (!queue.isEmpty()) {
             SearchNode node = queue.poll();
-            
-            // Verificar si llegamos al destino
+
             if (node.airport.equals(destination)) {
                 return node.path;
             }
-            
-            // Limitar profundidad de búsqueda a MAX_HOPS
+
             if (node.path.size() >= MAX_HOPS) {
                 continue;
             }
-            
-            // Obtener vuelos disponibles desde este aeropuerto
+
             List<Flight> availableFlights;
             if (allowedFlights != null) {
-                // Filtrar vuelos permitidos desde aeropuerto actual
                 availableFlights = new ArrayList<>(allowedFlights.stream()
                     .filter(f -> f.origin().equals(node.airport))
                     .filter(f -> f.departureTime().isAfter(node.currentTime))
                     .filter(f -> f.arrivalTime().isBefore(deadline))
                     .toList());
             } else {
-                // Usar todos los vuelos del plan
                 availableFlights = new ArrayList<>(
                     flightPlan.getFlightsFromAirport(node.airport, node.currentTime, deadline)
                 );
             }
-            
-            // IMPORTANTE: Shufflear vuelos para generar rutas diferentes
+
             if (randomize && random != null) {
                 Collections.shuffle(availableFlights, random);
+                if (preferMultiHop && node.path.isEmpty() && random.nextDouble() < DEFER_DIRECT_PROBABILITY) {
+                    deferDirectFlights(availableFlights, destination);
+                }
             } else {
                 availableFlights.sort(Comparator
                     .comparing(Flight::departureTime)
                     .thenComparing(Flight::arrivalTime)
                     .thenComparing(Flight::flightId));
+                if (preferMultiHop && node.path.isEmpty()) {
+                    deferDirectFlights(availableFlights, destination);
+                }
             }
-            
+
             for (Flight flight : availableFlights) {
-                // Verificar tiempo de escala mínimo (10 minutos)
                 Duration layover = Duration.between(node.currentTime, flight.departureTime());
                 if (layover.toMinutes() < 10) {
                     continue;
                 }
-                
-                // Verificar que llegada sea antes del deadline
+
                 if (!flight.arrivalTime().isBefore(deadline)) {
                     continue;
                 }
-                
-                // Crear nuevo nodo
+
+                if (capacity != null && batchQuantity > 0) {
+                    if (!capacity.hasFlightCapacity(flight, batchQuantity)) {
+                        continue;
+                    }
+                    Airport hub = flight.destination();
+                    boolean isFinalDestination = hub.equals(destination);
+                    // Origen ya ocupa espacio; hubs intermedios y destino final necesitan residual.
+                    // Intermedios: filtrar duro + soft-limit. Destino: solo residual duro.
+                    if (!isFinalDestination) {
+                        if (!capacity.hasHubCapacity(hub, batchQuantity) || capacity.isHubNearLimit(hub)) {
+                            continue;
+                        }
+                    } else if (!capacity.hasHubCapacity(hub, batchQuantity)) {
+                        continue;
+                    }
+                }
+
                 List<Flight> newPath = new ArrayList<>(node.path);
                 newPath.add(flight);
-                
-                // Clave de visitado: aeropuerto + hora aproximada (por hora)
-                String visitKey = flight.destination().id() + "_" + 
+
+                String visitKey = flight.destination().id() + "_" +
                                  flight.arrivalTime().toEpochSecond() / 3600;
-                
+
                 if (!visited.contains(visitKey)) {
                     visited.add(visitKey);
                     queue.add(new SearchNode(
@@ -150,41 +162,78 @@ public class RouteGenerator {
                 }
             }
         }
-        
-        return null;  // No se encontró camino
+
+        return null;
+    }
+
+    /** Mueve vuelos directos al final de la lista para explorar escalas primero. */
+    private static void deferDirectFlights(List<Flight> flights, Airport destination) {
+        List<Flight> directs = new ArrayList<>();
+        List<Flight> others = new ArrayList<>();
+        for (Flight f : flights) {
+            if (f.destination().equals(destination)) {
+                directs.add(f);
+            } else {
+                others.add(f);
+            }
+        }
+        flights.clear();
+        flights.addAll(others);
+        flights.addAll(directs);
+    }
+
+    public AssignedRoute generateFeasibleRoute(ShipmentBatch batch) {
+        return generateFeasibleRoute(batch, null, null, false);
+    }
+
+    public AssignedRoute generateFeasibleRoute(ShipmentBatch batch, CapacityContext capacity) {
+        return generateFeasibleRoute(batch, null, capacity, false);
     }
 
     /**
-     * Genera una ruta factible para un lote de maletas.
-    * Intenta según el esfuerzo configurado encontrar una ruta válida.
-     * 
-     * @param batch Lote de maletas para el cual generar la ruta
-     * @return AssignedRoute factible o null si no se encuentra ruta
-     * 
-     * **Validates: Requirements 14.1, 14.2, 14.3, 14.4, 14.6**
+     * Variante que prioriza caminos con escalas cuando hay alternativas (balanceo de red).
      */
-    public AssignedRoute generateFeasibleRoute(ShipmentBatch batch) {
-        return generateFeasibleRoute(batch, null);
+    public AssignedRoute generateFeasibleRoutePreferMultiHop(ShipmentBatch batch, CapacityContext capacity) {
+        return generateFeasibleRoute(batch, null, capacity, true);
     }
 
     /**
      * Genera una ruta factible IGNORANDO el cache de rutas (BFS aleatorizado fresco).
-     *
-     * <p>El cache limita la diversidad a ≤{@code maxCachedVariants} variantes por
-     * (origen, destino, ingreso): suficiente para CPU bajo carga, pero mata la exploración
-     * del GA/Tabú (la población converge a 2-3 rutas y el fitness se estanca). Este método
-     * inyecta rutas genuinamente nuevas al pool genético; usarlo con probabilidad acotada
-     * en mutación (el costo del BFS sin cache solo importa con miles de lotes).</p>
      */
     public AssignedRoute generateFeasibleRouteNoCache(ShipmentBatch batch) {
+        return generateFeasibleRouteNoCache(batch, null, false);
+    }
+
+    public AssignedRoute generateFeasibleRouteNoCache(ShipmentBatch batch, CapacityContext capacity) {
+        return generateFeasibleRouteNoCache(batch, capacity, false);
+    }
+
+    public AssignedRoute generateFeasibleRouteNoCache(
+            ShipmentBatch batch, CapacityContext capacity, boolean preferMultiHop) {
         Objects.requireNonNull(batch, "Batch cannot be null");
-        return generateFeasibleRouteUncached(batch, batch.calculateSLA(), null, maxAttempts);
+        return generateFeasibleRouteUncached(
+            batch, batch.calculateSLA(), null, maxAttempts, capacity, preferMultiHop);
     }
 
     public AssignedRoute generateEarliestFeasibleRoute(ShipmentBatch batch) {
+        return generateEarliestFeasibleRoute(batch, null);
+    }
+
+    public AssignedRoute generateEarliestFeasibleRoute(ShipmentBatch batch, CapacityContext capacity) {
         Objects.requireNonNull(batch, "Batch cannot be null");
         Duration sla = batch.calculateSLA();
 
+        AssignedRoute filtered = earliestPathRoute(batch, sla, capacity);
+        if (filtered != null) {
+            return filtered;
+        }
+        // FALLBACK BEST-EFFORT: con hubs/destino saturados por la línea base, el filtro de
+        // capacidad puede vetar todos los caminos; mejor una ruta que sobrecarga (penalizada
+        // proporcionalmente por el fitness) que un lote sin asignar (50k fijos, no viaja).
+        return capacity != null ? earliestPathRoute(batch, sla, null) : null;
+    }
+
+    private AssignedRoute earliestPathRoute(ShipmentBatch batch, Duration sla, CapacityContext capacity) {
         try {
             List<Flight> flightPath = findPath(
                 batch.origin(),
@@ -192,6 +241,9 @@ public class RouteGenerator {
                 batch.ingressTime(),
                 sla,
                 null,
+                false,
+                batch.quantity(),
+                capacity,
                 false
             );
 
@@ -206,30 +258,29 @@ public class RouteGenerator {
         }
     }
 
-    /**
-     * Genera una ruta factible para un lote de maletas usando solo vuelos permitidos.
-    * Intenta según el esfuerzo configurado encontrar una ruta válida.
-     * 
-     * IMPORTANTE: Introduce aleatoriedad shuffleando vuelos disponibles para generar
-     * rutas diferentes en cada intento. Esto es crucial para que el Algoritmo Genético
-     * tenga diversidad en la población inicial.
-     * 
-     * @param batch Lote de maletas para el cual generar la ruta
-     * @param allowedFlights Lista de vuelos permitidos (null = todos los vuelos)
-     * @return AssignedRoute factible o null si no se encuentra ruta
-     * 
-     * **Validates: Requirements 14.1, 14.2, 14.3, 14.4, 14.6**
-     */
     public AssignedRoute generateFeasibleRoute(ShipmentBatch batch, List<Flight> allowedFlights) {
+        return generateFeasibleRoute(batch, allowedFlights, null, false);
+    }
+
+    public AssignedRoute generateFeasibleRoute(
+            ShipmentBatch batch, List<Flight> allowedFlights, CapacityContext capacity) {
+        return generateFeasibleRoute(batch, allowedFlights, capacity, false);
+    }
+
+    /**
+     * Genera una ruta factible. Con {@code capacity != null}, filtra por residual de
+     * vuelos/hubs usando ocupación parcial de la solución en construcción.
+     */
+    public AssignedRoute generateFeasibleRoute(
+            ShipmentBatch batch,
+            List<Flight> allowedFlights,
+            CapacityContext capacity,
+            boolean preferMultiHop) {
         Objects.requireNonNull(batch, "Batch cannot be null");
         Duration sla = batch.calculateSLA();
 
         if (allowedFlights == null) {
             if (routePathCache.size() > MAX_ROUTE_CACHE_ENTRIES) {
-                // Desalojo PARCIAL (~25%) en vez de clear() total: el clear destruía todo el
-                // cache de golpe y el ciclo siguiente pagaba un "acantilado" de recomputación
-                // (picos de CPU/latencia). Podar una fracción mantiene la tasa de aciertos
-                // estable con costo O(n/4) acotado y sin pausas visibles.
                 int toEvict = MAX_ROUTE_CACHE_ENTRIES / 4;
                 var it = routePathCache.keySet().iterator();
                 while (toEvict-- > 0 && it.hasNext()) {
@@ -240,31 +291,121 @@ public class RouteGenerator {
             RouteCacheKey key = RouteCacheKey.from(batch, sla);
             List<List<Flight>> cachedPaths = routePathCache.computeIfAbsent(
                 key,
-                ignored -> findCandidatePaths(batch, sla, null, maxCachedVariants)
+                ignored -> findCandidatePaths(batch, sla, null, maxCachedVariants, null, preferMultiHop)
             );
 
-            if (!cachedPaths.isEmpty()) {
-                List<Flight> path = cachedPaths.get(ThreadLocalRandom.current().nextInt(cachedPaths.size()));
-                try {
-                    return new AssignedRoute(batch, path);
-                } catch (IllegalArgumentException ex) {
-                    routePathCache.remove(key);
+            List<List<Flight>> candidates = cachedPaths;
+            if (preferMultiHop && capacity == null) {
+                // Cache sin preferMultiHop: complementar con búsqueda fresca multi-hop
+                List<List<Flight>> multi = findCandidatePaths(
+                    batch, sla, null, maxCachedVariants, null, true);
+                if (!multi.isEmpty()) {
+                    candidates = mergeUniquePaths(cachedPaths, multi);
                 }
+            }
+
+            AssignedRoute fromCache = pickCapacityFeasible(batch, candidates, capacity);
+            if (fromCache != null) {
+                return fromCache;
+            }
+
+            // Ningún path cacheado cabe: BFS fresco con filtros de capacidad
+            if (capacity != null || preferMultiHop) {
+                AssignedRoute fresh = generateFeasibleRouteUncached(
+                    batch, sla, null, maxAttempts, capacity, preferMultiHop);
+                if (fresh != null) {
+                    return fresh;
+                }
+            }
+
+            // FALLBACK BEST-EFFORT: bajo saturación real (época pre-colapso) el filtro de
+            // capacidad rechaza TODOS los caminos —incluido el destino del lote, al que sí
+            // o sí debe llegar— y sin esto la asignación caía a 0%. Una ruta que sobrecarga
+            // un almacén cuesta penalización proporcional en el fitness; un lote SIN RUTA
+            // cuesta 50.000 fijos y no se transporta. El filtro es preferencia, no veto.
+            if (capacity != null) {
+                return pickCapacityFeasible(batch, candidates, null);
             }
             return null;
         }
 
-        return generateFeasibleRouteUncached(batch, sla, allowedFlights, maxAttempts);
+        return generateFeasibleRouteUncached(
+            batch, sla, allowedFlights, maxAttempts, capacity, preferMultiHop);
+    }
+
+    private AssignedRoute pickCapacityFeasible(
+            ShipmentBatch batch, List<List<Flight>> paths, CapacityContext capacity) {
+        if (paths == null || paths.isEmpty()) {
+            return null;
+        }
+        List<List<Flight>> feasible = new ArrayList<>();
+        for (List<Flight> path : paths) {
+            if (isPathCapacityFeasible(path, batch, capacity)) {
+                feasible.add(path);
+            }
+        }
+        if (feasible.isEmpty()) {
+            return null;
+        }
+        List<Flight> chosen = feasible.get(ThreadLocalRandom.current().nextInt(feasible.size()));
+        try {
+            return new AssignedRoute(batch, chosen);
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    private boolean isPathCapacityFeasible(
+            List<Flight> path, ShipmentBatch batch, CapacityContext capacity) {
+        if (capacity == null) {
+            return true;
+        }
+        int qty = batch.quantity();
+        Airport destination = batch.destination();
+        for (Flight flight : path) {
+            if (!capacity.hasFlightCapacity(flight, qty)) {
+                return false;
+            }
+            Airport hub = flight.destination();
+            boolean isFinal = hub.equals(destination);
+            if (!isFinal) {
+                if (!capacity.hasHubCapacity(hub, qty) || capacity.isHubNearLimit(hub)) {
+                    return false;
+                }
+            } else if (!capacity.hasHubCapacity(hub, qty)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static List<List<Flight>> mergeUniquePaths(
+            List<List<Flight>> primary, List<List<Flight>> secondary) {
+        Map<String, List<Flight>> unique = new LinkedHashMap<>();
+        for (List<Flight> path : primary) {
+            unique.putIfAbsent(pathSignature(path), path);
+        }
+        for (List<Flight> path : secondary) {
+            unique.putIfAbsent(pathSignature(path), path);
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private static String pathSignature(List<Flight> path) {
+        return path.stream()
+            .map(Flight::flightId)
+            .reduce((a, b) -> a + ">" + b)
+            .orElse("");
     }
 
     private AssignedRoute generateFeasibleRouteUncached(
             ShipmentBatch batch,
             Duration sla,
             List<Flight> allowedFlights,
-            int maxAttempts) {
-        
-        // Intentar generar ruta hasta el máximo configurado
-        // Cada intento usa un orden aleatorio de vuelos para generar rutas diferentes
+            int maxAttempts,
+            CapacityContext capacity,
+            boolean preferMultiHop) {
+
         try {
             List<Flight> deterministicPath = findPath(
                 batch.origin(),
@@ -272,7 +413,10 @@ public class RouteGenerator {
                 batch.ingressTime(),
                 sla,
                 allowedFlights,
-                false
+                false,
+                batch.quantity(),
+                capacity,
+                preferMultiHop
             );
 
             if (deterministicPath != null && !deterministicPath.isEmpty()) {
@@ -287,45 +431,43 @@ public class RouteGenerator {
 
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             try {
-                // Buscar secuencia de vuelos usando BFS con aleatoriedad
-                // IMPORTANTE: Siempre usar randomización para generar diversidad en GA
                 List<Flight> flightPath = findPath(
                     batch.origin(),
                     batch.destination(),
                     batch.ingressTime(),
                     sla,
                     allowedFlights,
-                    true  // Siempre usar aleatoriedad para diversidad
+                    true,
+                    batch.quantity(),
+                    capacity,
+                    preferMultiHop || attempt % 2 == 1
                 );
-                
-                // Si no se encontró camino, continuar intentando
+
                 if (flightPath == null || flightPath.isEmpty()) {
                     continue;
                 }
-                
-                // Construir AssignedRoute con la secuencia encontrada
-                // El constructor de AssignedRoute valida automáticamente:
-                // - Primer vuelo desde origen
-                // - Último vuelo a destino
-                // - Conexiones válidas
-                // - Tiempos de escala mínimos (10 min)
+
                 AssignedRoute route = new AssignedRoute(batch, flightPath);
-                
-                // Verificar que la ruta cumple SLA
                 if (!route.meetsSLA()) {
                     continue;
                 }
-                
-                // Ruta factible encontrada
+
                 return route;
-                
+
             } catch (IllegalArgumentException e) {
-                // La validación del constructor falló, intentar de nuevo
                 continue;
             }
         }
-        
-        // No se pudo generar ruta factible después de los intentos configurados
+
+        // FALLBACK BEST-EFFORT: si el filtro de capacidad no dejó ningún camino (hubs o
+        // destino saturados por la línea base en época de alta demanda), buscar ruta SIN
+        // filtro — el fitness castiga la sobrecarga proporcionalmente, pero un lote sin
+        // ruta (50k) es siempre peor. Sin esto la asignación caía a 0% en pre-colapso.
+        if (capacity != null) {
+            return generateFeasibleRouteUncached(batch, sla, allowedFlights,
+                Math.max(2, maxAttempts / 2), null, preferMultiHop);
+        }
+
         return null;
     }
 
@@ -333,7 +475,9 @@ public class RouteGenerator {
             ShipmentBatch batch,
             Duration sla,
             List<Flight> allowedFlights,
-            int maxCandidates) {
+            int maxCandidates,
+            CapacityContext capacity,
+            boolean preferMultiHop) {
         Map<String, List<Flight>> uniquePaths = new LinkedHashMap<>();
 
         try {
@@ -343,17 +487,16 @@ public class RouteGenerator {
                 batch.ingressTime(),
                 sla,
                 allowedFlights,
-                false
+                false,
+                batch.quantity(),
+                capacity,
+                preferMultiHop
             );
 
             if (deterministicPath != null && !deterministicPath.isEmpty()) {
                 AssignedRoute route = new AssignedRoute(batch, deterministicPath);
                 if (route.meetsSLA()) {
-                    String signature = deterministicPath.stream()
-                        .map(Flight::flightId)
-                        .reduce((a, b) -> a + ">" + b)
-                        .orElse("");
-                    uniquePaths.putIfAbsent(signature, List.copyOf(deterministicPath));
+                    uniquePaths.putIfAbsent(pathSignature(deterministicPath), List.copyOf(deterministicPath));
                 }
             }
         } catch (IllegalArgumentException e) {
@@ -362,13 +505,18 @@ public class RouteGenerator {
 
         for (int attempt = 0; attempt < maxAttempts && uniquePaths.size() < maxCandidates; attempt++) {
             try {
+                // Alternar preferMultiHop en intentos pares/impares para diversificar hops
+                boolean multiHopAttempt = preferMultiHop || attempt % 2 == 1;
                 List<Flight> flightPath = findPath(
                     batch.origin(),
                     batch.destination(),
                     batch.ingressTime(),
                     sla,
                     allowedFlights,
-                    true
+                    true,
+                    batch.quantity(),
+                    capacity,
+                    multiHopAttempt
                 );
 
                 if (flightPath == null || flightPath.isEmpty()) {
@@ -380,11 +528,7 @@ public class RouteGenerator {
                     continue;
                 }
 
-                String signature = flightPath.stream()
-                    .map(Flight::flightId)
-                    .reduce((a, b) -> a + ">" + b)
-                    .orElse("");
-                uniquePaths.putIfAbsent(signature, List.copyOf(flightPath));
+                uniquePaths.putIfAbsent(pathSignature(flightPath), List.copyOf(flightPath));
             } catch (IllegalArgumentException e) {
                 // Intentar otro candidato
             }
@@ -393,10 +537,6 @@ public class RouteGenerator {
         return List.copyOf(uniquePaths.values());
     }
 
-    /**
-     * Nodo de búsqueda para BFS.
-     * Representa un estado en la búsqueda de rutas.
-     */
     private record SearchNode(Airport airport, ZonedDateTime currentTime, List<Flight> path) {}
 
     private record RouteCacheKey(String originId, String destinationId, long ingressMinute, long slaMinutes) {

@@ -1,5 +1,6 @@
 package com.equipo2b.scheduler.algorithm;
 
+import com.equipo2b.scheduler.logic.CapacityContext;
 import com.equipo2b.scheduler.logic.RouteGenerator;
 import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
@@ -46,8 +47,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private int parallelPopulationThreshold = 32;
     private int largeVolumeBatchThreshold = 2_500;
     private int routeSearchAttempts = 12;
-    private int routeCachedVariants = 3;
+    private int routeCachedVariants = 5;
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro por ciclo (presupuesto Ta)
+    /** Línea base de almacén del ciclo (para CapacityContext en construcción de rutas). */
+    private volatile Map<Airport, Integer> storageBaseline = Map.of();
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -86,9 +89,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @param batches Lista de lotes para los cuales generar rutas
      * @return Población inicial de soluciones
      */
-    private List<Solution> initializePopulation(List<ShipmentBatch> batches, int effectivePopulationSize) {
+    private List<Solution> initializePopulation(List<ShipmentBatch> batches, int effectivePopulationSize,
+                                                long deadline) {
         Set<String> unroutableBatches = Collections.synchronizedSet(new HashSet<>());
-        
+
         Stream<Integer> populationIndexes = IntStream.range(0, effectivePopulationSize).boxed();
         if (shouldUseParallelism(effectivePopulationSize)) {
             populationIndexes = populationIndexes.parallel();
@@ -96,7 +100,16 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
 
         List<Solution> population = populationIndexes.map(i -> {
                 Solution solution = new Solution();
-                
+                // GUARDA DE PRESUPUESTO: la construcción capacity-aware es más cara que la
+                // antigua; con poblaciones de 14-16 individuos podía consumir todo el deadline
+                // antes del primer chequeo por generación. El individuo 0 (semilla greedy)
+                // SIEMPRE se construye completo; los demás se omiten si ya no hay tiempo (una
+                // Solution vacía queda última por la penalización de lotes sin asignar).
+                if (i > 0 && System.currentTimeMillis() >= deadline) {
+                    return solution;
+                }
+                CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
+
                 List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
                 if (i == 0) {
                     shuffledBatches.sort(Comparator
@@ -107,13 +120,21 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                     // ThreadLocalRandom es thread-safe sin sincronización
                     Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
                 }
-                
+
                 for (ShipmentBatch batch : shuffledBatches) {
-                    AssignedRoute route = i == 0
-                        ? routeGenerator.generateEarliestFeasibleRoute(batch)
-                        : routeGenerator.generateFeasibleRoute(batch);
+                    // Individuos impares: sesgo multi-hop para explorar hubs alternativos
+                    boolean preferMultiHop = i > 0 && (i % 2 == 1);
+                    AssignedRoute route;
+                    if (i == 0) {
+                        route = routeGenerator.generateEarliestFeasibleRoute(batch, capacity);
+                    } else if (preferMultiHop) {
+                        route = routeGenerator.generateFeasibleRoutePreferMultiHop(batch, capacity);
+                    } else {
+                        route = routeGenerator.generateFeasibleRoute(batch, capacity);
+                    }
                     if (route != null) {
                         solution.addRoute(route);
+                        capacity.applyRoute(route);
                     } else {
                         // Solo registrar warning la primera vez que encontramos un lote no ruteable
                         if (i == 0) {
@@ -128,13 +149,33 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         
         // Mostrar resumen de lotes no ruteables (solo una vez)
         if (!unroutableBatches.isEmpty()) {
-            System.err.printf("Warning: %d batches could not be routed (no feasible path found)%n", 
+            System.err.printf("Warning: %d batches could not be routed (no feasible path found)%n",
                             unroutableBatches.size());
             if (unroutableBatches.size() <= 10) {
                 System.err.println("Unroutable batches: " + unroutableBatches);
             }
         }
-        
+
+        // Los individuos omitidos por deadline NO deben competir vacíos: bajo saturación
+        // real (línea base de almacenes al tope, época pre-colapso) una solución vacía
+        // puede GANARLE en fitness a una completa — 50k/lote sin asignar es más barato que
+        // el exceso de almacén acumulado evento a evento — y el ciclo terminaba con
+        // asignación 0%. Se reemplazan por copias del primer individuo completo (barato:
+        // copia de mapa) para que la evolución compare solo soluciones que transportan.
+        if (!batches.isEmpty()) {
+            Solution seed = population.stream()
+                .filter(s -> !s.getRoutes().isEmpty())
+                .findFirst()
+                .orElse(null);
+            if (seed != null) {
+                for (int j = 0; j < population.size(); j++) {
+                    if (population.get(j).getRoutes().isEmpty()) {
+                        population.set(j, new Solution(seed));
+                    }
+                }
+            }
+        }
+
         return population;
     }
     
@@ -170,30 +211,29 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             && effectivePopulationSize >= parallelPopulationThreshold;
     }
 
-    // Niveles adaptativos por volumen. La banda 500-2,500 se recalibró para la ventana de
-    // consumo de 1.5h (Sc=90 min): en época pico (nov-2028) cada ciclo trae ~1,000-1,600
-    // lotes y el presupuesto duro (deadline=70% de Ta) protege el ciclo — medido: pop=10 ×
-    // gens=5 usaba solo 5-9s de los 21s disponibles, así que hay espacio para buscar más
-    // profundo sin riesgo (si la VM se atrasa, el deadline corta y devuelve lo mejor logrado).
+    // Niveles adaptativos por volumen. La banda 500-2,000 (Sc=90 min, ~1,000-1,600 lotes
+    // en pico) se recalibró para explorar más (pop/gens/reinicios) sin romper el deadline
+    // duro (70% de Ta): si la VM se atrasa, corta y devuelve lo mejor logrado.
     private int effectivePopulationSize(int batchCount) {
         if (batchCount >= 4_000) return Math.min(populationSize, 6);
-        if (batchCount >= 2_000) return Math.min(populationSize, 10);
-        if (batchCount >= 1_000) return Math.min(populationSize, 12);
-        if (batchCount >= 500) return Math.min(populationSize, 14);
+        if (batchCount >= 2_000) return Math.min(populationSize, 12);
+        if (batchCount >= 1_000) return Math.min(populationSize, 14);
+        if (batchCount >= 500) return Math.min(populationSize, 16);
         return populationSize;
     }
 
     private int effectiveGenerations(int batchCount) {
         if (batchCount >= 4_000) return Math.min(generations, 3);
-        if (batchCount >= 2_000) return Math.min(generations, 6);
-        if (batchCount >= 1_000) return Math.min(generations, 8);
-        if (batchCount >= 500) return Math.min(generations, 10);
+        if (batchCount >= 2_000) return Math.min(generations, 8);
+        if (batchCount >= 1_000) return Math.min(generations, 10);
+        if (batchCount >= 500) return Math.min(generations, 12);
         return generations;
     }
 
     private int effectiveStagnationLimit(int batchCount, int effectiveGenerations) {
         if (batchCount >= 4_000) return Math.min(stagnationLimit, 3);
-        if (batchCount >= 500) return Math.min(stagnationLimit, 5);
+        if (batchCount >= 2_000) return Math.min(stagnationLimit, 5);
+        if (batchCount >= 500) return Math.min(stagnationLimit, 6);
         return Math.min(stagnationLimit, effectiveGenerations);
     }
 
@@ -201,12 +241,14 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         Solution solution = new Solution();
         List<ShipmentBatch> orderedBatches = new ArrayList<>(batches);
         orderedBatches.sort(Comparator.comparing(ShipmentBatch::ingressTime));
+        CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
 
         int unroutable = 0;
         for (ShipmentBatch batch : orderedBatches) {
-            AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(batch);
+            AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(batch, capacity);
             if (route != null) {
                 solution.addRoute(route);
+                capacity.applyRoute(route);
             } else {
                 unroutable++;
             }
@@ -323,25 +365,43 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * @param solution Solución a mutar (se modifica in-place)
      * @param batches Lista de lotes disponibles
      */
-    /** Probabilidad de generar la ruta mutada SIN cache (diversidad genuina en el pool). */
-    private static final double FRESH_ROUTE_PROBABILITY = 0.30;
+    /**
+     * Probabilidad de generar la ruta mutada SIN cache (diversidad genuina + multi-hop).
+     * Subida desde 0.30: en la banda Sc=90min el cache homogeneizaba la población.
+     */
+    private static final double FRESH_ROUTE_PROBABILITY = 0.45;
+
+    /** Probabilidad de sesgar la mutación hacia rutas multi-hop (balanceo de hubs). */
+    private static final double MULTI_HOP_MUTATION_PROBABILITY = 0.40;
 
     private void mutate(Solution solution, List<ShipmentBatch> batches) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
-        // Mutar 1-3 genes aleatorios (en vez de iterar todos con 5%)
         int mutationCount = random.nextInt(1, Math.min(4, batches.size() + 1));
+        CapacityContext capacity = CapacityContext.fromSolution(
+            solution.getRoutes().values(), storageBaseline);
 
         for (int m = 0; m < mutationCount; m++) {
             ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
-            // Bypass probabilístico del cache de rutas: el cache limita cada lote a ≤3
-            // variantes y homogeneiza la población en 2-3 generaciones (fitness estancado).
-            // Un 30% de mutaciones con BFS fresco inyecta rutas nuevas; el 70% cacheado
-            // mantiene el costo de CPU acotado bajo carga.
-            AssignedRoute newRoute = random.nextDouble() < FRESH_ROUTE_PROBABILITY
-                ? routeGenerator.generateFeasibleRouteNoCache(batch)
-                : routeGenerator.generateFeasibleRoute(batch);
+            AssignedRoute existing = solution.getRoute(batch.batchId());
+            if (existing != null) {
+                capacity.removeRoute(existing);
+            }
+
+            boolean preferMultiHop = random.nextDouble() < MULTI_HOP_MUTATION_PROBABILITY;
+            AssignedRoute newRoute;
+            if (random.nextDouble() < FRESH_ROUTE_PROBABILITY) {
+                newRoute = routeGenerator.generateFeasibleRouteNoCache(batch, capacity, preferMultiHop);
+            } else if (preferMultiHop) {
+                newRoute = routeGenerator.generateFeasibleRoutePreferMultiHop(batch, capacity);
+            } else {
+                newRoute = routeGenerator.generateFeasibleRoute(batch, capacity);
+            }
             if (newRoute != null) {
                 solution.addRoute(newRoute);
+                capacity.applyRoute(newRoute);
+            } else if (existing != null) {
+                // Restaurar ocupación si no hubo reemplazo
+                capacity.applyRoute(existing);
             }
         }
     }
@@ -398,22 +458,24 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         final long startMs = System.currentTimeMillis();
         final long deadline = maxTimeMillis > 0 ? startMs + maxTimeMillis : Long.MAX_VALUE;
 
-        // PACIENCIA ADAPTATIVA AL PRESUPUESTO: con carga ligera el presupuesto Ta queda
-        // >99% sin usar; cortar tras 4 generaciones sin mejora ahorraba un tiempo que no
-        // necesitábamos ahorrar. Con presupuesto configurado y carga baja, exploramos más.
+        // PACIENCIA ADAPTATIVA AL PRESUPUESTO: con carga ligera/media el presupuesto Ta
+        // queda subutilizado; cortar tras pocas generaciones sin mejora desperdicia tiempo
+        // útil para explorar rutas multi-hop alternativas.
         if (maxTimeMillis > 0 && batches.size() < 500) {
             effectiveStagnationLimit = Math.max(effectiveStagnationLimit, 12);
             effectiveGenerations = Math.max(effectiveGenerations, 40);
+        } else if (maxTimeMillis > 0 && batches.size() < 2_000) {
+            // Banda Sc=90min (~500–1600): más exploración sin reinicios agresivos
+            effectiveStagnationLimit = Math.max(effectiveStagnationLimit, 8);
+            effectiveGenerations = Math.max(effectiveGenerations, 14);
         }
 
-        // REINICIOS ITERADOS: cuando la evolución converge (early-stop) y sobra presupuesto,
-        // relanzar con población fresca conserva el mejor global y ataca el estancamiento
-        // causado por la baja diversidad inicial (cache de rutas). Solo con carga baja
-        // (<500 lotes) y siempre bajo el deadline duro — bajo carga alta se corre una vez,
-        // exactamente como antes.
-        final boolean restartsEnabled = maxTimeMillis > 0 && batches.size() < 500;
-        final int maxRestarts = restartsEnabled ? 6 : 1;
-        final int maxRestartsWithoutImprovement = 2;
+        // REINICIOS ITERADOS: cuando la evolución converge y sobra presupuesto, relanzar
+        // con población fresca. Extendido a <2000 (antes solo <500) con menos reinicios
+        // en la banda media para no comerse el Ta.
+        final boolean restartsEnabled = maxTimeMillis > 0 && batches.size() < 2_000;
+        final int maxRestarts = !restartsEnabled ? 1 : (batches.size() < 500 ? 6 : 3);
+        final int maxRestartsWithoutImprovement = batches.size() < 500 ? 2 : 1;
 
         Solution globalBest = null;
         int runs = 0;
@@ -477,7 +539,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             long deadline) {
 
         // 1. Inicializar población con rutas factibles (aleatoriedad nueva en cada corrida)
-        List<Solution> population = initializePopulation(batches, effectivePopulationSize);
+        List<Solution> population = initializePopulation(batches, effectivePopulationSize, deadline);
 
         double bestFitnessSoFar = Double.MAX_VALUE;
         int stagnationCounter = 0;
@@ -542,10 +604,11 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     
     /**
      * Propaga la ocupación de almacén preexistente (rutas de ciclos previos) al evaluador
-     * interno, para que las evaluaciones de este ciclo vean la carga absoluta real.
+     * y a la construcción capacity-aware de rutas de este ciclo.
      */
     public void setStorageBaseline(Map<Airport, Integer> baseline) {
-        this.evaluator.setStorageBaseline(baseline);
+        this.storageBaseline = baseline != null ? baseline : Map.of();
+        this.evaluator.setStorageBaseline(this.storageBaseline);
     }
 
     /**
@@ -589,7 +652,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.parallelPopulationThreshold = config.getInt("parallelPopulationThreshold", 32);
         this.largeVolumeBatchThreshold = config.getInt("largeVolumeBatchThreshold", 2_500);
         this.routeSearchAttempts = config.getInt("routeSearchAttempts", 12);
-        this.routeCachedVariants = config.getInt("routeCachedVariants", 3);
+        this.routeCachedVariants = config.getInt("routeCachedVariants", 5);
         this.maxTimeMillis = config.getInt("maxTimeMillis", 0);
         this.routeGenerator.configureSearchEffort(routeSearchAttempts, routeCachedVariants);
     }
