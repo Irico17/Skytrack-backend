@@ -46,11 +46,11 @@ class SolutionEvaluatorGatsTest {
     void slaPenaltyUsesFractionalHoursNotTruncated() {
         ZoneId zone = lima.zoneId();
         ZonedDateTime ingress = ZonedDateTime.of(2026, 1, 1, 8, 0, 0, 0, zone);
-        // SLA intra = 12h; llegada a 12h30 → retraso 30 min = 0.5h (toHours() daría 0)
+        // SLA intra = 24h; llegada a 24h30 → retraso 30 min = 0.5h (toHours() daría 0)
         Flight late = new Flight(
             "LATE", lima, bogota,
             ingress.plusMinutes(30),
-            ingress.plusHours(12).plusMinutes(30),
+            ingress.plusHours(24).plusMinutes(30),
             200, FlightType.INTRACONTINENTAL
         );
         ShipmentBatch batch = new ShipmentBatch(

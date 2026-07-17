@@ -32,7 +32,8 @@ import java.util.UUID;
  * para los REST controllers y el WebSocket.
  */
 @Service
-public class SimulationService implements SimulationController.SimulationListener {
+public class SimulationService implements SimulationController.SimulationListener,
+        SimulationController.LightweightStorageAware {
 
     @Autowired
     private DataLoadingService dataService;
@@ -61,6 +62,11 @@ public class SimulationService implements SimulationController.SimulationListene
     private ZonedDateTime currentStartDate;
     private ZonedDateTime currentStartedAt;
     private ZonedDateTime currentFinishedAt;
+
+    /** Último inventario/métricas enviados — reutilizados en ticks livianos durante el GA. */
+    private volatile java.util.List<CycleUpdateDTO.AirportCapacityDTO> lastAirportCapacities = List.of();
+    private volatile CycleUpdateDTO.OperationalMetricsDTO lastOperationalMetrics =
+        new CycleUpdateDTO.OperationalMetricsDTO(0, 0, 0, 0, 0, 0, 0, 0, null, 0.0);
 
     public record StartSimulationResult(String simulationId, boolean joinedExisting, ActiveSimulationDTO activeSimulation) {}
 
@@ -123,6 +129,9 @@ public class SimulationService implements SimulationController.SimulationListene
         currentStartDate = requestedStartDate;
         currentStartedAt = ZonedDateTime.now(ZoneOffset.UTC);
         currentFinishedAt = null;
+        lastAirportCapacities = List.of();
+        lastOperationalMetrics =
+            new CycleUpdateDTO.OperationalMetricsDTO(0, 0, 0, 0, 0, 0, 0, 0, null, 0.0);
 
         long startupT0 = System.currentTimeMillis();
         try {
@@ -511,20 +520,20 @@ public class SimulationService implements SimulationController.SimulationListene
                 .count())
             : 0;
 
-        // Construir vuelos activos para animación (deduplicado por flightId).
-        // Solo interesan los vuelos recientes/próximos al reloj simulado — el mapa en vivo
-        // no necesita vuelos que ya aterrizaron hace días. Sin este corte, en colapso (sin
-        // límite de duración) esta lista crece sin fin con TODA la historia acumulada de
-        // rutas, agrandando el payload de cada CYCLE_UPDATE por WebSocket ciclo tras ciclo
-        // hasta que el front deja de verse fluido (en 5 días no se nota porque la duración
-        // total está acotada a 5 días).
-        ZonedDateTime activeFlightsCutoff = status.simulatedTime() != null
-            ? status.simulatedTime().minusDays(3)
-            : null;
+        // Solo vuelos cercanos al reloj simulado (en aire o por despegar/aterrizar pronto).
+        // Antes: cutoff de 3 días atrás → miles de ActiveFlightDTO, payloads >1 MB y el
+        // ConcurrentWebSocketSessionDecorator con OVERFLOW_DROP descartaba el CYCLE_UPDATE
+        // (el front nunca veía el ciclo 2 aunque el backend sí lo hubiera terminado).
+        ZonedDateTime simNow = status.simulatedTime();
+        ZonedDateTime activeFlightsFrom = simNow != null ? simNow.minusHours(6) : null;
+        ZonedDateTime activeFlightsTo = simNow != null ? simNow.plusHours(18) : null;
         java.util.Map<String, CycleUpdateDTO.ActiveFlightDTO> flightMap = new java.util.LinkedHashMap<>();
         for (AssignedRoute route : solution.getRoutes().values()) {
             for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
-                if (activeFlightsCutoff != null && flight.arrivalTime().isBefore(activeFlightsCutoff)) {
+                if (activeFlightsFrom != null && flight.arrivalTime().isBefore(activeFlightsFrom)) {
+                    continue;
+                }
+                if (activeFlightsTo != null && flight.departureTime().isAfter(activeFlightsTo)) {
                     continue;
                 }
                 String fid = flight.flightId();
@@ -555,6 +564,10 @@ public class SimulationService implements SimulationController.SimulationListene
         // Calcular capacidad actual de cada aeropuerto (reusable para todos los modos)
         java.util.List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities =
             buildAirportCapacities(solution, status.simulatedTime());
+        CycleUpdateDTO.OperationalMetricsDTO metrics =
+            buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities);
+        lastAirportCapacities = airportCapacities;
+        lastOperationalMetrics = metrics;
 
         CycleUpdateDTO update = new CycleUpdateDTO(
             "CYCLE_UPDATE",
@@ -570,7 +583,7 @@ public class SimulationService implements SimulationController.SimulationListene
             solution.getTotalBags(),
             semaphores,
             new CycleUpdateDTO.BatchSummaryDTO((int) onTime, (int) delayed, unrouted),
-            buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities),
+            metrics,
             activeFlights,
             airportCapacities
         );
@@ -583,10 +596,14 @@ public class SimulationService implements SimulationController.SimulationListene
 
     @Override
     public void onStorageUpdated(SimulationStatus status, Solution solution) {
-        if (webSocketHandler == null) return;
+        if (webSocketHandler == null || activeController == null) return;
 
         java.util.List<CycleUpdateDTO.AirportCapacityDTO> airportCapacities =
             buildAirportCapacities(solution, status.simulatedTime());
+        CycleUpdateDTO.OperationalMetricsDTO metrics =
+            buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities);
+        lastAirportCapacities = airportCapacities;
+        lastOperationalMetrics = metrics;
 
         StorageUpdateDTO update = new StorageUpdateDTO(
             "STORAGE_UPDATE",
@@ -595,9 +612,26 @@ public class SimulationService implements SimulationController.SimulationListene
             formatDate(status.simulatedTime()),
             activeController.getDaysElapsed(),
             airportCapacities,
-            buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities)
+            metrics
         );
 
+        webSocketHandler.onStorageUpdated(update);
+    }
+
+    @Override
+    public void onStorageUpdatedLightweight(SimulationStatus status) {
+        if (webSocketHandler == null || activeController == null) return;
+
+        // Solo reloj + último inventario conocido: no recalcular O(rutas) durante el GA.
+        StorageUpdateDTO update = new StorageUpdateDTO(
+            "STORAGE_UPDATE",
+            activeController.getSimulationId(),
+            status.currentCycle(),
+            formatDate(status.simulatedTime()),
+            activeController.getDaysElapsed(),
+            lastAirportCapacities,
+            lastOperationalMetrics
+        );
         webSocketHandler.onStorageUpdated(update);
     }
 

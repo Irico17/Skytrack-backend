@@ -105,7 +105,7 @@ if [ -f "$SCRIPT_DIR/skytrack-backend.service" ]; then
 fi
 
 if [ -f /etc/skytrack/backend.env ]; then
-  SKYTRACK_JAVA_OPTS='JAVA_OPTS=-Xms192m -Xmx1024m -XX:ActiveProcessorCount=2 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+ExitOnOutOfMemoryError'
+  SKYTRACK_JAVA_OPTS='JAVA_OPTS=-Xms192m -Xmx1024m -XX:ActiveProcessorCount=1 -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp -XX:+ExitOnOutOfMemoryError'
   if grep -q '^JAVA_OPTS=' /etc/skytrack/backend.env; then
     sed -i "s|^JAVA_OPTS=.*|$SKYTRACK_JAVA_OPTS|" /etc/skytrack/backend.env
   else

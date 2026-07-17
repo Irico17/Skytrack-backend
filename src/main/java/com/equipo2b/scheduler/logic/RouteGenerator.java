@@ -15,7 +15,7 @@ import java.util.*;
  * <p>Restricciones verificadas en BFS:
  * <ul>
  *   <li>Tiempos de escala (mínimo 10 minutos)</li>
- *   <li>SLA (12h mismo continente, 24h diferentes continentes)</li>
+ *   <li>SLA (24h mismo continente, 48h diferentes continentes)</li>
  *   <li>Conexiones válidas entre vuelos</li>
  *   <li>Capacidad residual de vuelos y hubs (cuando se pasa {@link CapacityContext})</li>
  * </ul>
@@ -33,9 +33,12 @@ public class RouteGenerator {
 
     private int maxAttempts = 12;
     private int maxCachedVariants = 5;
-    private static final int MAX_ROUTE_CACHE_ENTRIES = 20_000;
+    // Las claves incluyen instante de ingreso; en simulaciones masivas casi no se
+    // reutilizan entre lotes. Un límite de 20k retenía rutas de ciclos antiguos y
+    // presionaba innecesariamente el heap de 1 GB.
+    private static final int MAX_ROUTE_CACHE_ENTRIES = 4_096;
     // Tope práctico de tramos por ruta. No se limita "artificialmente" a pocos saltos:
-    // el SLA (12h intra / 24h inter) ya poda los caminos largos y la BFS está acotada por
+    // el SLA (24h intra / 48h inter) ya poda los caminos largos y la BFS está acotada por
     // su set `visited` (aeropuerto+hora), así que subir a 5 no degrada el rendimiento.
     // 5 tramos es el máximo que el SLA permite en la práctica.
     private static final int MAX_HOPS = 5;

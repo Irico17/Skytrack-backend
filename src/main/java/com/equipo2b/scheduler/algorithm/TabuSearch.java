@@ -36,19 +36,17 @@ public class TabuSearch implements OptimizationAlgorithm {
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
     private volatile Map<Airport, Integer> storageBaseline = Map.of();
 
-    // Recalibrado para la ventana de consumo de 1.5h (~1,000-1,600 rutas por ciclo en época
-    // pico): el refinamiento tiene su propio presupuesto duro (deadline=25% de Ta) que corta
-    // a tiempo, así que puede explorar más vecinos que con los topes ultraconservadores
-    // pensados para ventanas de 6h. Sobre 2,500 rutas se sigue omitiendo por costo de copia.
+    // En la VM 1 CPU / heap 1 GB, copiar soluciones y ejecutar BFS multi-hop sobre ~900
+    // rutas agotaba el heap en el ciclo 2. La heurística masiva ya obtuvo 100% de asignación
+    // y SLA y Tabú no mejoró el fitness en las mediciones; se conserva para ventanas menores,
+    // donde sí puede explorar sin comprometer la simulación.
     private int effectiveMaxIterations(int routeCount) {
-        if (routeCount >= 2_500) return 0;
-        if (routeCount >= 1_000) return Math.min(maxIterations, 10);
+        if (routeCount >= 800) return 0;
         if (routeCount >= 500) return Math.min(maxIterations, 14);
         return maxIterations;
     }
 
     private int effectiveNeighborhoodSize(int routeCount) {
-        if (routeCount >= 1_000) return Math.min(neighborhoodSize, 4);
         if (routeCount >= 500) return Math.min(neighborhoodSize, 5);
         return neighborhoodSize;
     }
@@ -332,11 +330,20 @@ public class TabuSearch implements OptimizationAlgorithm {
     private Solution generateInitialSolution(List<ShipmentBatch> batches) {
         Solution solution = new Solution();
         CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
+        long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
+        int routed = 0;
         for (ShipmentBatch batch : batches) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf(
+                    "⏱ Tabú semilla truncada por Ta tras %d/%d lotes%n",
+                    routed, batches.size());
+                break;
+            }
             AssignedRoute route = routeGenerator.generateFeasibleRoute(batch, capacity);
             if (route != null) {
                 solution.addRoute(route);
                 capacity.applyRoute(route);
+                routed++;
             }
         }
         return solution;
@@ -676,6 +683,29 @@ public class TabuSearch implements OptimizationAlgorithm {
     public void setStorageBaseline(Map<Airport, Integer> baseline) {
         this.storageBaseline = baseline != null ? baseline : Map.of();
         this.evaluator.setStorageBaseline(this.storageBaseline);
+    }
+
+    /**
+     * Prueba BARATA (una sola búsqueda BFS, sin capacidad ni cache) de si existe AL MENOS
+     * un camino de vuelos que cumpla el SLA del lote, ignorando por completo la capacidad.
+     *
+     * <p>Distingue las dos causas de "sin ruta" que se ven idénticas desde afuera:</p>
+     * <ul>
+     *   <li><b>Congestión momentánea</b> (capacidad ocupada por otras rutas de este ciclo):
+     *       {@code true} — SÍ existe camino, solo faltó espacio; reintentar en el próximo
+     *       ciclo tiene sentido porque la ocupación cambia.</li>
+     *   <li><b>Infactibilidad estructural</b> (el SLA no alcanza para NINGUNA combinación de
+     *       vuelos entre ese origen/destino, sin importar la capacidad): {@code false} — la
+     *       geometría del plan de vuelos (frecuencia + duración) hace el SLA imposible de
+     *       cumplir. Reintentar es pura pérdida de presupuesto: el resultado NUNCA cambia
+     *       de un ciclo a otro porque el horario de vuelos no cambia.</li>
+     * </ul>
+     *
+     * @param batch Lote sin ruta a diagnosticar
+     * @return true si existe algún camino factible por horario/SLA (con o sin capacidad)
+     */
+    public boolean hasFeasiblePathIgnoringCapacity(ShipmentBatch batch) {
+        return routeGenerator.generateEarliestFeasibleRoute(batch, null) != null;
     }
 
     /**

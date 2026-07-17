@@ -39,7 +39,9 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
 
     /** Presupuesto de envío por cliente antes de desconectarlo (cliente lento ≠ simulador lento). */
     private static final int SEND_TIME_LIMIT_MS = 2_000;
-    private static final int SEND_BUFFER_LIMIT_BYTES = 1024 * 1024; // 1 MB por sesión
+    // Los activeFlights ya están acotados a la ventana visible; 1 MB protege la VM
+    // de 2 GB cuando hay varios clientes lentos conectados.
+    private static final int SEND_BUFFER_LIMIT_BYTES = 1024 * 1024;
     private static final DateTimeFormatter ISO_OFFSET = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
     // Sesiones DECORADAS (ConcurrentWebSocketSessionDecorator) indexadas por id: el decorador

@@ -106,11 +106,12 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
 
         List<Solution> population = populationIndexes.map(i -> {
                 Solution solution = new Solution();
-                // GUARDA DE PRESUPUESTO: la construcción capacity-aware es más cara que la
-                // antigua; con poblaciones de 14-16 individuos podía consumir todo el deadline
-                // antes del primer chequeo por generación. El individuo 0 (semilla greedy)
-                // SIEMPRE se construye completo; los demás se omiten si ya no hay tiempo (una
-                // Solution vacía queda última por la penalización de lotes sin asignar).
+                // GUARDA DE PRESUPUESTO: con SLA 24h/48h el BFS ve ~2× vuelos y construir
+                // UN solo individuo (la semilla) sobre 900–1600 lotes puede consumir todo Ta
+                // sin llegar a la generación 1 — el reloj simulado no avanza hasta que
+                // optimize() retorna, y el frontend parece "congelado". Cortamos también
+                // DENTRO del bucle de lotes (semilla incluida): mejor solución parcial a
+                // tiempo que semilla completa fuera de Sa.
                 if (i > 0 && System.currentTimeMillis() >= deadline) {
                     return solution;
                 }
@@ -127,7 +128,16 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                     Collections.shuffle(shuffledBatches, ThreadLocalRandom.current());
                 }
 
+                int routed = 0;
                 for (ShipmentBatch batch : shuffledBatches) {
+                    if (System.currentTimeMillis() >= deadline) {
+                        if (i == 0) {
+                            System.out.printf(
+                                "⏱ Semilla GA truncada por Ta tras %d/%d lotes (SLA largo / VM lenta)%n",
+                                routed, shuffledBatches.size());
+                        }
+                        break;
+                    }
                     // Individuos impares: sesgo multi-hop para explorar hubs alternativos
                     boolean preferMultiHop = i > 0 && (i % 2 == 1);
                     AssignedRoute route;
@@ -141,6 +151,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                     if (route != null) {
                         solution.addRoute(route);
                         capacity.applyRoute(route);
+                        routed++;
                     } else {
                         // Solo registrar warning la primera vez que encontramos un lote no ruteable
                         if (i == 0) {
@@ -243,18 +254,26 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         return Math.min(stagnationLimit, effectiveGenerations);
     }
 
-    private Solution buildHeuristicSolution(List<ShipmentBatch> batches) {
+    private Solution buildHeuristicSolution(List<ShipmentBatch> batches, long deadline) {
         Solution solution = new Solution();
         List<ShipmentBatch> orderedBatches = new ArrayList<>(batches);
         orderedBatches.sort(Comparator.comparing(ShipmentBatch::ingressTime));
         CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
 
         int unroutable = 0;
+        int routed = 0;
         for (ShipmentBatch batch : orderedBatches) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf(
+                    "⏱ Heurística masiva truncada por Ta tras %d/%d lotes%n",
+                    routed, orderedBatches.size());
+                break;
+            }
             AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(batch, capacity);
             if (route != null) {
                 solution.addRoute(route);
                 capacity.applyRoute(route);
+                routed++;
             } else {
                 unroutable++;
             }
@@ -268,12 +287,13 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
 
     private Solution optimizeLargeVolume(List<ShipmentBatch> batches) {
         long startMs = System.currentTimeMillis();
+        long deadline = maxTimeMillis > 0 ? startMs + maxTimeMillis : Long.MAX_VALUE;
         System.out.printf(
             "Carga masiva (%d lotes): usando planificación heurística cacheada para respetar CPU/RAM%n",
             batches.size()
         );
 
-        Solution solution = buildHeuristicSolution(batches);
+        Solution solution = buildHeuristicSolution(batches, deadline);
         evaluator.evaluate(solution);
 
         System.out.printf(

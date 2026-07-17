@@ -28,7 +28,14 @@ import java.util.UUID;
  */
 public class SimulationController {
     private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
-    private static final long STORAGE_UPDATE_INTERVAL_MS = 250L;
+    /** Intervalo normal de STORAGE_UPDATE (reloj + inventario). */
+    private static final long STORAGE_UPDATE_INTERVAL_MS = 1_000L;
+    /**
+     * Durante executePlanningCycle el hilo de inventario NO debe competir con el GA/Tabú
+     * en VMs de 1 CPU: cada calculateCurrentBags + métricas + JSON robaba el núcleo y
+     * alargaba el ciclo a minutos. Solo tick de reloj liviano.
+     */
+    private static final long STORAGE_UPDATE_INTERVAL_PLANNING_MS = 2_000L;
     /** Relleno de capacidad por sub-lotes (split en vuelos directos). Aditivo y seguro. */
     private static final boolean PARTIAL_FILL_ENABLED = true;
     /**
@@ -74,6 +81,8 @@ public class SimulationController {
     private Thread simulationThread;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean paused = new AtomicBoolean(false);
+    /** True mientras corre GA/Tabú/split del ciclo actual (el hilo de storage se aligera). */
+    private final AtomicBoolean planningInProgress = new AtomicBoolean(false);
     
     // Scheduler y componentes
     private Scheduler scheduler;
@@ -93,7 +102,8 @@ public class SimulationController {
     private SimulationListener listener;
     
     // Estadísticas
-    private int currentCycle = 0;
+    /** Número de ciclos COMPLETADOS. Durante el primer planning permanece en 0. */
+    private volatile int currentCycle = 0;
     private ZonedDateTime simulatedTime;
     private int batchesProcessed = 0;
     private int batchesFailed = 0;
@@ -532,15 +542,19 @@ public class SimulationController {
      */
     private void runSimulation(ScenarioType scenario) {
         try {
-            long simStartRealMs = System.currentTimeMillis();
+            // El reloj se ancla DESPUÉS de terminar el primer ciclo. Mientras se prepara
+            // la solución inicial la UI permanece en "Preparando…" y el tiempo simulado
+            // sigue exactamente en startDate.
+            long simClockStartRealMs = -1L;
             long simStartSimMs = simulatedTime.toInstant().toEpochMilli();
             ZonedDateTime planningCursor = simulatedTime;
             ZonedDateTime simulationEndTime = scenario == ScenarioType.PERIOD_SIMULATION
                 ? planningCursor.plusDays(5)
                 : null;
 
-            simulatedClockHorizon = planningCursor;
-            startStorageUpdateLoop(simStartRealMs, simStartSimMs, scenario);
+            // Después del warm-up, el reloj de pantalla sigue wall×K y no se ata a la
+            // ventana Sc del ciclo en curso. Así no se congela durante un planning largo.
+            simulatedClockHorizon = simulationEndTime;
 
             while (running.get()) {
                 // Esperar si está pausado
@@ -551,12 +565,11 @@ public class SimulationController {
                 if (!running.get()) break;
                 
                 // =========== INICIO DEL CICLO ===========
-                currentCycle++;
+                int cycleNumber = currentCycle + 1;
                 long cycleStartRealMs = System.currentTimeMillis();
-                System.out.println("\n--- CICLO " + currentCycle + " ---");
+                System.out.println("\n--- CICLO " + cycleNumber + " ---");
                 ZonedDateTime cyclePlanningTime = planningCursor;
                 ZonedDateTime cycleHorizon = cyclePlanningTime.plusMinutes(scenario.getSc());
-                simulatedClockHorizon = cycleHorizon;
                 
                 // 0b. Línea base de almacenes: ocupación REAL de cada aeropuerto al inicio de
                 //     la ventana, según las rutas YA planificadas en ciclos anteriores. Sin
@@ -564,7 +577,7 @@ public class SimulationController {
                 //     rutas previas parecía vacío) y seguía concentrando carga hasta el
                 //     colapso. Con la base, el desborde duro y el balanceo convexo del
                 //     evaluador ven la ocupación absoluta.
-                if (currentCycle > 1 && inventoryService != null && currentSolution != null
+                if (cycleNumber > 1 && inventoryService != null && currentSolution != null
                         && !currentSolution.getRoutes().isEmpty()) {
                     scheduler.setStorageBaseline(inventoryService.calculateCurrentBags(
                         currentSolution, cyclePlanningTime, currentBatches));
@@ -573,10 +586,18 @@ public class SimulationController {
                 // 1. Ejecutar algoritmo sobre una ventana de consumo discreta y secuencial.
                 //    Si el algoritmo se demora, el siguiente ciclo no salta datos: continúa
                 //    desde cycleHorizon, no desde el reloj de pared.
-                currentSolution = scheduler.executePlanningCycle(cyclePlanningTime);
+                planningInProgress.set(true);
+                try {
+                    currentSolution = scheduler.executePlanningCycle(cyclePlanningTime);
+                } finally {
+                    planningInProgress.set(false);
+                }
+                // Publicar el número solo cuando el ciclo está completo. Esto evita que
+                // /status haga creer al frontend que ya existe CYCLE_UPDATE durante el warm-up.
+                currentCycle = cycleNumber;
                 long algorithmMs = System.currentTimeMillis() - cycleStartRealMs;
                 planningCursor = cycleHorizon;
-                if (currentCycle == 1) {
+                if (cycleNumber == 1) {
                     System.out.printf("⏱️ [arranque] primer ciclo de planificación listo en %d ms (algoritmo)%n", algorithmMs);
                 }
                 logResourceUsage(scenario, algorithmMs);
@@ -596,9 +617,11 @@ public class SimulationController {
                     }
                 }
 
-                // 2. Avanzar tiempo simulado: basado en tiempo real transcurrido × K
-                //    Esto asegura que el reloj del backend coincida con el del frontend
-                updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
+                // El ciclo 1 es warm-up: su frame se publica exactamente en startDate.
+                // Desde el ciclo 2, el reloj ya está anclado al final del warm-up.
+                if (simClockStartRealMs >= 0) {
+                    updateSimulatedClock(simClockStartRealMs, simStartSimMs, scenario);
+                }
 
                 // 3. Verificar colapso (instancia compartida — el detector es sin estado)
                 CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
@@ -612,6 +635,13 @@ public class SimulationController {
                     } catch (Exception e) {
                         System.err.println("⚠️ Error notificando listener: " + e.getMessage());
                     }
+                }
+
+                // Arrancar reloj/ticks SOLO después de que el frontend recibió el primer
+                // CYCLE_UPDATE. El siguiente ciclo se agenda Sa segundos desde este instante.
+                if (cycleNumber == 1) {
+                    simClockStartRealMs = System.currentTimeMillis();
+                    startStorageUpdateLoop(simClockStartRealMs, simStartSimMs, scenario);
                 }
 
                 // Nota: el algoritmo ahora respeta un presupuesto de tiempo duro (deadline=Ta),
@@ -697,7 +727,8 @@ public class SimulationController {
                 // 6. Esperar Sa segundos reales desde el INICIO del ciclo (no desde el fin del algoritmo)
                 //    Esto mantiene el ritmo constante: ciclos cada Sa segundos reales
                 long saMs = scenario.getSaSeconds() * 1000L;
-                long elapsedInCycleMs = System.currentTimeMillis() - cycleStartRealMs;
+                long cadenceStartRealMs = cycleNumber == 1 ? simClockStartRealMs : cycleStartRealMs;
+                long elapsedInCycleMs = System.currentTimeMillis() - cadenceStartRealMs;
                 long remainingMs = saMs - elapsedInCycleMs;
 
                 if (remainingMs > 0) {
@@ -713,6 +744,12 @@ public class SimulationController {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             System.out.println("⚠️  Simulación interrumpida");
+        } catch (OutOfMemoryError e) {
+            // Error no recuperable, pero sí debe llegar como SIMULATION_ERROR al frontend.
+            // Antes quedaba como un STOP silencioso porque Exception no captura Error.
+            lastErrorMessage = "Memoria insuficiente durante la planificación del ciclo "
+                + (currentCycle + 1);
+            System.err.println("❌ " + lastErrorMessage);
         } catch (Exception e) {
             lastErrorMessage = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             System.err.println("❌ Simulación falló: " + lastErrorMessage);
@@ -1049,40 +1086,42 @@ public class SimulationController {
                 break;
                 
             case PERIOD_SIMULATION:
-                // Configuración ajustada para VM 2 CPU / 2 GB
-                gaConfig.setInt("populationSize", 20);
-                gaConfig.setInt("generations", 10);
+                // VM típica del curso: 1 CPU / 2 GB. Priorizar terminar dentro de Ta
+                // y no saturar el único núcleo (sin paralelismo, búsqueda de rutas corta).
+                gaConfig.setInt("populationSize", 10);
+                gaConfig.setInt("generations", 5);
                 gaConfig.setDouble("mutationRate", 0.15);
-                gaConfig.setInt("stagnationLimit", 6);
+                gaConfig.setInt("stagnationLimit", 3);
                 gaConfig.setBoolean("parallelEnabled", false);
-                gaConfig.setInt("routeSearchAttempts", 12);
-                gaConfig.setInt("routeCachedVariants", 5);
-                // Primer ciclo con presupuesto recortado: red vacia, la semilla ya es casi optima
-                gaConfig.setDouble("firstCycleBudgetRatio", 0.35);
-                tabuConfig.setInt("maxIterations", 32);
-                tabuConfig.setInt("tabuTenure", 12);
-                tabuConfig.setInt("neighborhoodSize", 8);
-                tabuConfig.setInt("routeSearchAttempts", 10);
-                tabuConfig.setInt("routeCachedVariants", 4);
+                gaConfig.setInt("routeSearchAttempts", 4);
+                gaConfig.setInt("routeCachedVariants", 2);
+                // Heurística greedy antes: en 1 CPU el GA completo por encima de ~800 lotes
+                // no cabe en Ta y solo alarga el ciclo (UI congelada / CYCLE_UPDATE tarde).
+                gaConfig.setInt("largeVolumeBatchThreshold", 800);
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
+                tabuConfig.setInt("maxIterations", 16);
+                tabuConfig.setInt("tabuTenure", 8);
+                tabuConfig.setInt("neighborhoodSize", 4);
+                tabuConfig.setInt("routeSearchAttempts", 4);
+                tabuConfig.setInt("routeCachedVariants", 2);
                 break;
                 
             case COLLAPSE_SIMULATION:
-                // Mismos parámetros/velocidad que PERIOD (decisión PO) y config liviana
-                // apta para VM 2 CPU / 2 GB; el deadline duro garantiza Ta.
-                gaConfig.setInt("populationSize", 20);
-                gaConfig.setInt("generations", 10);
+                // Misma calibración liviana que PERIOD (1 CPU / 2 GB).
+                gaConfig.setInt("populationSize", 10);
+                gaConfig.setInt("generations", 5);
                 gaConfig.setDouble("mutationRate", 0.15);
-                gaConfig.setInt("stagnationLimit", 6);
+                gaConfig.setInt("stagnationLimit", 3);
                 gaConfig.setBoolean("parallelEnabled", false);
-                gaConfig.setInt("routeSearchAttempts", 12);
-                gaConfig.setInt("routeCachedVariants", 5);
-                // Primer ciclo con presupuesto recortado: red vacia, la semilla ya es casi optima
-                gaConfig.setDouble("firstCycleBudgetRatio", 0.35);
-                tabuConfig.setInt("maxIterations", 32);
-                tabuConfig.setInt("tabuTenure", 12);
-                tabuConfig.setInt("neighborhoodSize", 8);
-                tabuConfig.setInt("routeSearchAttempts", 10);
-                tabuConfig.setInt("routeCachedVariants", 4);
+                gaConfig.setInt("routeSearchAttempts", 4);
+                gaConfig.setInt("routeCachedVariants", 2);
+                gaConfig.setInt("largeVolumeBatchThreshold", 800);
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
+                tabuConfig.setInt("maxIterations", 16);
+                tabuConfig.setInt("tabuTenure", 8);
+                tabuConfig.setInt("neighborhoodSize", 4);
+                tabuConfig.setInt("routeSearchAttempts", 4);
+                tabuConfig.setInt("routeCachedVariants", 2);
                 break;
         }
 
@@ -1202,9 +1241,14 @@ public class SimulationController {
                     }
                     if (!running.get()) return;
 
+                    boolean planning = planningInProgress.get();
                     updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
-                    notifyStorageUpdated();
-                    Thread.sleep(STORAGE_UPDATE_INTERVAL_MS);
+                    // Durante el GA: no recalcular inventario ni saturar el WS (1 CPU / buffer DROP).
+                    // El reloj sí avanza vía frames livianos en onStorageUpdated.
+                    notifyStorageUpdated(planning);
+                    Thread.sleep(planning
+                        ? STORAGE_UPDATE_INTERVAL_PLANNING_MS
+                        : STORAGE_UPDATE_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
@@ -1216,12 +1260,28 @@ public class SimulationController {
     }
 
     private void notifyStorageUpdated() {
+        notifyStorageUpdated(false);
+    }
+
+    private void notifyStorageUpdated(boolean lightweight) {
         if (listener == null) return;
         try {
-            listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
+            if (lightweight && listener instanceof LightweightStorageAware aware) {
+                aware.onStorageUpdatedLightweight(buildLightweightStatus());
+            } else {
+                listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
+            }
         } catch (Exception e) {
             System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
         }
+    }
+
+    /**
+     * Extensión opcional del listener: tick de reloj sin inventario O(rutas).
+     * SimulationService la implementa para no matar el núcleo único durante el GA.
+     */
+    public interface LightweightStorageAware {
+        void onStorageUpdatedLightweight(SimulationStatus status);
     }
 
     private void updateSimulatedClock(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {

@@ -19,8 +19,13 @@ import java.util.concurrent.atomic.AtomicLong;
 public class FlightPlan {
     private final List<Flight> allFlights;
     private final Map<String, List<Flight>> flightsByOrigin;  // Índice para búsqueda rápida por Airport ID
+    /**
+     * Cachea proyecciones por DÍAS completos, no por segundos exactos de cada nodo BFS.
+     * La versión anterior retenía hasta 60.000 listas, cada una con objetos Flight nuevos;
+     * en 1 GB de heap agotaba memoria durante el Tabú del ciclo 2.
+     */
     private final Map<FlightQueryKey, List<Flight>> projectedFlightsCache = new ConcurrentHashMap<>();
-    private static final int MAX_PROJECTED_FLIGHT_CACHE_ENTRIES = 60_000;
+    private static final int MAX_PROJECTED_FLIGHT_CACHE_ENTRIES = 256;
 
     /**
      * Set thread-safe de IDs de vuelos cancelados durante la simulación.
@@ -93,65 +98,66 @@ public class FlightPlan {
                                               ZonedDateTime start, 
                                               ZonedDateTime end) {
         FlightQueryKey queryKey = FlightQueryKey.from(origin, start, end, cancellationRevision.get());
-        List<Flight> cachedFlights = projectedFlightsCache.get(queryKey);
-        if (cachedFlights != null) {
-            return cachedFlights;
-        }
-
-        if (projectedFlightsCache.size() > MAX_PROJECTED_FLIGHT_CACHE_ENTRIES) {
+        if (projectedFlightsCache.size() >= MAX_PROJECTED_FLIGHT_CACHE_ENTRIES
+                && !projectedFlightsCache.containsKey(queryKey)) {
             projectedFlightsCache.clear();
         }
 
+        List<Flight> projectedWindow = projectedFlightsCache.computeIfAbsent(
+            queryKey, ignored -> projectFlightsForWholeDays(origin, start, end));
+
+        // El cache usa días completos para maximizar reutilización. Aplicar aquí el corte
+        // exacto solicitado por el nodo BFS sin crear nuevas instancias Flight.
+        return projectedWindow.stream()
+            .filter(f -> !f.departureTime().isBefore(start))
+            .filter(f -> !f.departureTime().isAfter(end))
+            .toList();
+    }
+
+    private List<Flight> projectFlightsForWholeDays(
+            Airport origin, ZonedDateTime requestedStart, ZonedDateTime requestedEnd) {
         List<Flight> baseFlights = flightsByOrigin.getOrDefault(origin.id(), Collections.emptyList());
-        List<Flight> adjustedFlights = new ArrayList<>();
-        
-        // Calcular cuántos días necesitamos proyectar los vuelos
-        long daysDiff = baseFlights.isEmpty()
-            ? 0
-            : java.time.temporal.ChronoUnit.DAYS.between(
-                baseFlights.get(0).departureTime().toLocalDate(),
-                start.withZoneSameInstant(origin.zoneId()).toLocalDate()
-            );
-        
-        // Para cada vuelo base, crear instancias ajustadas que caigan en la ventana temporal
-        for (Flight baseFlight : baseFlights) {
-            // Proyectar el vuelo al día de inicio y días siguientes si es necesario
-            for (long dayOffset = daysDiff; dayOffset <= daysDiff + 7; dayOffset++) {
-                ZonedDateTime adjustedDeparture = baseFlight.departureTime().plusDays(dayOffset);
-                ZonedDateTime adjustedArrival = baseFlight.arrivalTime().plusDays(dayOffset);
-                
-                // Verificar si este vuelo ajustado cae en la ventana temporal
-                if (!adjustedDeparture.isBefore(start) && !adjustedDeparture.isAfter(end)) {
-                    // Crear un nuevo vuelo con las fechas ajustadas
-                    String adjustedId = baseFlight.flightId() + "-D" + dayOffset;
-
-                    // Saltar vuelos cancelados para esta instancia de día
-                    if (cancelledFlightIds.contains(adjustedId)) {
-                        continue;
-                    }
-
-                    Flight adjustedFlight = new Flight(
-                        adjustedId,
-                        baseFlight.origin(),
-                        baseFlight.destination(),
-                        adjustedDeparture,
-                        adjustedArrival,
-                        baseFlight.capacity(),
-                        baseFlight.type()
-                    );
-                    adjustedFlights.add(adjustedFlight);
-                }
-            }
+        if (baseFlights.isEmpty()) {
+            return List.of();
         }
 
+        ZonedDateTime dayStart = requestedStart.withZoneSameInstant(origin.zoneId())
+            .toLocalDate().atStartOfDay(origin.zoneId());
+        ZonedDateTime dayEndExclusive = requestedEnd.withZoneSameInstant(origin.zoneId())
+            .toLocalDate().plusDays(1).atStartOfDay(origin.zoneId());
+        long firstDayOffset = java.time.temporal.ChronoUnit.DAYS.between(
+            baseFlights.get(0).departureTime().toLocalDate(), dayStart.toLocalDate());
+        long lastDayOffset = java.time.temporal.ChronoUnit.DAYS.between(
+            baseFlights.get(0).departureTime().toLocalDate(),
+            dayEndExclusive.toLocalDate().minusDays(1));
+
+        List<Flight> adjustedFlights = new ArrayList<>();
+        for (Flight baseFlight : baseFlights) {
+            for (long dayOffset = firstDayOffset; dayOffset <= lastDayOffset; dayOffset++) {
+                ZonedDateTime departure = baseFlight.departureTime().plusDays(dayOffset);
+                if (departure.isBefore(dayStart) || !departure.isBefore(dayEndExclusive)) {
+                    continue;
+                }
+                String adjustedId = baseFlight.flightId() + "-D" + dayOffset;
+                if (cancelledFlightIds.contains(adjustedId)) {
+                    continue;
+                }
+                adjustedFlights.add(new Flight(
+                    adjustedId,
+                    baseFlight.origin(),
+                    baseFlight.destination(),
+                    departure,
+                    baseFlight.arrivalTime().plusDays(dayOffset),
+                    baseFlight.capacity(),
+                    baseFlight.type()
+                ));
+            }
+        }
         adjustedFlights.sort(Comparator
             .comparing(Flight::departureTime)
             .thenComparing(Flight::arrivalTime)
             .thenComparing(Flight::flightId));
-        
-        List<Flight> immutableFlights = List.copyOf(adjustedFlights);
-        List<Flight> existingFlights = projectedFlightsCache.putIfAbsent(queryKey, immutableFlights);
-        return existingFlights != null ? existingFlights : immutableFlights;
+        return List.copyOf(adjustedFlights);
     }
 
     /**
@@ -255,12 +261,13 @@ public class FlightPlan {
         projectedFlightsCache.clear();
     }
 
-    private record FlightQueryKey(String originId, long startEpochSecond, long endEpochSecond, long cancellationRevision) {
+    private record FlightQueryKey(
+            String originId, long startLocalEpochDay, long endLocalEpochDay, long cancellationRevision) {
         private static FlightQueryKey from(Airport origin, ZonedDateTime start, ZonedDateTime end, long revision) {
             return new FlightQueryKey(
                 origin.id(),
-                start.toInstant().getEpochSecond(),
-                end.toInstant().getEpochSecond(),
+                start.withZoneSameInstant(origin.zoneId()).toLocalDate().toEpochDay(),
+                end.withZoneSameInstant(origin.zoneId()).toLocalDate().toEpochDay(),
                 revision
             );
         }

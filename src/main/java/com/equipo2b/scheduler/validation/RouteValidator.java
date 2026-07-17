@@ -181,7 +181,7 @@ public class RouteValidator {
     /**
      * REMOVED: Flight duration validation is not a business constraint.
      * 
-     * The SLA constraint (12h same continent, 24h different continents) applies to the 
+     * The SLA constraint (24h same continent, 48h different continents) applies to the
      * TOTAL transit time from registration to delivery, not to individual flight durations.
      * 
      * Individual flights can have any realistic duration as long as the total route 

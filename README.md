@@ -95,12 +95,14 @@ El backend valida todo en una carpeta temporal antes de tocar los archivos activ
 
 ## SLA Operativo
 
-El modelo usa estos limites para decidir si una maleta fue entregada a tiempo:
+El modelo usa estos limites (plazo de entrega del enunciado) para decidir si una maleta fue entregada a tiempo:
 
-- Mismo continente: 12 horas desde el ingreso del lote.
-- Continentes diferentes: 24 horas desde el ingreso del lote.
+- Mismo continente: 24 horas (1 día) desde el ingreso del lote.
+- Continentes diferentes: 48 horas (2 días) desde el ingreso del lote.
 
-Estos valores son los que alimentan `ShipmentBatch.calculateSLA()`, `AssignedRoute.meetsSLA()` y el conteo de rutas con/sin SLA en WebSocket.
+No confundir con los tiempos tipicos de traslado de vuelo (medio dia / un dia = 12h/24h en `FlightType`).
+
+Estos valores alimentan `ShipmentBatch.calculateSLA()`, `AssignedRoute.meetsSLA()` y el conteo de rutas con/sin SLA en WebSocket.
 
 ## Optimizacion Para Volumen Alto
 
