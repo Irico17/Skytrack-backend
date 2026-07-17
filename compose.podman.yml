@@ -50,8 +50,14 @@ services:
       DATA_RESULTS_DIR: /app/data/results
       LOGGING_LEVEL_COM_EQUIPO2B: INFO
       LOGGING_LEVEL_SPRING_WEB_SOCKET: INFO
+      # Xmx768m: pico de heap medido ~350 MB (2028, ciclo 1 con Tabú dinámico) → 2×
+      # de margen. Con Xmx1024 el RSS real (heap+metaspace+threads) rozaba el límite
+      # del contenedor y en la VM de 2 GB (donde los límites sumaban 2048m sin dejar
+      # nada al SO) el kernel OOM-mataba a java a mitad del ciclo 1 → el backend
+      # reiniciaba vacío y el frontend recibía 404 en /status para siempre.
       JAVA_TOOL_OPTIONS: >-
-        -Xms192m -Xmx1024m
+        -Xms192m -Xmx768m
+        -XX:MaxMetaspaceSize=160m
         -XX:+UseG1GC
         -XX:ActiveProcessorCount=2
         -XX:ParallelGCThreads=2
@@ -71,7 +77,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 90s
-    mem_limit: 1536m
+    # 1152m > RSS máximo esperado (~1000m con Xmx768+metaspace160+threads). La suma de
+    # límites (384+1152+128 = 1664m) deja ~380m para SO+podman en la VM de 2 GB.
+    mem_limit: 1152m
     cpus: 1.6
     networks:
       - scheduling

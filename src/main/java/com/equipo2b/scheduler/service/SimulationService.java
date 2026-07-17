@@ -595,6 +595,12 @@ public class SimulationService implements SimulationController.SimulationListene
     }
 
     @Override
+    public void onPreparationProgress(SimulationStatus status, String message) {
+        if (webSocketHandler == null || activeController == null) return;
+        webSocketHandler.onPreparationProgress(activeController.getSimulationId(), message);
+    }
+
+    @Override
     public void onStorageUpdated(SimulationStatus status, Solution solution) {
         if (webSocketHandler == null || activeController == null) return;
 

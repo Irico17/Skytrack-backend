@@ -45,6 +45,16 @@ public class Scheduler {
     private final boolean partialFillEnabled;
     private final RouteGenerator fillRouteGenerator;  // para sub-lotes multi-hop (puede ser null)
     private static final int MIN_FILL_BAGS = 1;
+
+    /**
+     * PRIMER CICLO RÁPIDO (mismo principio que GA.firstCycleBudgetRatio, aplicado al
+     * Tabú): con la red vacía el usuario ve "Preparando simulación…" hasta que el ciclo 1
+     * entero termina. Medido en contenedor 2 CPU/1.5 GB: con presupuesto dinámico completo
+     * el Tabú consumía ~20-25 s del Ta en el ciclo 1 (total ~27 s con datos de 2028),
+     * haciendo parecer colgada la UI. Ciclos siguientes (red cargada, donde el balanceo
+     * SÍ es crítico) usan el presupuesto dinámico completo.
+     */
+    private static final double FIRST_CYCLE_REFINE_BUDGET_RATIO = 0.20;
     
     // Parámetros de configuración
     private final int taSeconds;  // Presupuesto del algoritmo (segundos)
@@ -183,6 +193,9 @@ public class Scheduler {
         //    la optimización de la ventana nueva: los candidatos del ciclo se evalúan
         //    contra la ocupación absoluta real de cada almacén.
         applyStorageBaseline(pendingStorageBaseline);
+        // Red vacía = primer ciclo real (warm start). Se calcula ANTES de optimizar
+        // porque currentSolution se reemplaza más abajo con la acumulada de este ciclo.
+        boolean isWarmStart = currentSolution.getRoutes().isEmpty();
         long startTime = System.currentTimeMillis();
         String algorithmName = algorithmType == AlgorithmType.GATS ? "Algoritmo Genético" : "Búsqueda Tabú";
         System.out.println("\nEjecutando " + algorithmName + "...");
@@ -203,9 +216,17 @@ public class Scheduler {
         if (useRefinement) {
             startTime = System.currentTimeMillis();
             long taMillisBudget = taSeconds > 0 ? taSeconds * 1000L : 0;
+            // Margen del 15% de Ta (≥1.5s): en la VM del curso (más lenta que el equipo
+            // de desarrollo) la acumulación/evaluación/validación post-algoritmo también
+            // se encarece; con Ta=30s el algoritmo termina a ~25.5s y queda holgura real.
             long refineBudget = taMillisBudget > 0
-                ? taMillisBudget - primaryTime - Math.max(1_000L, taMillisBudget / 10)
+                ? taMillisBudget - primaryTime - Math.max(1_500L, Math.round(taMillisBudget * 0.15))
                 : 0;
+
+            if (isWarmStart && taMillisBudget > 0) {
+                refineBudget = Math.min(refineBudget,
+                    Math.round(taMillisBudget * FIRST_CYCLE_REFINE_BUDGET_RATIO));
+            }
 
             if (taMillisBudget > 0 && refineBudget < 500) {
                 System.out.println("⏱ Sin presupuesto restante para refinamiento Tabú (fase primaria usó "

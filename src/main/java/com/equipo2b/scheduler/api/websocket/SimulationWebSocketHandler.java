@@ -51,6 +51,10 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
     private final Map<String, String> sessionSubscriptions = new ConcurrentHashMap<>();
     private final Map<String, String> lastCycleUpdateBySimId = new ConcurrentHashMap<>();
     private final Map<String, String> lastStorageUpdateBySimId = new ConcurrentHashMap<>();
+    // Progreso de warm-up (ciclo 1 en curso). Se cachea porque el cliente suele conectar
+    // el WS DESPUÉS de que el hilo de simulación ya emitió el aviso; se borra al llegar
+    // el primer CYCLE_UPDATE para que clientes nuevos no vean texto obsoleto.
+    private final Map<String, String> lastPreparationBySimId = new ConcurrentHashMap<>();
     private final ObjectMapper mapper;
 
     private volatile String activeSimId = "N/A";
@@ -100,6 +104,7 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
         try {
             String json = mapper.writeValueAsString(update);
             lastCycleUpdateBySimId.put(update.simulationId(), json);
+            lastPreparationBySimId.remove(update.simulationId());
             broadcast(update.simulationId(), json);
         } catch (Exception e) {
             System.err.println("⚠️ Error serializando CYCLE_UPDATE: " + e.getMessage());
@@ -113,6 +118,25 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
             broadcast(update.simulationId(), json);
         } catch (Exception e) {
             System.err.println("⚠️ Error serializando STORAGE_UPDATE: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Progreso de warm-up: emitido por el hilo de simulación antes de completar el
+     * ciclo 1 (p. ej. "Datos de envíos cargados — calculando el primer plan…").
+     */
+    public void onPreparationProgress(String simId, String message) {
+        if (simId == null || simId.isBlank() || message == null) return;
+        try {
+            String json = mapper.writeValueAsString(Map.of(
+                "type", "PREPARATION_PROGRESS",
+                "simulationId", simId,
+                "message", message
+            ));
+            lastPreparationBySimId.put(simId, json);
+            broadcast(simId, json);
+        } catch (Exception e) {
+            System.err.println("⚠️ Error serializando PREPARATION_PROGRESS: " + e.getMessage());
         }
     }
 
@@ -137,6 +161,7 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
     @Override
     public void onCycleCompleted(SimulationStatus status, Solution solution) {
         try {
+            lastPreparationBySimId.remove(activeSimId);
             Map<String, Object> msg = Map.of(
                 "type", "CYCLE_UPDATE",
                 "simulationId", activeSimId,
@@ -207,11 +232,15 @@ public class SimulationWebSocketHandler extends TextWebSocketHandler
         if (simId != null && !simId.isBlank()) {
             lastCycleUpdateBySimId.keySet().removeIf(k -> !k.equals(simId));
             lastStorageUpdateBySimId.keySet().removeIf(k -> !k.equals(simId));
+            lastPreparationBySimId.keySet().removeIf(k -> !k.equals(simId));
         }
     }
 
     private void sendSnapshot(WebSocketSession session) {
         String simId = resolveSubscription(sessionSubscriptions.get(session.getId()));
+        // Solo existe durante el warm-up (se borra al primer CYCLE_UPDATE): cubre la
+        // carrera en que el hilo de simulación lo emitió antes de que el WS conectara.
+        sendIfOpen(session, lastPreparationBySimId.get(simId));
         sendIfOpen(session, lastCycleUpdateBySimId.get(simId));
         sendIfOpen(session, lastStorageUpdateBySimId.get(simId));
     }

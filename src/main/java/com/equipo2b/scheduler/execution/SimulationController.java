@@ -583,6 +583,22 @@ public class SimulationController {
                         currentSolution, cyclePlanningTime, currentBatches));
                 }
 
+                // 0c. Aviso de warm-up al frontend: confirma que los datos de envíos ya
+                //     están cargados y que el ciclo 1 está calculándose. El handler WS lo
+                //     cachea, así que clientes que conecten tarde también lo reciben.
+                if (cycleNumber == 1 && listener != null) {
+                    try {
+                        String prepMsg = currentBatches.isEmpty()
+                            ? "✓ Datos listos (sin envíos precargados) — esperando registros para el ciclo 1"
+                            : String.format(
+                                "✓ Datos de envíos cargados (%,d lotes) — calculando el primer plan de rutas (hasta ~%d s)…",
+                                currentBatches.size(), scenario.getTaSeconds());
+                        listener.onPreparationProgress(getStatus(), prepMsg);
+                    } catch (Exception e) {
+                        System.err.println("⚠️ Error notificando preparación: " + e.getMessage());
+                    }
+                }
+
                 // 1. Ejecutar algoritmo sobre una ventana de consumo discreta y secuencial.
                 //    Si el algoritmo se demora, el siguiente ciclo no salta datos: continúa
                 //    desde cycleHorizon, no desde el reloj de pared.
@@ -1075,12 +1091,18 @@ public class SimulationController {
         
         switch (scenario) {
             case DAY_TO_DAY:
-                // Configuración rápida
+                // Ta=90s/Sa=120s (mucho más holgado que PERIOD/COLLAPSE), pero cada ciclo
+                // solo consume Sc=2min de datos reales — normalmente pocos lotes. Mismo
+                // diseño anytime: topes generosos, el deadline dinámico gobierna cuánto se
+                // usa. firstCycleBudgetRatio protege el ciclo 1 si el usuario precargó
+                // muchos envíos por la web antes de arrancar.
                 gaConfig.setInt("populationSize", 20);
-                gaConfig.setInt("generations", 15);
+                gaConfig.setInt("generations", 40);
                 gaConfig.setDouble("mutationRate", 0.1);
+                gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
-                tabuConfig.setInt("maxIterations", 50);
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
+                tabuConfig.setInt("maxIterations", 2_000);
                 tabuConfig.setInt("tabuTenure", 10);
                 tabuConfig.setInt("neighborhoodSize", 15);
                 break;
@@ -1211,6 +1233,15 @@ public class SimulationController {
          * @param status Estado final
          */
         void onSimulationFinished(SimulationStatus status);
+
+        /**
+         * Llamado durante el warm-up (antes de que termine el ciclo 1) con mensajes de
+         * progreso. Sin esto el frontend no recibe NADA entre "Simulación iniciada" y el
+         * primer CYCLE_UPDATE (medido: hasta ~27 s en la VM de 2 CPU) y la pantalla
+         * "Preparando simulación…" parece colgada. Default no-op para no romper
+         * implementaciones existentes (tests, listeners mínimos).
+         */
+        default void onPreparationProgress(SimulationStatus status, String message) {}
     }
 
     /**
