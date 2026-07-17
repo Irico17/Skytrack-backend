@@ -54,6 +54,12 @@ public class Scheduler {
     
     // Solución actual del sistema
     private Solution currentSolution;
+
+    // Cola de reintento: lotes que NO obtuvieron ruta en el ciclo anterior y aún pueden
+    // cumplir su SLA. Entran al siguiente ciclo ANTES que los lotes nuevos (prioridad).
+    // Los lotes sin camino factible por horario/SLA (infactibilidad estructural: el plan
+    // de vuelos no cambia entre ciclos) NO se reintentan — sería presupuesto perdido.
+    private final List<ShipmentBatch> carryoverBatches = new ArrayList<>();
     
     /**
      * Constructor del Scheduler con algoritmo configurable.
@@ -156,9 +162,16 @@ public class Scheduler {
         
         System.out.println("Ventana de consumo: " + Sc + " minutos");
         
-        // 2. Consumir pedidos de ShipmentQueue en ventana Sc
-        List<ShipmentBatch> batches = shipmentQueue.consumeShipments(windowStart, windowEnd);
-        System.out.println("Lotes consumidos: " + batches.size());
+        // 2. Consumir pedidos de ShipmentQueue en ventana Sc + reintentos del ciclo anterior.
+        //    Los reintentos van PRIMERO: llevan más tiempo esperando y menos margen de SLA.
+        List<ShipmentBatch> newBatches = shipmentQueue.consumeShipments(windowStart, windowEnd);
+        int retryCount = carryoverBatches.size();
+        List<ShipmentBatch> batches = new ArrayList<>(retryCount + newBatches.size());
+        batches.addAll(carryoverBatches);
+        batches.addAll(newBatches);
+        carryoverBatches.clear();
+        System.out.println("Lotes consumidos: " + newBatches.size() + " nuevos"
+            + (retryCount > 0 ? " + " + retryCount + " en reintento = " + batches.size() : ""));
         
         if (batches.isEmpty()) {
             System.out.println("No hay lotes para planificar");
@@ -240,7 +253,11 @@ public class Scheduler {
         }
 
         logQualityMetrics(batches, finalSolution, accumulatedSolution, validationReport);
-        
+
+        // 7b. Clasificar lotes sin ruta: reintento (aún dentro de SLA y con camino factible),
+        //     vencidos (su SLA expira antes del próximo ciclo) o estructuralmente imposibles.
+        registerUnroutedForRetry(batches, accumulatedSolution, windowEnd);
+
         // 8. Registrar tiempo de ejecución y verificar que sea <= Ta
         long totalTime = primaryTime + refinementTime;
         long taMillis = taSeconds * 1000L;
@@ -253,6 +270,57 @@ public class Scheduler {
         
         currentSolution = accumulatedSolution;
         return currentSolution;
+    }
+
+    /**
+     * Encola para el próximo ciclo los lotes que quedaron SIN RUTA en este, filtrando los
+     * casos donde reintentar no tiene sentido:
+     * <ul>
+     *   <li><b>SLA vencido</b>: su deadline cae antes del fin de esta ventana — ya es
+     *       irrecuperable, reintentarlo solo infla la carga del algoritmo.</li>
+     *   <li><b>Infactibilidad estructural</b>: no existe NINGUNA combinación de vuelos que
+     *       cumpla el SLA aunque la capacidad fuera infinita. Como el plan de vuelos no
+     *       cambia entre ciclos, el resultado nunca cambiaría.</li>
+     * </ul>
+     * Los que sí se encolan fallaron por congestión momentánea (capacidad ocupada por otras
+     * rutas de esta ventana), que sí puede resolverse en el ciclo siguiente.
+     *
+     * <p>Limitación conocida: la búsqueda de rutas parte del ingreso del lote, así que un
+     * reintento podría elegir un vuelo que despega dentro de la ventana anterior (hasta Sc
+     * minutos "en el pasado" del reloj de planificación). Con Sc=90min el efecto es menor.</p>
+     */
+    private void registerUnroutedForRetry(List<ShipmentBatch> batches,
+                                          Solution accumulated,
+                                          ZonedDateTime windowEnd) {
+        Set<String> routedBaseIds = new HashSet<>();
+        for (String key : accumulated.getRoutes().keySet()) {
+            routedBaseIds.add(baseBatchId(key));
+        }
+
+        int expired = 0;
+        int structural = 0;
+        for (ShipmentBatch batch : batches) {
+            if (routedBaseIds.contains(batch.batchId())) {
+                continue;
+            }
+            ZonedDateTime slaDeadline = batch.ingressTime().plus(batch.calculateSLA());
+            if (!slaDeadline.isAfter(windowEnd)) {
+                expired++;
+                continue;
+            }
+            if (!tabuSearch.hasFeasiblePathIgnoringCapacity(batch)) {
+                structural++;
+                continue;
+            }
+            carryoverBatches.add(batch);
+        }
+
+        if (!carryoverBatches.isEmpty() || expired > 0 || structural > 0) {
+            System.out.printf(
+                "🔁 Sin ruta este ciclo: %d pasan a reintento, %d con SLA vencido, %d sin camino factible por horario (no se reintentan)%n",
+                carryoverBatches.size(), expired, structural
+            );
+        }
     }
 
     /**

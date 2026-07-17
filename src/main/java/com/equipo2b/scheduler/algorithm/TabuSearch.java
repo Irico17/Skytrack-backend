@@ -36,17 +36,21 @@ public class TabuSearch implements OptimizationAlgorithm {
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
     private volatile Map<Airport, Integer> storageBaseline = Map.of();
 
-    // En la VM 1 CPU / heap 1 GB, copiar soluciones y ejecutar BFS multi-hop sobre ~900
-    // rutas agotaba el heap en el ciclo 2. La heurística masiva ya obtuvo 100% de asignación
-    // y SLA y Tabú no mejoró el fitness en las mediciones; se conserva para ventanas menores,
-    // donde sí puede explorar sin comprometer la simulación.
+    // El agotamiento de heap que obligó a apagar Tabú en ciclos pico venía de los caches
+    // sin límite práctico (proyecciones de FlightPlan y rutas), ya acotados. Las copias de
+    // Solution son superficiales (comparten AssignedRoute), así que un vecindario pequeño
+    // con el deadline duro de refine() cabe en 1 CPU / 1 GB. En pico (≥800 rutas) Tabú es
+    // la ÚNICA fase que balancea almacenes (el GA cede a la heurística greedy), por eso no
+    // se apaga: pocas iteraciones, movimientos de descongestión incluidos.
     private int effectiveMaxIterations(int routeCount) {
-        if (routeCount >= 800) return 0;
+        if (routeCount >= 2_500) return 0;
+        if (routeCount >= 800) return Math.min(maxIterations, 16);
         if (routeCount >= 500) return Math.min(maxIterations, 14);
         return maxIterations;
     }
 
     private int effectiveNeighborhoodSize(int routeCount) {
+        if (routeCount >= 800) return Math.min(neighborhoodSize, 4);
         if (routeCount >= 500) return Math.min(neighborhoodSize, 5);
         return neighborhoodSize;
     }

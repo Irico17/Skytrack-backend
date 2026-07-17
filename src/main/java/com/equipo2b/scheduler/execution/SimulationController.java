@@ -1095,8 +1095,10 @@ public class SimulationController {
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 4);
                 gaConfig.setInt("routeCachedVariants", 2);
-                // Heurística greedy antes: en 1 CPU el GA completo por encima de ~800 lotes
-                // no cabe en Ta y solo alarga el ciclo (UI congelada / CYCLE_UPDATE tarde).
+                // Medido (2028-11-01, ciclos de 900-1600 lotes): el GA poblacional NO cabe
+                // en Ta=30s — se corta en la generación 0 y la asignación cae a 62%/9%/1%.
+                // La heurística greedy capacity-aware asigna el 100% en 1.5-2s; el balanceo
+                // de almacenes en pico queda a cargo del Tabú acotado (deadline 25% de Ta).
                 gaConfig.setInt("largeVolumeBatchThreshold", 800);
                 gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
                 tabuConfig.setInt("maxIterations", 16);
@@ -1105,7 +1107,7 @@ public class SimulationController {
                 tabuConfig.setInt("routeSearchAttempts", 4);
                 tabuConfig.setInt("routeCachedVariants", 2);
                 break;
-                
+
             case COLLAPSE_SIMULATION:
                 // Misma calibración liviana que PERIOD (1 CPU / 2 GB).
                 gaConfig.setInt("populationSize", 10);

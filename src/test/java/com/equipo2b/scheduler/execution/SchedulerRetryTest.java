@@ -7,7 +7,6 @@ import com.equipo2b.scheduler.algorithm.TabuSearch;
 import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 import com.equipo2b.scheduler.validation.RouteValidator;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.time.ZoneId;
@@ -18,7 +17,8 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Especificación de la cola de reintento en Scheduler (aún no cableada).
+ * Cola de reintento en Scheduler: los lotes sin ruta se reintentan el ciclo siguiente con
+ * prioridad, salvo que su SLA haya vencido o no exista camino factible por horario.
  * SLA enunciado: 24h mismo continente / 48h distinto continente.
  */
 class SchedulerRetryTest {
@@ -39,7 +39,6 @@ class SchedulerRetryTest {
     }
 
     @Test
-    @Disabled("Cola de reintento aún no implementada en Scheduler.executePlanningCycle")
     void unroutedBatchIsRetriedNextCycleWithPriorityThenDroppedAfterSlaExpires() {
         ZoneId zone = ZoneId.of("America/Lima");
         Airport lima = new Airport("SPIM", "Lima", "PE", zone, 400, -12.0, -77.0, Continent.AMERICA);
@@ -88,7 +87,6 @@ class SchedulerRetryTest {
      * Este caso usa un único vuelo que llega DESPUÉS del deadline de 48h.
      */
     @Test
-    @Disabled("Cola de reintento aún no implementada; el test documenta el filtro estructural")
     void unroutedBatchWithNoFeasiblePathIsNeverRetried() {
         ZoneId zone = ZoneId.of("Asia/Kolkata");
         Airport delhi = new Airport("VIDP", "Delhi", "IN", zone, 480, 28.6, 77.2, Continent.ASIA);
