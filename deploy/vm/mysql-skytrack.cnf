@@ -1,0 +1,7 @@
+# Skytrack — MySQL en la VM de 2 GB compartida con el backend (Xmx768m) y nginx.
+# Mismos valores que compose.podman.yml; sin esto MySQL 8 usa ~400-500 MB RSS.
+[mysqld]
+innodb_buffer_pool_size = 128M
+max_connections = 25
+performance_schema = OFF
+skip-log-bin

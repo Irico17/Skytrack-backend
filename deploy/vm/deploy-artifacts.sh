@@ -105,7 +105,11 @@ if [ -f "$SCRIPT_DIR/skytrack-backend.service" ]; then
 fi
 
 if [ -f /etc/skytrack/backend.env ]; then
-  SKYTRACK_JAVA_OPTS='JAVA_OPTS=-Xms192m -Xmx1024m -XX:ActiveProcessorCount=1 -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp -XX:+ExitOnOutOfMemoryError'
+  # 2 CPUs reales de la VM (antes decía 1 y castraba GA/Tabú y el GC). Xmx768m:
+  # heap pico medido ~350 MB; con Xmx1024 el RSS (heap+metaspace+threads) rozaba
+  # MemoryMax=1300M del service y el kernel OOM-mataba a java a mitad del ciclo 1
+  # (systemd lo reiniciaba vacío y el frontend quedaba con 404 de /status).
+  SKYTRACK_JAVA_OPTS='JAVA_OPTS=-Xms192m -Xmx768m -XX:MaxMetaspaceSize=160m -XX:ActiveProcessorCount=2 -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp -XX:+ExitOnOutOfMemoryError'
   if grep -q '^JAVA_OPTS=' /etc/skytrack/backend.env; then
     sed -i "s|^JAVA_OPTS=.*|$SKYTRACK_JAVA_OPTS|" /etc/skytrack/backend.env
   else
@@ -136,6 +140,15 @@ chown -R www-data:www-data /var/www/skytrack
 # quedaban en el repo sin aplicarse nunca en la VM salvo copia manual.
 if [ -f "$SCRIPT_DIR/nginx-skytrack.conf" ]; then
   install -m 0644 "$SCRIPT_DIR/nginx-skytrack.conf" /etc/nginx/sites-available/skytrack
+fi
+
+# Dieta de memoria para MySQL (VM de 2 GB): aplicar en redeploy si cambió; el restart
+# solo ocurre cuando el archivo es distinto para no cortar conexiones sin motivo.
+if [ -f "$SCRIPT_DIR/mysql-skytrack.cnf" ] && [ -d /etc/mysql/mysql.conf.d ]; then
+  if ! cmp -s "$SCRIPT_DIR/mysql-skytrack.cnf" /etc/mysql/mysql.conf.d/skytrack.cnf 2>/dev/null; then
+    install -m 0644 "$SCRIPT_DIR/mysql-skytrack.cnf" /etc/mysql/mysql.conf.d/skytrack.cnf
+    systemctl restart mysql || echo "⚠️  MySQL no pudo reiniciarse; revisa: systemctl status mysql"
+  fi
 fi
 
 systemctl daemon-reload

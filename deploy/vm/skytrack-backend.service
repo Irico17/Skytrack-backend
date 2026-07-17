@@ -13,8 +13,13 @@ ExecStart=/bin/sh -c 'exec /usr/bin/java $JAVA_OPTS -jar /opt/skytrack/backend/s
 SuccessExitStatus=143
 Restart=on-failure
 RestartSec=5
-MemoryMax=1300M
-CPUQuota=100%
+# 1152M > RSS máximo esperado con Xmx768+MaxMetaspace160 (~1050M). Con el par
+# anterior (Xmx1024 / MemoryMax=1300M) el RSS cruzaba el límite durante el
+# ciclo 1 con muchos lotes → OOM-kill → reinicio vacío → 404 en el frontend.
+MemoryMax=1152M
+# 2 cores reales de la VM; 170% deja CPU para MySQL y nginx (100% era 1 core
+# y contradecía ActiveProcessorCount=2 del JAVA_OPTS).
+CPUQuota=170%
 Nice=5
 NoNewPrivileges=true
 PrivateTmp=true

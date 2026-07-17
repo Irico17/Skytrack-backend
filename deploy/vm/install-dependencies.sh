@@ -19,6 +19,12 @@ apt-get install -y openjdk-17-jre-headless nginx mysql-server unzip curl openssl
 systemctl enable --now mysql
 systemctl enable --now nginx
 
+# Dieta de memoria para MySQL (VM de 2 GB compartida con backend Xmx768m + nginx).
+if [ -f "$SCRIPT_DIR/mysql-skytrack.cnf" ] && [ -d /etc/mysql/mysql.conf.d ]; then
+  install -m 0644 "$SCRIPT_DIR/mysql-skytrack.cnf" /etc/mysql/mysql.conf.d/skytrack.cnf
+  systemctl restart mysql
+fi
+
 if ! id -u skytrack >/dev/null 2>&1; then
   useradd --system --home /opt/skytrack --shell /usr/sbin/nologin skytrack
 fi
@@ -86,7 +92,7 @@ MAX_UPLOAD_FILE_SIZE=25MB
 MAX_UPLOAD_REQUEST_SIZE=128MB
 JPA_SHOW_SQL=false
 LOGGING_LEVEL_COM_EQUIPO2B=INFO
-JAVA_OPTS=-Xms192m -Xmx1024m -XX:ActiveProcessorCount=2 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+ExitOnOutOfMemoryError
+JAVA_OPTS=-Xms192m -Xmx768m -XX:MaxMetaspaceSize=160m -XX:ActiveProcessorCount=2 -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -XX:+UseG1GC -XX:MaxGCPauseMillis=250 -XX:+UseStringDeduplication -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp -XX:+ExitOnOutOfMemoryError
 EOF
 chown root:skytrack "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
