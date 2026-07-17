@@ -53,8 +53,8 @@ services:
       JAVA_TOOL_OPTIONS: >-
         -Xms192m -Xmx1024m
         -XX:+UseG1GC
-        -XX:ActiveProcessorCount=1
-        -XX:ParallelGCThreads=1
+        -XX:ActiveProcessorCount=2
+        -XX:ParallelGCThreads=2
         -XX:ConcGCThreads=1
         -Djava.util.concurrent.ForkJoinPool.common.parallelism=1
         -Dfile.encoding=UTF-8
@@ -72,7 +72,7 @@ services:
       retries: 5
       start_period: 90s
     mem_limit: 1536m
-    cpus: 0.8
+    cpus: 1.6
     networks:
       - scheduling
 

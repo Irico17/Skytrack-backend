@@ -25,7 +25,7 @@ USER app
 EXPOSE 8080
 
 ENV SPRING_PROFILES_ACTIVE=container
-ENV JAVA_TOOL_OPTIONS="-Xms192m -Xmx1024m -XX:+UseG1GC -XX:ActiveProcessorCount=1 -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1 -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -Dfile.encoding=UTF-8"
+ENV JAVA_TOOL_OPTIONS="-Xms192m -Xmx1024m -XX:+UseG1GC -XX:ActiveProcessorCount=2 -XX:ParallelGCThreads=2 -XX:ConcGCThreads=1 -Djava.util.concurrent.ForkJoinPool.common.parallelism=1 -Dfile.encoding=UTF-8"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:8080/actuator/health || exit 1

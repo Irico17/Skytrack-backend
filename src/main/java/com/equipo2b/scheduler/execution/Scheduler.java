@@ -195,15 +195,32 @@ public class Scheduler {
         Solution finalSolution = primarySolution;
         long refinementTime = 0;
 
-        // 4. Refinar con Búsqueda Tabú (solo para GATS)
+        // 4. Refinar con Búsqueda Tabú (solo para GATS) con PRESUPUESTO DINÁMICO: recibe
+        //    todo el Ta que la fase primaria no consumió (menos un margen para split/
+        //    evaluación/validación). Así, cuando la semilla es rápida, el balanceo de
+        //    almacenes/vuelos por escalas dispone de decenas de segundos en lugar de un
+        //    porcentaje fijo, sin jamás exceder Ta.
         if (useRefinement) {
             startTime = System.currentTimeMillis();
-            System.out.println("\nRefinando con Búsqueda Tabú...");
-            finalSolution = tabuSearch.refine(primarySolution);
-            refinementTime = System.currentTimeMillis() - startTime;
+            long taMillisBudget = taSeconds > 0 ? taSeconds * 1000L : 0;
+            long refineBudget = taMillisBudget > 0
+                ? taMillisBudget - primaryTime - Math.max(1_000L, taMillisBudget / 10)
+                : 0;
 
-            System.out.println("✓ Refinamiento completado en " + refinementTime + " ms");
-            System.out.println("  Fitness mejorado: " + String.format("%.2f", finalSolution.getFitness()));
+            if (taMillisBudget > 0 && refineBudget < 500) {
+                System.out.println("⏱ Sin presupuesto restante para refinamiento Tabú (fase primaria usó "
+                    + primaryTime + " ms de " + taMillisBudget + " ms)");
+            } else {
+                System.out.println("\nRefinando con Búsqueda Tabú"
+                    + (taMillisBudget > 0 ? " (presupuesto dinámico: " + refineBudget + " ms)..." : "..."));
+                finalSolution = taMillisBudget > 0
+                    ? tabuSearch.refine(primarySolution, refineBudget)
+                    : tabuSearch.refine(primarySolution);
+                refinementTime = System.currentTimeMillis() - startTime;
+
+                System.out.println("✓ Refinamiento completado en " + refinementTime + " ms");
+                System.out.println("  Fitness mejorado: " + String.format("%.2f", finalSolution.getFitness()));
+            }
         }
 
         // Retirar la línea base ANTES de evaluar la solución ACUMULADA: la acumulada ya

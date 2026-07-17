@@ -1086,22 +1086,19 @@ public class SimulationController {
                 break;
                 
             case PERIOD_SIMULATION:
-                // VM típica del curso: 1 CPU / 2 GB. Priorizar terminar dentro de Ta
-                // y no saturar el único núcleo (sin paralelismo, búsqueda de rutas corta).
-                gaConfig.setInt("populationSize", 10);
-                gaConfig.setInt("generations", 5);
+                // VM del curso: 2 CPU / 2 GB (frontend + backend). Diseño ANYTIME: el GA
+                // mide el costo real de la semilla y decide con eso cuántos individuos
+                // caben; el Tabú recibe todo el Ta restante como presupuesto dinámico.
+                // populationSize/maxIterations son TOPES — quien gobierna es el deadline.
+                gaConfig.setInt("populationSize", 16);
+                gaConfig.setInt("generations", 40);
                 gaConfig.setDouble("mutationRate", 0.15);
-                gaConfig.setInt("stagnationLimit", 3);
+                gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 4);
                 gaConfig.setInt("routeCachedVariants", 2);
-                // Medido (2028-11-01, ciclos de 900-1600 lotes): el GA poblacional NO cabe
-                // en Ta=30s — se corta en la generación 0 y la asignación cae a 62%/9%/1%.
-                // La heurística greedy capacity-aware asigna el 100% en 1.5-2s; el balanceo
-                // de almacenes en pico queda a cargo del Tabú acotado (deadline 25% de Ta).
-                gaConfig.setInt("largeVolumeBatchThreshold", 800);
                 gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
-                tabuConfig.setInt("maxIterations", 16);
+                tabuConfig.setInt("maxIterations", 400);
                 tabuConfig.setInt("tabuTenure", 8);
                 tabuConfig.setInt("neighborhoodSize", 4);
                 tabuConfig.setInt("routeSearchAttempts", 4);
@@ -1109,17 +1106,16 @@ public class SimulationController {
                 break;
 
             case COLLAPSE_SIMULATION:
-                // Misma calibración liviana que PERIOD (1 CPU / 2 GB).
-                gaConfig.setInt("populationSize", 10);
-                gaConfig.setInt("generations", 5);
+                // Misma calibración anytime que PERIOD (2 CPU / 2 GB).
+                gaConfig.setInt("populationSize", 16);
+                gaConfig.setInt("generations", 40);
                 gaConfig.setDouble("mutationRate", 0.15);
-                gaConfig.setInt("stagnationLimit", 3);
+                gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
                 gaConfig.setInt("routeSearchAttempts", 4);
                 gaConfig.setInt("routeCachedVariants", 2);
-                gaConfig.setInt("largeVolumeBatchThreshold", 800);
                 gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
-                tabuConfig.setInt("maxIterations", 16);
+                tabuConfig.setInt("maxIterations", 400);
                 tabuConfig.setInt("tabuTenure", 8);
                 tabuConfig.setInt("neighborhoodSize", 4);
                 tabuConfig.setInt("routeSearchAttempts", 4);
@@ -1128,9 +1124,13 @@ public class SimulationController {
         }
 
         // Presupuesto de tiempo duro por ciclo (deadline): el algoritmo nunca excede Ta.
-        // GA ~70% y Tabú ~25% de Ta (5% de margen para evaluación/acumulación).
+        // GA ~40% de Ta como TOPE; el Tabú recibe en runtime todo lo que el GA no use
+        // (presupuesto dinámico en Scheduler). Medido: la evolución poblacional aporta
+        // poco fitness por segundo frente a los movimientos de descongestión del Tabú,
+        // así que el reparto favorece al refinamiento. El maxTimeMillis del Tabú es solo
+        // fallback para usos sin presupuesto explícito (p. ej. TABU_PURE).
         long taMs = scenario.getTaSeconds() * 1000L;
-        gaConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.70));
+        gaConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.40));
         tabuConfig.setInt("maxTimeMillis", (int) Math.round(taMs * 0.25));
 
         ga.configure(gaConfig);

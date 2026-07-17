@@ -36,24 +36,11 @@ public class TabuSearch implements OptimizationAlgorithm {
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
     private volatile Map<Airport, Integer> storageBaseline = Map.of();
 
-    // El agotamiento de heap que obligó a apagar Tabú en ciclos pico venía de los caches
-    // sin límite práctico (proyecciones de FlightPlan y rutas), ya acotados. Las copias de
-    // Solution son superficiales (comparten AssignedRoute), así que un vecindario pequeño
-    // con el deadline duro de refine() cabe en 1 CPU / 1 GB. En pico (≥800 rutas) Tabú es
-    // la ÚNICA fase que balancea almacenes (el GA cede a la heurística greedy), por eso no
-    // se apaga: pocas iteraciones, movimientos de descongestión incluidos.
-    private int effectiveMaxIterations(int routeCount) {
-        if (routeCount >= 2_500) return 0;
-        if (routeCount >= 800) return Math.min(maxIterations, 16);
-        if (routeCount >= 500) return Math.min(maxIterations, 14);
-        return maxIterations;
-    }
-
-    private int effectiveNeighborhoodSize(int routeCount) {
-        if (routeCount >= 800) return Math.min(neighborhoodSize, 4);
-        if (routeCount >= 500) return Math.min(neighborhoodSize, 5);
-        return neighborhoodSize;
-    }
+    // Sin topes por cantidad de rutas: el DEADLINE gobierna cuánto se explora (diseño
+    // anytime). Con 400 rutas cada iteración es barata y caben cientos; con 3.000 caben
+    // menos, pero las que caben se ejecutan igual — no hay acantilados de comportamiento.
+    // Las copias de Solution son superficiales (comparten AssignedRoute) y los caches de
+    // proyecciones/rutas están acotados, así que el costo por iteración es predecible.
     
     /**
      * Constructor que inicializa Búsqueda Tabú con dependencias.
@@ -87,28 +74,23 @@ public class TabuSearch implements OptimizationAlgorithm {
         currentSolution.setFitness(evaluator.evaluate(currentSolution));
         
         Solution bestSolution = new Solution(currentSolution);
-        int effectiveMaxIterations = effectiveMaxIterations(currentSolution.getRoutes().size());
-        int effectiveNeighborhoodSize = effectiveNeighborhoodSize(currentSolution.getRoutes().size());
 
-        if (effectiveMaxIterations == 0) {
-            System.out.printf(
-                "Carga alta (%d rutas): se omite Tabú puro para respetar tiempo de ciclo%n",
-                currentSolution.getRoutes().size()
-            );
-            return bestSolution;
-        }
-        
         // Lista tabú: contiene batch IDs de rutas modificadas recientemente
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
-        
-        // Iterar durante maxIterations iteraciones
-        for (int iter = 0; iter < effectiveMaxIterations; iter++) {
+        final long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
+
+        // Iterar hasta maxIterations o hasta agotar el presupuesto de tiempo
+        for (int iter = 0; iter < maxIterations; iter++) {
+            if (System.currentTimeMillis() >= deadline) {
+                System.out.printf("⏱️ Tabú detenido por presupuesto de tiempo en iteración %d%n", iter);
+                break;
+            }
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
-            
+
             // Explorar vecindario
-            for (int n = 0; n < effectiveNeighborhoodSize; n++) {
+            for (int n = 0; n < neighborhoodSize; n++) {
                 Move move = generateMove(currentSolution, batches);
                 Solution neighbor = move.solution();
                 neighbor.setFitness(evaluator.evaluate(neighbor));
@@ -155,45 +137,45 @@ public class TabuSearch implements OptimizationAlgorithm {
      * **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.6**
      */
     public Solution refine(Solution initialSolution) {
+        return refine(initialSolution, maxTimeMillis);
+    }
+
+    /**
+     * Refinamiento con presupuesto de tiempo EXPLÍCITO (diseño anytime).
+     *
+     * <p>El Scheduler pasa aquí todo el Ta que la fase primaria no consumió: si la
+     * semilla tomó 2s de un Ta de 30s, el Tabú explora ~27s en lugar de un porcentaje
+     * fijo. Cuantas más iteraciones, más movimientos de descongestión de vuelos y
+     * almacenes se prueban — y una ruta con escalas reemplaza a la directa siempre que
+     * el fitness (que incluye el desbalance global de almacenes) mejore.</p>
+     *
+     * @param initialSolution Solución a refinar
+     * @param budgetMillis Presupuesto duro en ms (0 = sin límite de tiempo)
+     * @return Mejor solución encontrada dentro del presupuesto
+     */
+    public Solution refine(Solution initialSolution, long budgetMillis) {
         Solution currentSolution = new Solution(initialSolution);
         if (!currentSolution.isEvaluated()) {
             currentSolution.setFitness(evaluator.evaluate(currentSolution));
         }
-        
+
         Solution bestSolution = new Solution(currentSolution);
-        int routeCount = currentSolution.getRoutes().size();
-        int effectiveMaxIterations = effectiveMaxIterations(routeCount);
-        int effectiveNeighborhoodSize = effectiveNeighborhoodSize(routeCount);
 
-        if (effectiveMaxIterations == 0) {
-            System.out.printf(
-                "Carga alta (%d rutas): se omite refinamiento Tabú para respetar tiempo de ciclo%n",
-                routeCount
-            );
-            return bestSolution;
-        }
-
-        if (effectiveMaxIterations != maxIterations || effectiveNeighborhoodSize != neighborhoodSize) {
-            System.out.printf(
-                "Carga alta (%d rutas): Tabú adaptativo iteraciones=%d, vecindario=%d%n",
-                routeCount, effectiveMaxIterations, effectiveNeighborhoodSize
-            );
-        }
-        
         Queue<String> tabuList = new LinkedList<>();
         Set<String> tabuSet = new HashSet<>();
-        final long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
+        final long deadline = budgetMillis > 0 ? System.currentTimeMillis() + budgetMillis : Long.MAX_VALUE;
+        int iterationsExecuted = 0;
 
-        for (int iter = 0; iter < effectiveMaxIterations; iter++) {
+        for (int iter = 0; iter < maxIterations; iter++) {
             if (System.currentTimeMillis() >= deadline) {
-                System.out.printf("⏱️ Tabú detenido por presupuesto de tiempo en iteración %d%n", iter);
                 break;
             }
+            iterationsExecuted = iter + 1;
             Solution bestNeighbor = null;
             String bestMoveBatchId = null;
-            
+
             // Explorar vecindario generando variaciones de rutas individuales
-            for (int n = 0; n < effectiveNeighborhoodSize; n++) {
+            for (int n = 0; n < neighborhoodSize; n++) {
                 Move move = generateMoveFromSolution(currentSolution);
                 Solution neighbor = move.solution();
                 neighbor.setFitness(evaluator.evaluate(neighbor));
@@ -219,8 +201,12 @@ public class TabuSearch implements OptimizationAlgorithm {
                 updateTabuList(tabuList, tabuSet, bestMoveBatchId);
             }
         }
-        
-        // Retornar mejor solución encontrada
+
+        System.out.printf(
+            "🔎 Tabú: %d iteraciones (%d rutas), fitness %.2f → %.2f%n",
+            iterationsExecuted, bestSolution.getRoutes().size(),
+            initialSolution.getFitness(), bestSolution.getFitness()
+        );
         return bestSolution;
     }
     
