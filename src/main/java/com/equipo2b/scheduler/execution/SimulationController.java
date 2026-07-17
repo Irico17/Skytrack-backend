@@ -1098,7 +1098,9 @@ public class SimulationController {
                 gaConfig.setInt("routeSearchAttempts", 4);
                 gaConfig.setInt("routeCachedVariants", 2);
                 gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
-                tabuConfig.setInt("maxIterations", 400);
+                // Tope holgado: medido que 400 iteraciones terminan ANTES del presupuesto
+                // dinámico; quien debe cortar es el deadline, no el contador.
+                tabuConfig.setInt("maxIterations", 2_000);
                 tabuConfig.setInt("tabuTenure", 8);
                 tabuConfig.setInt("neighborhoodSize", 4);
                 tabuConfig.setInt("routeSearchAttempts", 4);
@@ -1115,7 +1117,7 @@ public class SimulationController {
                 gaConfig.setInt("routeSearchAttempts", 4);
                 gaConfig.setInt("routeCachedVariants", 2);
                 gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
-                tabuConfig.setInt("maxIterations", 400);
+                tabuConfig.setInt("maxIterations", 2_000);
                 tabuConfig.setInt("tabuTenure", 8);
                 tabuConfig.setInt("neighborhoodSize", 4);
                 tabuConfig.setInt("routeSearchAttempts", 4);

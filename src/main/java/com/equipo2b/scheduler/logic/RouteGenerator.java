@@ -169,6 +169,83 @@ public class RouteGenerator {
         return null;
     }
 
+    /**
+     * Búsqueda de LLEGADA MÁS TEMPRANA: variante de Dijkstra (label-setting) sobre la red
+     * tiempo-dependiente de vuelos.
+     *
+     * <p>Diferencia clave con el BFS de {@link #findPath}: el BFS con cola FIFO devuelve el
+     * primer camino que alcanza el destino en orden de NÚMERO DE ESCALAS — puede preferir un
+     * directo que despega 10 horas más tarde sobre una escala que ya habría llegado. Aquí la
+     * cola de prioridad expande siempre la etiqueta con menor hora de llegada y la dominancia
+     * por aeropuerto ("ya llegué antes ahí") poda el resto, así que el primer camino que toca
+     * el destino es EL de llegada más temprana — máximo margen de SLA, y con escalas cuando
+     * las escalas genuinamente llegan antes.</p>
+     *
+     * <p>Mismos filtros que el BFS: escala mínima 10 min, deadline de SLA, capacidad residual
+     * de vuelos y hubs cuando hay {@link CapacityContext}. El tope {@link #MAX_HOPS} acota la
+     * profundidad (con la poda por dominancia casi nunca se alcanza).</p>
+     */
+    private List<Flight> findEarliestArrivalPath(Airport origin, Airport destination,
+                                                 ZonedDateTime startTime, Duration sla,
+                                                 int batchQuantity, CapacityContext capacity) {
+        ZonedDateTime deadline = startTime.plus(sla);
+
+        record Label(Airport airport, ZonedDateTime time, List<Flight> path) {}
+        PriorityQueue<Label> frontier = new PriorityQueue<>(Comparator.comparing(Label::time));
+        frontier.add(new Label(origin, startTime, List.of()));
+        Map<String, ZonedDateTime> bestArrival = new HashMap<>();
+
+        while (!frontier.isEmpty()) {
+            Label label = frontier.poll();
+
+            if (label.airport().equals(destination)) {
+                return new ArrayList<>(label.path());
+            }
+            ZonedDateTime known = bestArrival.get(label.airport().id());
+            if (known != null && !label.time().isBefore(known)) {
+                continue;  // dominada: ya alcanzamos este aeropuerto más temprano
+            }
+            bestArrival.put(label.airport().id(), label.time());
+
+            if (label.path().size() >= MAX_HOPS) {
+                continue;
+            }
+
+            for (Flight flight : flightPlan.getFlightsFromAirport(label.airport(), label.time(), deadline)) {
+                if (Duration.between(label.time(), flight.departureTime()).toMinutes() < 10) {
+                    continue;
+                }
+                if (!flight.arrivalTime().isBefore(deadline)) {
+                    continue;
+                }
+                if (capacity != null && batchQuantity > 0) {
+                    if (!capacity.hasFlightCapacity(flight, batchQuantity)) {
+                        continue;
+                    }
+                    Airport hub = flight.destination();
+                    boolean isFinalDestination = hub.equals(destination);
+                    if (!isFinalDestination) {
+                        if (!capacity.hasHubCapacity(hub, batchQuantity) || capacity.isHubNearLimit(hub)) {
+                            continue;
+                        }
+                    } else if (!capacity.hasHubCapacity(hub, batchQuantity)) {
+                        continue;
+                    }
+                }
+                ZonedDateTime prevArrival = bestArrival.get(flight.destination().id());
+                if (prevArrival != null && !flight.arrivalTime().isBefore(prevArrival)) {
+                    continue;  // poda temprana: llegaríamos igual o más tarde que lo ya logrado
+                }
+                List<Flight> newPath = new ArrayList<>(label.path().size() + 1);
+                newPath.addAll(label.path());
+                newPath.add(flight);
+                frontier.add(new Label(flight.destination(), flight.arrivalTime(), newPath));
+            }
+        }
+
+        return null;
+    }
+
     /** Mueve vuelos directos al final de la lista para explorar escalas primero. */
     private static void deferDirectFlights(List<Flight> flights, Airport destination) {
         List<Flight> directs = new ArrayList<>();
@@ -238,16 +315,13 @@ public class RouteGenerator {
 
     private AssignedRoute earliestPathRoute(ShipmentBatch batch, Duration sla, CapacityContext capacity) {
         try {
-            List<Flight> flightPath = findPath(
+            List<Flight> flightPath = findEarliestArrivalPath(
                 batch.origin(),
                 batch.destination(),
                 batch.ingressTime(),
                 sla,
-                null,
-                false,
                 batch.quantity(),
-                capacity,
-                false
+                capacity
             );
 
             if (flightPath == null || flightPath.isEmpty()) {
