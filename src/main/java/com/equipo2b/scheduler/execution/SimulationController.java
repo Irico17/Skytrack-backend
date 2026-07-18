@@ -50,7 +50,12 @@ public class SimulationController {
     private static final int COLLAPSE_CHUNK_DAYS = 2;
     /** Margen de aviso: se pide el siguiente bloque cuando falta esto para agotar el actual. */
     private static final int COLLAPSE_REFILL_MARGIN_DAYS = 1;
-    /** Factor de crecimiento aplicado sobre cada bloque real cargado (Requisito 29.2). */
+    /**
+     * Factor de crecimiento (Requisito 29.2) aplicado SOLO cuando el dataset real se agota:
+     * mientras haya envíos reales, colapso los consume tal cual (idéntico a 5 días, sin tope);
+     * al agotarse, cada bloque sintético se proyecta sobre el anterior, así el crecimiento
+     * compone 1.23ⁿ hasta que algún gatillo de colapso dispare (Requisito 29.4).
+     */
     private static final double COLLAPSE_GROWTH_FACTOR = 1.23;
     /**
      * Carga por bloques también para la simulación de 5 DÍAS: bloques de 1 día con margen
@@ -119,6 +124,7 @@ public class SimulationController {
     // todo el volumen de una sola vez). null para día a día (no usa dataset histórico).
     private java.util.function.BiFunction<ZonedDateTime, ZonedDateTime, List<ShipmentBatch>> chunkLoader;
     private ZonedDateTime chunkLoadedHorizon;
+    /** Última base de proyección para colapso: el último bloque no vacío (real o sintético). */
     private List<ShipmentBatch> collapseLastNonEmptyChunk;
     /** Tope de carga por bloques (solo 5 días: inicio + 5 días). Null = sin tope (colapso). */
     private ZonedDateTime chunkLoadEndBound;
@@ -1006,6 +1012,10 @@ public class SimulationController {
                 // el ciclo 1 y el riesgo de memoria de materializar cientos de miles de lotes
                 // de una sola vez. El primer bloque se carga aquí; los siguientes se piden
                 // durante la simulación (ver runSimulation) a medida que el reloj avanza.
+                // SOLO datos reales: antes se sumaba aquí un 123% sintético que luego se
+                // solapaba con el siguiente bloque real (~2.2× de demanda desde el día 2 y
+                // colapso casi inmediato). El crecimiento sintético entra únicamente cuando
+                // el dataset real se agota (ver refillChunk).
                 ZonedDateTime chunkStart = startDate != null ? startDate : ZonedDateTime.now();
                 ZonedDateTime chunkEnd = chunkStart.plusDays(COLLAPSE_CHUNK_DAYS);
                 List<ShipmentBatch> firstChunk = chunkLoader != null
@@ -1016,7 +1026,7 @@ public class SimulationController {
                 if (!firstChunk.isEmpty()) {
                     collapseLastNonEmptyChunk = firstChunk;
                 }
-                return buildCollapseBlock(firstChunk);
+                return firstChunk;
             }
 
             default:
@@ -1025,20 +1035,22 @@ public class SimulationController {
     }
 
     /**
-     * Aplica el factor de crecimiento (Requisito 29.2) sobre un bloque real de envíos y
-     * devuelve el bloque real + lo generado. Si el bloque real viene vacío (fecha fuera del
-     * dataset), usa el último bloque real no vacío como base para el patrón/crecimiento, de
-     * modo que el colapso siga escalando presión aunque los datos reales ya se hayan agotado.
+     * Genera el siguiente bloque SINTÉTICO de envíos (Requisitos 29.2/29.4). Se usa SOLO
+     * cuando el dataset real se agotó: proyecta COLLAPSE_CHUNK_DAYS días con el factor de
+     * crecimiento sobre la última base (el último bloque real, o el último sintético ya
+     * generado). Al re-basar sobre lo generado, el crecimiento compone 1.23ⁿ y las fechas
+     * de ingreso avanzan naturalmente a continuación del bloque anterior.
      */
-    private List<ShipmentBatch> buildCollapseBlock(List<ShipmentBatch> realChunk) {
-        List<ShipmentBatch> base = !realChunk.isEmpty() ? realChunk : collapseLastNonEmptyChunk;
-        List<ShipmentBatch> block = new ArrayList<>(realChunk);
-        if (base != null && !base.isEmpty()) {
-            ShipmentGenerator collapseGenerator = new ShipmentGenerator();
-            List<ShipmentBatch> growthBatches = collapseGenerator.generateFutureShipments(
-                base, COLLAPSE_CHUNK_DAYS, COLLAPSE_GROWTH_FACTOR
-            );
-            block.addAll(growthBatches);
+    private List<ShipmentBatch> nextSyntheticCollapseBlock() {
+        if (collapseLastNonEmptyChunk == null || collapseLastNonEmptyChunk.isEmpty()) {
+            return List.of(); // nunca hubo datos reales: no hay patrón del cual proyectar
+        }
+        ShipmentGenerator collapseGenerator = new ShipmentGenerator();
+        List<ShipmentBatch> block = collapseGenerator.generateFutureShipments(
+            collapseLastNonEmptyChunk, COLLAPSE_CHUNK_DAYS, COLLAPSE_GROWTH_FACTOR
+        );
+        if (!block.isEmpty()) {
+            collapseLastNonEmptyChunk = block;
         }
         return block;
     }
@@ -1062,12 +1074,15 @@ public class SimulationController {
 
         List<ShipmentBatch> nextChunk = chunkLoader.apply(nextStart, nextEnd);
         List<ShipmentBatch> block;
-        if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
-            if (!nextChunk.isEmpty()) {
+        boolean synthetic = false;
+        if (scenario == ScenarioType.COLLAPSE_SIMULATION && nextChunk.isEmpty()) {
+            // Dataset real agotado: recién aquí entra la proyección con crecimiento.
+            block = nextSyntheticCollapseBlock();
+            synthetic = true;
+        } else {
+            if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
                 collapseLastNonEmptyChunk = nextChunk;
             }
-            block = buildCollapseBlock(nextChunk);
-        } else {
             block = nextChunk;
         }
         for (ShipmentBatch batch : block) {
@@ -1075,11 +1090,12 @@ public class SimulationController {
         }
         currentBatches.addAll(block);
         chunkLoadedHorizon = nextEnd;
-        System.out.printf("➕ %s: bloque [%s → %s) cargado — %,d lotes reales%s (%,d total)%n",
+        System.out.printf("➕ %s: bloque [%s → %s) cargado — %,d lotes %s%n",
             scenario == ScenarioType.COLLAPSE_SIMULATION ? "Colapso" : "5 días",
-            nextStart.toLocalDate(), nextEnd.toLocalDate(), nextChunk.size(),
-            scenario == ScenarioType.COLLAPSE_SIMULATION ? " + crecimiento" : "",
-            block.size());
+            nextStart.toLocalDate(), nextEnd.toLocalDate(), block.size(),
+            synthetic
+                ? String.format("SINTÉTICOS (dataset real agotado, crecimiento ×%.2f compuesto)", COLLAPSE_GROWTH_FACTOR)
+                : "reales");
     }
 
     /**
