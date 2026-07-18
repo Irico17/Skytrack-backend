@@ -171,7 +171,7 @@ final class BagTraceabilityReadModel {
             return new BagSnapshot("PENDING_ROUTE", batch.origin().id(), null, false, 0.0);
         }
 
-        if (!simulatedTime.isBefore(route.getFinalArrivalTime())) {
+        if (!simulatedTime.isBefore(route.getDeliveredTime())) {
             return new BagSnapshot("DELIVERED", batch.destination().id(), null, route.meetsSLA(), 1.0);
         }
 
@@ -225,7 +225,7 @@ final class BagTraceabilityReadModel {
             addEvent(events, "LOADED", flight.origin().id(), flight.flightId(), flight.departureTime(), simulatedTime);
             addEvent(events, "ARRIVED", flight.destination().id(), flight.flightId(), flight.arrivalTime(), simulatedTime);
         }
-        addEvent(events, "DELIVERED", batch.destination().id(), null, route.getFinalArrivalTime(), simulatedTime);
+        addEvent(events, "DELIVERED", batch.destination().id(), null, route.getDeliveredTime(), simulatedTime);
         return events;
     }
 

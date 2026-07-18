@@ -22,9 +22,12 @@ public final class AssignedRoute {
     /**
      * Ventana de recojo en el destino final: tiempo que las maletas permanecen
      * en el almacén del aeropuerto destino antes de ser recogidas por el cliente.
-     * Pasada esta ventana, las maletas liberan el almacén (dejan de ocupar capacidad).
+     * Pasada esta ventana, las maletas liberan el almacén (dejan de ocupar capacidad)
+     * y se consideran ENTREGADAS — este mismo instante ({@link #getDeliveredTime()})
+     * es el que usa BagTraceabilityReadModel para el evento/estado "Entregada", así
+     * la UI coincide exactamente con lo que el modelo de capacidad ve como liberado.
      */
-    private static final Duration FINAL_PICKUP_WINDOW = Duration.ofHours(2);
+    private static final Duration FINAL_PICKUP_WINDOW = Duration.ofMinutes(10);
 
     private final ShipmentBatch batch;
     private final List<Flight> flights;
@@ -201,12 +204,22 @@ public final class AssignedRoute {
     }
     
     /**
-     * @return Tiempo de llegada al destino final
+     * @return Tiempo de llegada al destino final (aterrizaje del último vuelo)
      */
     public ZonedDateTime getFinalArrivalTime() {
         return finalArrivalTime;
     }
-    
+
+    /**
+     * @return Instante en que el cliente recoge la maleta y libera el almacén de destino
+     *         (llegada + {@link #FINAL_PICKUP_WINDOW}). Es el instante que debe mostrarse
+     *         como "Entregada" — no {@link #getFinalArrivalTime()}, que solo marca cuándo
+     *         aterriza el avión.
+     */
+    public ZonedDateTime getDeliveredTime() {
+        return finalArrivalTime.plus(FINAL_PICKUP_WINDOW);
+    }
+
     /**
      * Calcula el tiempo total de tránsito desde el ingreso al sistema
      * hasta la llegada al destino final.

@@ -708,7 +708,7 @@ public class SimulationService implements SimulationController.SimulationListene
                     .forEach(activeLoadedFlightIds::add);
             }
 
-            if (!simulatedTime.isBefore(route.getFinalArrivalTime())) {
+            if (!simulatedTime.isBefore(route.getDeliveredTime())) {
                 deliveredBags += quantity;
             }
         }
@@ -949,7 +949,7 @@ public class SimulationService implements SimulationController.SimulationListene
     }
 
     private String shipmentState(AssignedRoute route, ZonedDateTime simulatedTime) {
-        if (!simulatedTime.isBefore(route.getFinalArrivalTime())) return "DELIVERED";
+        if (!simulatedTime.isBefore(route.getDeliveredTime())) return "DELIVERED";
         for (Flight flight : route.getFlights()) {
             if (!simulatedTime.isBefore(flight.departureTime()) && simulatedTime.isBefore(flight.arrivalTime())) {
                 return "IN_FLIGHT";
