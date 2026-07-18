@@ -63,6 +63,7 @@ public final class DTOMapper {
             route.meetsSLA(),
             route.getSLASlack().toString(),
             route.getFinalArrivalTime().format(ISO),
+            route.getDeliveredTime().format(ISO),
             segments
         );
     }

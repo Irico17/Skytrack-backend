@@ -156,6 +156,7 @@ final class BagTraceabilityReadModel {
             format(batch.ingressTime()),
             format(batch.ingressTime().plus(batch.calculateSLA())),
             route != null ? format(route.getFinalArrivalTime()) : null,
+            route != null ? format(route.getDeliveredTime()) : null,
             snapshot.meetsSla(),
             snapshot.progress(),
             events

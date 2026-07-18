@@ -13,6 +13,7 @@ public record RouteDTO(
     int quantity,
     boolean meetsSLA,
     String slaSlack,         // ISO-8601 duration, ej: "PT2H30M"
-    String finalArrivalTime, // ISO-8601
+    String finalArrivalTime, // ISO-8601 — aterrizaje del último vuelo, NO la entrega al cliente
+    String deliveredTime,    // ISO-8601 — finalArrivalTime + ventana de recojo (AssignedRoute.getDeliveredTime())
     List<FlightSegmentDTO> flights
 ) {}

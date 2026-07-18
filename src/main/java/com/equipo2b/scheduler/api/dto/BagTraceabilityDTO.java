@@ -39,7 +39,8 @@ public record BagTraceabilityDTO(
         String nextEvent,
         String ingressTime,
         String deadline,
-        String finalArrivalTime,
+        String finalArrivalTime, // aterrizaje del último vuelo, NO la entrega al cliente
+        String deliveredTime,    // instante real de entrega (finalArrivalTime + ventana de recojo)
         boolean meetsSla,
         double progress,
         List<BagEventDTO> events
