@@ -1332,20 +1332,49 @@ public class SimulationController {
         }
     }
 
+    /** Desde cuándo (epoch ms, reloj REAL) cada aeropuerto viene por encima del 100% de forma
+     *  CONTINUA — se reinicia apenas un tick lo ve de vuelta bajo 100%. Solo el hilo de storage
+     *  toca este mapa (mismo hilo que llama a {@link #checkLiveCollapseTriggers}), sin
+     *  necesidad de sincronización. */
+    private final Map<String, Long> overCapacitySinceMs = new HashMap<>();
+
+    /**
+     * Ventana mínima (ms reales) que un almacén debe permanecer CONTINUAMENTE sobre su
+     * capacidad antes de declarar colapso, según qué tan severo sea el exceso ahora mismo.
+     *
+     * <p>Un pico transitorio (maletas esperando su vuelo de conexión, que se libera apenas ese
+     * vuelo despega) es un fenómeno normal y frecuente de la red — verificado en vivo: un
+     * aeropuerto pasó por 114%→88%→116%→63% en 90 s reales en una corrida completamente sana,
+     * sin ningún problema real de fondo. Disparar colapso en el primer tick que cruza 100%
+     * confunde ese ruido esperado con saturación genuina: es cuestión de suerte del muestreo
+     * en qué segundo exacto un pico normal cae del lado equivocado de la línea, no una señal
+     * real de que la red colapsó — por eso corridas con demanda similar podían "colapsar" en
+     * momentos completamente distintos sin ninguna razón de fondo.</p>
+     *
+     * <p>La escala es inversa a la severidad: mientras más lejos de 100% esté, menos tiempo
+     * hace falta esperar — un 110%+ ya es una sobrecarga difícil de explicar como simple
+     * ruido de buffering, así que se declara casi de inmediato.</p>
+     */
+    private static long requiredPersistenceMs(double ratio) {
+        if (ratio >= 1.10) return 2_000L;
+        if (ratio >= 1.05) return 5_000L;
+        return 10_000L; // 100%–105%
+    }
+
     /**
      * Chequeo de colapso EN VIVO para COLAPSO: antes, evaluateSevereOverload/
      * evaluateWarehouseSaturation solo corrían una vez por ciclo en el loop principal
      * (cada Sa=45s reales / Sc=90min simulados). Aquí el muestreo es cada tick de storage
      * (0.5–1 s reales). Un solo {@code calculateCurrentBags} alimenta la comprobación.
      *
-     * <p>Requisito del curso: el colapso se declara apenas UN SOLO almacén supera el 100% de
-     * su capacidad — no hace falta que sean varios ni que sea severo. Esto reemplaza los
-     * umbrales anteriores (120% en ≥3 aeropuertos, o 50% de la red en ≥90%), que existían
-     * para absorber el ruido de un bug de enrutamiento ya corregido (RouteGenerator/
-     * placeBagsInLeftover podían forzar un desborde de almacén bajo presión; ahora la
-     * capacidad de almacén es una restricción DURA que el planificador nunca cruza por su
-     * cuenta — así que cualquier >100% que se observe hoy es saturación real de la red, no
-     * ruido del algoritmo, y el umbral relajado ya no hace falta.</p>
+     * <p>Requisito del curso: el colapso se declara cuando un almacén supera el 100% de su
+     * capacidad de forma SOSTENIDA (ver {@link #requiredPersistenceMs}) — no hace falta que
+     * sean varios aeropuertos ni un solo tick alcanza. Esto reemplaza tanto los umbrales
+     * originales (120% en ≥3 aeropuertos, 50% de la red) como el disparo instantáneo que los
+     * reemplazó: ambos existían/fallaban por la misma razón, distinguir ruido de saturación
+     * real. Con la capacidad de almacén ya como restricción dura del planificador, un pico NO
+     * es ruido de bug — es buffering real — así que la señal correcta es "cuánto tiempo se
+     * sostiene", no "si tocó la línea una vez".</p>
      *
      * <p>Señaliza el colapso al loop principal escribiendo {@link #collapseInfo}/
      * {@link #completedNaturally} (volatile) y recién después {@code running.set(false)}.
@@ -1369,17 +1398,37 @@ public class SimulationController {
             return;
         }
 
-        Optional<Map.Entry<Airport, Integer>> overCapacity = currentBags.entrySet().stream()
-            .filter(entry -> entry.getKey().storageCapacity() > 0
-                && entry.getValue() > entry.getKey().storageCapacity())
-            .max(Comparator.comparingDouble(
-                entry -> (double) entry.getValue() / entry.getKey().storageCapacity()));
+        long now = System.currentTimeMillis();
+        Set<String> stillOver = new HashSet<>();
+        Airport triggeredAirport = null;
+        int triggeredBags = 0;
+        double triggeredRatio = 0.0;
 
-        if (overCapacity.isPresent() && collapseTriggered.compareAndSet(false, true)) {
-            Airport airport = overCapacity.get().getKey();
-            int bags = overCapacity.get().getValue();
-            double pct = 100.0 * bags / airport.storageCapacity();
-            System.out.printf("%n⚠️  COLAPSO POR ALMACÉN SOBRE CAPACIDAD - %s (%s) al %.0f%% (%d/%d maletas)%n",
+        for (Map.Entry<Airport, Integer> entry : currentBags.entrySet()) {
+            Airport airport = entry.getKey();
+            int bags = entry.getValue();
+            if (airport.storageCapacity() <= 0 || bags <= airport.storageCapacity()) {
+                continue;
+            }
+            double ratio = (double) bags / airport.storageCapacity();
+            stillOver.add(airport.id());
+            long since = overCapacitySinceMs.computeIfAbsent(airport.id(), id -> now);
+            long persisted = now - since;
+            if (persisted >= requiredPersistenceMs(ratio)) {
+                triggeredAirport = airport;
+                triggeredBags = bags;
+                triggeredRatio = ratio;
+                break;
+            }
+        }
+        // Reiniciar la racha de cualquier aeropuerto que este tick ya no está sobre capacidad.
+        overCapacitySinceMs.keySet().removeIf(id -> !stillOver.contains(id));
+
+        if (triggeredAirport != null && collapseTriggered.compareAndSet(false, true)) {
+            Airport airport = triggeredAirport;
+            int bags = triggeredBags;
+            double pct = 100.0 * triggeredRatio;
+            System.out.printf("%n⚠️  COLAPSO POR ALMACÉN SOBRE CAPACIDAD - %s (%s) al %.0f%% (%d/%d maletas), sostenido%n",
                 airport.id(), airport.city(), pct, bags, airport.storageCapacity());
             CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
                 currentSolution, batchesProcessed, batchesFailed);
@@ -1387,7 +1436,7 @@ public class SimulationController {
                 "WAREHOUSE_OVER_CAPACITY",
                 "Almacén sobre capacidad",
                 String.format("Se consideró colapso porque el almacén %s (%s) superó el 100%% de su capacidad "
-                    + "(%.0f%%, %d/%d maletas) — la red ya no puede recibir más carga en ese punto.",
+                    + "de forma sostenida (%.0f%%, %d/%d maletas) — la red ya no puede recibir más carga en ese punto.",
                     airport.id(), airport.city(), pct, bags, airport.storageCapacity()),
                 ZonedDateTime.now(),
                 simulatedTime,
