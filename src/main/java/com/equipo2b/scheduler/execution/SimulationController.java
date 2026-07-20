@@ -1338,6 +1338,14 @@ public class SimulationController {
      *  necesidad de sincronización. */
     private final Map<String, Long> overCapacitySinceMs = new HashMap<>();
 
+    /** Pico de ratio (ej. 1.14 = 114%) visto durante la racha ACTUAL de cada aeropuerto —
+     *  para poder loguear "hasta dónde llegó" cuando la racha termina, no solo cuándo empezó. */
+    private final Map<String, Double> overCapacityPeakRatio = new HashMap<>();
+
+    /** Hora simulada en la que empezó la racha actual de cada aeropuerto — para el log de
+     *  inicio/fin de cada episodio de sobrecapacidad (ver {@link #checkLiveCollapseTriggers}). */
+    private final Map<String, ZonedDateTime> overCapacitySinceSimTime = new HashMap<>();
+
     /**
      * Ventana mínima (ms reales) que un almacén debe permanecer CONTINUAMENTE sobre su
      * capacidad antes de declarar colapso, según qué tan severo sea el exceso ahora mismo.
@@ -1412,7 +1420,16 @@ public class SimulationController {
             }
             double ratio = (double) bags / airport.storageCapacity();
             stillOver.add(airport.id());
+            boolean isNewStreak = !overCapacitySinceMs.containsKey(airport.id());
             long since = overCapacitySinceMs.computeIfAbsent(airport.id(), id -> now);
+            if (isNewStreak) {
+                overCapacitySinceSimTime.put(airport.id(), simulatedTime);
+                overCapacityPeakRatio.put(airport.id(), ratio);
+                System.out.printf("🔺 SOBRECAPACIDAD INICIA - %s (%s) %.0f%% (%d/%d) — hora simulada %s%n",
+                    airport.id(), airport.city(), ratio * 100, bags, airport.storageCapacity(), simulatedTime);
+            } else {
+                overCapacityPeakRatio.merge(airport.id(), ratio, Math::max);
+            }
             long persisted = now - since;
             if (persisted >= requiredPersistenceMs(ratio)) {
                 triggeredAirport = airport;
@@ -1421,8 +1438,18 @@ public class SimulationController {
                 break;
             }
         }
-        // Reiniciar la racha de cualquier aeropuerto que este tick ya no está sobre capacidad.
-        overCapacitySinceMs.keySet().removeIf(id -> !stillOver.contains(id));
+        // Cualquier aeropuerto que este tick ya no está sobre capacidad: cerrar su racha con
+        // un log de resumen (pico alcanzado, cuánto duró) y reiniciar su estado.
+        for (String id : new ArrayList<>(overCapacitySinceMs.keySet())) {
+            if (stillOver.contains(id)) {
+                continue;
+            }
+            long startedMs = overCapacitySinceMs.remove(id);
+            double peak = overCapacityPeakRatio.remove(id);
+            ZonedDateTime startedSim = overCapacitySinceSimTime.remove(id);
+            System.out.printf("🔻 SOBRECAPACIDAD TERMINA - %s: pico %.0f%%, duró %.1fs reales (%s → %s)%n",
+                id, peak * 100, (now - startedMs) / 1000.0, startedSim, simulatedTime);
+        }
 
         if (triggeredAirport != null && collapseTriggered.compareAndSet(false, true)) {
             Airport airport = triggeredAirport;
