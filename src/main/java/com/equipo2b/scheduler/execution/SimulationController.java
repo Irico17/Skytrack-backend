@@ -1307,6 +1307,8 @@ public class SimulationController {
                     notifyStorageUpdated();
                     if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
                         checkLiveCollapseTriggers();
+                    } else {
+                        trackOvercapacityEpisodesInformational();
                     }
                     // Intervalo más largo durante planning: el GA usa el otro core; el
                     // recálculo es barato (cache-hit) pero no hace falta spamear el WS.
@@ -1389,28 +1391,45 @@ public class SimulationController {
      * El loop principal revisa {@code running} al tope de cada iteración y en
      * {@link #sleepInterruptibly}.</p>
      */
-    private void checkLiveCollapseTriggers() {
-        if (collapseTriggered.get()) {
-            return;
-        }
-        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
-            return;
-        }
+    /** Resultado de un tick que encontró un aeropuerto con sobrecapacidad SOSTENIDA
+     *  (persistencia cumplida) — null si ninguno la cumplió todavía este tick. */
+    private record OvercapacityTrigger(Airport airport, int bags, double ratio) {}
 
+    /**
+     * Registra (log de inicio/fin, ver {@link #trackOvercapacityEpisodes}) los episodios de
+     * sobrecapacidad para escenarios que NO se detienen por esto (PERIOD/D2D) — puramente
+     * informativo, nunca declara colapso. Permite comparar, con datos reales, si esos
+     * escenarios (acotados a menos ciclos que COLLAPSE_SIMULATION) también ven picos.
+     */
+    private void trackOvercapacityEpisodesInformational() {
+        Map<Airport, Integer> currentBags = loadCurrentBagsForLiveCheck();
+        if (currentBags != null) {
+            trackOvercapacityEpisodes(currentBags);
+        }
+    }
+
+    private Map<Airport, Integer> loadCurrentBagsForLiveCheck() {
+        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
+            return null;
+        }
         StorageInventoryService inventory = inventoryService != null
             ? inventoryService
             : new StorageInventoryService(airportManager);
         Map<Airport, Integer> currentBags = inventory.calculateCurrentBags(
             currentSolution, simulatedTime, currentBatches);
-        if (currentBags.isEmpty()) {
-            return;
-        }
+        return currentBags.isEmpty() ? null : currentBags;
+    }
 
+    /**
+     * Actualiza las rachas de sobrecapacidad por aeropuerto (inicio/fin, logueados) y
+     * devuelve el primer aeropuerto que ya cumplió su persistencia requerida este tick, o
+     * null si ninguno la cumplió todavía. No decide qué hacer con eso — eso es
+     * responsabilidad de quien llama (solo {@link #checkLiveCollapseTriggers} actúa).
+     */
+    private OvercapacityTrigger trackOvercapacityEpisodes(Map<Airport, Integer> currentBags) {
         long now = System.currentTimeMillis();
         Set<String> stillOver = new HashSet<>();
-        Airport triggeredAirport = null;
-        int triggeredBags = 0;
-        double triggeredRatio = 0.0;
+        OvercapacityTrigger trigger = null;
 
         for (Map.Entry<Airport, Integer> entry : currentBags.entrySet()) {
             Airport airport = entry.getKey();
@@ -1430,12 +1449,11 @@ public class SimulationController {
             } else {
                 overCapacityPeakRatio.merge(airport.id(), ratio, Math::max);
             }
-            long persisted = now - since;
-            if (persisted >= requiredPersistenceMs(ratio)) {
-                triggeredAirport = airport;
-                triggeredBags = bags;
-                triggeredRatio = ratio;
-                break;
+            if (trigger == null) {
+                long persisted = now - since;
+                if (persisted >= requiredPersistenceMs(ratio)) {
+                    trigger = new OvercapacityTrigger(airport, bags, ratio);
+                }
             }
         }
         // Cualquier aeropuerto que este tick ya no está sobre capacidad: cerrar su racha con
@@ -1450,11 +1468,24 @@ public class SimulationController {
             System.out.printf("🔻 SOBRECAPACIDAD TERMINA - %s: pico %.0f%%, duró %.1fs reales (%s → %s)%n",
                 id, peak * 100, (now - startedMs) / 1000.0, startedSim, simulatedTime);
         }
+        return trigger;
+    }
 
-        if (triggeredAirport != null && collapseTriggered.compareAndSet(false, true)) {
-            Airport airport = triggeredAirport;
-            int bags = triggeredBags;
-            double pct = 100.0 * triggeredRatio;
+    private void checkLiveCollapseTriggers() {
+        if (collapseTriggered.get()) {
+            return;
+        }
+        Map<Airport, Integer> currentBags = loadCurrentBagsForLiveCheck();
+        if (currentBags == null) {
+            return;
+        }
+
+        OvercapacityTrigger triggerResult = trackOvercapacityEpisodes(currentBags);
+
+        if (triggerResult != null && collapseTriggered.compareAndSet(false, true)) {
+            Airport airport = triggerResult.airport();
+            int bags = triggerResult.bags();
+            double pct = 100.0 * triggerResult.ratio();
             System.out.printf("%n⚠️  COLAPSO POR ALMACÉN SOBRE CAPACIDAD - %s (%s) al %.0f%% (%d/%d maletas), sostenido%n",
                 airport.id(), airport.city(), pct, bags, airport.storageCapacity());
             CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
