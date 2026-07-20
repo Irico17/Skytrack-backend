@@ -108,7 +108,7 @@ public class CapacityMonitor {
         }
         
         // Ordenar eventos por timestamp
-        allEvents.sort(Comparator.comparing(StorageEvent::timestamp));
+        allEvents.sort(StorageEvent.CHRONOLOGICAL_ORDER);
         
         // Simular ocupación a lo largo del tiempo
         Map<Airport, Integer> currentOccupancy = new HashMap<>();

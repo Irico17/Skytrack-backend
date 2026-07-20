@@ -91,7 +91,7 @@ public class RouteValidator {
         }
         
         // Ordenar por timestamp
-        allEvents.sort(Comparator.comparing(StorageEvent::timestamp));
+        allEvents.sort(StorageEvent.CHRONOLOGICAL_ORDER);
         
         // Simular ocupación de cada aeropuerto
         Map<String, Integer> currentOccupancy = new HashMap<>();

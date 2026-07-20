@@ -154,7 +154,12 @@ public class SimulationResultExporter {
                 collapseInfo.unserviceablePct(),
                 collapseInfo.criticalAirports(),
                 collapseInfo.totalAirports(),
-                collapseInfo.cycle()
+                collapseInfo.cycle(),
+                collapseInfo.lastCycleBatches(),
+                collapseInfo.lastCycleBags(),
+                collapseInfo.lastCycleBatchesUnrouted(),
+                collapseInfo.lastCycleBagsUnrouted(),
+                collapseInfo.lastCycleSlaExpired()
             );
         SimulationResultsDTO dto = new SimulationResultsDTO(
             simId,

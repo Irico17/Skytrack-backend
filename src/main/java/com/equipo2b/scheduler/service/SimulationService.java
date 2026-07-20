@@ -32,8 +32,7 @@ import java.util.UUID;
  * para los REST controllers y el WebSocket.
  */
 @Service
-public class SimulationService implements SimulationController.SimulationListener,
-        SimulationController.LightweightStorageAware {
+public class SimulationService implements SimulationController.SimulationListener {
 
     @Autowired
     private DataLoadingService dataService;
@@ -62,11 +61,6 @@ public class SimulationService implements SimulationController.SimulationListene
     private ZonedDateTime currentStartDate;
     private ZonedDateTime currentStartedAt;
     private ZonedDateTime currentFinishedAt;
-
-    /** Último inventario/métricas enviados — reutilizados en ticks livianos durante el GA. */
-    private volatile java.util.List<CycleUpdateDTO.AirportCapacityDTO> lastAirportCapacities = List.of();
-    private volatile CycleUpdateDTO.OperationalMetricsDTO lastOperationalMetrics =
-        new CycleUpdateDTO.OperationalMetricsDTO(0, 0, 0, 0, 0, 0, 0, 0, null, 0.0);
 
     public record StartSimulationResult(String simulationId, boolean joinedExisting, ActiveSimulationDTO activeSimulation) {}
 
@@ -129,9 +123,6 @@ public class SimulationService implements SimulationController.SimulationListene
         currentStartDate = requestedStartDate;
         currentStartedAt = ZonedDateTime.now(ZoneOffset.UTC);
         currentFinishedAt = null;
-        lastAirportCapacities = List.of();
-        lastOperationalMetrics =
-            new CycleUpdateDTO.OperationalMetricsDTO(0, 0, 0, 0, 0, 0, 0, 0, null, 0.0);
 
         long startupT0 = System.currentTimeMillis();
         try {
@@ -566,8 +557,6 @@ public class SimulationService implements SimulationController.SimulationListene
             buildAirportCapacities(solution, status.simulatedTime());
         CycleUpdateDTO.OperationalMetricsDTO metrics =
             buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities);
-        lastAirportCapacities = airportCapacities;
-        lastOperationalMetrics = metrics;
 
         CycleUpdateDTO update = new CycleUpdateDTO(
             "CYCLE_UPDATE",
@@ -608,8 +597,6 @@ public class SimulationService implements SimulationController.SimulationListene
             buildAirportCapacities(solution, status.simulatedTime());
         CycleUpdateDTO.OperationalMetricsDTO metrics =
             buildOperationalMetrics(solution, status.simulatedTime(), airportCapacities);
-        lastAirportCapacities = airportCapacities;
-        lastOperationalMetrics = metrics;
 
         StorageUpdateDTO update = new StorageUpdateDTO(
             "STORAGE_UPDATE",
@@ -621,23 +608,6 @@ public class SimulationService implements SimulationController.SimulationListene
             metrics
         );
 
-        webSocketHandler.onStorageUpdated(update);
-    }
-
-    @Override
-    public void onStorageUpdatedLightweight(SimulationStatus status) {
-        if (webSocketHandler == null || activeController == null) return;
-
-        // Solo reloj + último inventario conocido: no recalcular O(rutas) durante el GA.
-        StorageUpdateDTO update = new StorageUpdateDTO(
-            "STORAGE_UPDATE",
-            activeController.getSimulationId(),
-            status.currentCycle(),
-            formatDate(status.simulatedTime()),
-            activeController.getDaysElapsed(),
-            lastAirportCapacities,
-            lastOperationalMetrics
-        );
         webSocketHandler.onStorageUpdated(update);
     }
 

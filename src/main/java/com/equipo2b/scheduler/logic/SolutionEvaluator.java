@@ -220,10 +220,12 @@ public class SolutionEvaluator {
      * de la red (ocupación = max(pico del ciclo, baseline)) y penaliza la varianza de
      * ratios ocupación/capacidad → incentiva rutas multi-hop que usen hubs subutilizados.
      *
-     * <p>Escala: con N≈30 aeropuertos y varianza 0.05 → ~180 pts; lejos de las restricciones
-     * duras (10k–50k). No puede superar factibilidad/SLA.
+     * <p>Escala: con N≈30 aeropuertos y varianza 0.05 → ~540 pts; lejos de las restricciones
+     * duras (10k–50k), pero del orden de las demás penalizaciones/premios "blandos" (cientos
+     * de puntos) para que sí incline el desempate entre rutas de costo similar hacia hubs
+     * subutilizados. No puede superar factibilidad/SLA.
      */
-    public static final double PENALTY_GLOBAL_IMBALANCE_FACTOR = 120.0;
+    public static final double PENALTY_GLOBAL_IMBALANCE_FACTOR = 360.0;
     
     // ==================== Dependencias ====================
     
@@ -303,33 +305,47 @@ public class SolutionEvaluator {
     public double calculateFlightCapacityPenalties(com.equipo2b.scheduler.model.Solution solution) {
         // Agrupar maletas por vuelo
         java.util.Map<com.equipo2b.scheduler.model.Flight, Integer> bagsPerFlight = new java.util.HashMap<>();
-        
+
         for (com.equipo2b.scheduler.model.AssignedRoute route : solution.getRoutes().values()) {
             int batchQuantity = route.getBatch().quantity();
             for (com.equipo2b.scheduler.model.Flight flight : route.getFlights()) {
                 bagsPerFlight.merge(flight, batchQuantity, Integer::sum);
             }
         }
-        
-        // Calcular exceso (restricción dura) + costo marginal convexo de ocupación (suave).
+
         double penalty = 0.0;
         for (java.util.Map.Entry<com.equipo2b.scheduler.model.Flight, Integer> entry : bagsPerFlight.entrySet()) {
-            com.equipo2b.scheduler.model.Flight flight = entry.getKey();
-            int assignedBags = entry.getValue();
-            int capacity = flight.capacity();
-            int excess = assignedBags - capacity;
-
-            if (excess > 0) {
-                penalty += excess * PENALTY_FLIGHT_CAPACITY;
-            }
-            if (capacity > 0 && assignedBags > 0) {
-                // α · load²/cap — convexo: presiona a repartir carga entre vuelos alternativos
-                // (retrasa el punto de colapso). Aritmética primitiva, sin asignaciones.
-                double load = assignedBags;
-                penalty += PENALTY_LOAD_CONVEX_FACTOR * (load * load) / capacity;
-            }
+            penalty += calculateFlightPenaltyFor(entry.getKey(), entry.getValue());
         }
 
+        return penalty;
+    }
+
+    /**
+     * Penalización de UN vuelo (exceso duro + costo convexo) dada su carga TOTAL final —
+     * misma fórmula que {@link #calculateFlightCapacityPenalties}, extraída para reutilizar
+     * desde el tracking incremental de {@link com.equipo2b.scheduler.execution.Scheduler}
+     * (un vuelo ya cerrado no vuelve a cambiar, así que su penalización se calcula una sola
+     * vez con la carga final en vez de recorrer toda la solución acumulada cada ciclo).
+     *
+     * @param flight Vuelo evaluado
+     * @param assignedBags Total de maletas asignadas a ese vuelo (de cualquier ciclo)
+     * @return Penalización (exceso duro + convexo) de ese vuelo
+     */
+    public double calculateFlightPenaltyFor(com.equipo2b.scheduler.model.Flight flight, int assignedBags) {
+        int capacity = flight.capacity();
+        int excess = assignedBags - capacity;
+        double penalty = 0.0;
+
+        if (excess > 0) {
+            penalty += excess * PENALTY_FLIGHT_CAPACITY;
+        }
+        if (capacity > 0 && assignedBags > 0) {
+            // α · load²/cap — convexo: presiona a repartir carga entre vuelos alternativos
+            // (retrasa el punto de colapso). Aritmética primitiva, sin asignaciones.
+            double load = assignedBags;
+            penalty += PENALTY_LOAD_CONVEX_FACTOR * (load * load) / capacity;
+        }
         return penalty;
     }
     
@@ -352,51 +368,93 @@ public class SolutionEvaluator {
         }
 
         // Ordenar eventos por timestamp
-        allEvents.sort(java.util.Comparator.comparing(com.equipo2b.scheduler.model.StorageEvent::timestamp));
+        allEvents.sort(com.equipo2b.scheduler.model.StorageEvent.CHRONOLOGICAL_ORDER);
 
-        // Simular ocupación a lo largo del tiempo, partiendo de la carga preexistente
-        // (rutas de ciclos anteriores) para que el ciclo vea la ocupación absoluta real.
         java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> baseline = this.storageBaseline;
-        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> currentOccupancy = new java.util.HashMap<>();
+        StorageReplayResult replay = replayStorageEvents(allEvents, baseline);
+
+        double penalty = replay.hardPenalty();
+
+        // Balanceo de almacenes (requisito del curso): costo convexo β·pico²/capacidad por
+        // aeropuerto tocado por la solución — repartir la carga entre hubs cuesta menos que
+        // concentrarla, incluso sin desborde.
+        for (java.util.Map.Entry<com.equipo2b.scheduler.model.Airport, Integer> entry : replay.peakOccupancy().entrySet()) {
+            penalty += calculateStorageConvexPenaltyFor(entry.getKey(), entry.getValue());
+        }
+
+        // Desbalance GLOBAL: varianza de ratios en toda la red (incluye baseline / no tocados).
+        penalty += calculateGlobalStorageImbalancePenalty(replay.peakOccupancy(), baseline);
+
+        return penalty;
+    }
+
+    /**
+     * Resultado de reproducir una secuencia de eventos de almacén: penalización dura
+     * acumulada (excedente puntual en cada evento), pico de ocupación alcanzado por
+     * aeropuerto durante la reproducción, y ocupación final por aeropuerto (para encadenar
+     * con el siguiente lote de eventos sin volver a empezar desde cero).
+     */
+    public record StorageReplayResult(
+        double hardPenalty,
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> peakOccupancy,
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> endingOccupancy) {
+    }
+
+    /**
+     * Reproduce una secuencia de eventos de almacén YA ORDENADOS por timestamp, partiendo de
+     * una ocupación inicial dada, y devuelve penalización dura + picos alcanzados. Extraído de
+     * {@link #calculateStorageCapacityPenalties} para reutilizar desde el tracking incremental
+     * de {@link com.equipo2b.scheduler.execution.Scheduler}: en vez de reproducir TODA la
+     * historia de eventos cada ciclo, se reproducen solo los eventos NUEVOS de este ciclo
+     * partiendo de la ocupación ya conocida al inicio de la ventana (línea base) — cada evento
+     * es un hecho puntual del pasado que, una vez procesado, nunca se vuelve a evaluar.
+     *
+     * @param sortedEvents Eventos ordenados por timestamp ascendente
+     * @param startingOccupancy Ocupación por aeropuerto al inicio de la secuencia
+     * @return Penalización dura total, picos alcanzados y ocupación final por aeropuerto
+     */
+    public StorageReplayResult replayStorageEvents(
+            java.util.List<com.equipo2b.scheduler.model.StorageEvent> sortedEvents,
+            java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> startingOccupancy) {
+        java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> currentOccupancy =
+            new java.util.HashMap<>(startingOccupancy);
         java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> peakOccupancy = new java.util.HashMap<>();
         double penalty = 0.0;
 
-        for (com.equipo2b.scheduler.model.StorageEvent event : allEvents) {
+        for (com.equipo2b.scheduler.model.StorageEvent event : sortedEvents) {
             com.equipo2b.scheduler.model.Airport airport = event.airport();
             int quantity = event.quantity();
 
-            // Actualizar ocupación según tipo de evento (arranca desde la línea base)
-            int previous = currentOccupancy.computeIfAbsent(
-                airport, a -> baseline.getOrDefault(a, 0));
+            int previous = currentOccupancy.getOrDefault(airport, 0);
             int newOccupancy = event.type() == com.equipo2b.scheduler.model.StorageEventType.ARRIVAL
                 ? previous + quantity
                 : previous - quantity;
             currentOccupancy.put(airport, newOccupancy);
             peakOccupancy.merge(airport, newOccupancy, Math::max);
 
-            // Calcular exceso respecto a capacidad
             int excess = newOccupancy - airport.storageCapacity();
             if (excess > 0) {
                 penalty += excess * PENALTY_STORAGE_CAPACITY;
             }
         }
 
-        // Balanceo de almacenes (requisito del curso): costo convexo β·pico²/capacidad por
-        // aeropuerto tocado por la solución — repartir la carga entre hubs cuesta menos que
-        // concentrarla, incluso sin desborde.
-        for (java.util.Map.Entry<com.equipo2b.scheduler.model.Airport, Integer> entry : peakOccupancy.entrySet()) {
-            int capacity = entry.getKey().storageCapacity();
-            int peak = entry.getValue();
-            if (capacity > 0 && peak > 0) {
-                double p = peak;
-                penalty += PENALTY_STORAGE_CONVEX_FACTOR * (p * p) / capacity;
-            }
+        return new StorageReplayResult(penalty, peakOccupancy, currentOccupancy);
+    }
+
+    /**
+     * Costo convexo β·pico²/capacidad de UN aeropuerto dado su pico de ocupación — misma
+     * fórmula que el término convexo dentro de {@link #calculateStorageCapacityPenalties},
+     * extraída para reutilizar desde el tracking incremental (el pico histórico de un
+     * aeropuerto es un valor pequeño que se mantiene entre ciclos; recalcular esta fórmula
+     * sobre él cada ciclo es O(aeropuertos), no O(eventos históricos)).
+     */
+    public double calculateStorageConvexPenaltyFor(com.equipo2b.scheduler.model.Airport airport, int peak) {
+        int capacity = airport.storageCapacity();
+        if (capacity > 0 && peak > 0) {
+            double p = peak;
+            return PENALTY_STORAGE_CONVEX_FACTOR * (p * p) / capacity;
         }
-
-        // Desbalance GLOBAL: varianza de ratios en toda la red (incluye baseline / no tocados).
-        penalty += calculateGlobalStorageImbalancePenalty(peakOccupancy, baseline);
-
-        return penalty;
+        return 0.0;
     }
 
     /**
@@ -536,7 +594,50 @@ public class SolutionEvaluator {
 
         return reward;
     }
-    
+
+    /**
+     * Contribución de fitness INTRÍNSECA de una ruta: penalización de SLA + penalización de
+     * escala - premio de holgura. A diferencia de la capacidad de vuelo/almacén, estos tres
+     * términos dependen solo de la ruta misma (sus propios vuelos y horarios) — nunca de
+     * otras rutas — así que quedan fijos para siempre desde el momento en que la ruta se
+     * crea. Usado por el tracking incremental de {@link com.equipo2b.scheduler.execution.Scheduler}
+     * para sumar la contribución de una ruta nueva una sola vez, sin esperar a que "asiente"
+     * ni volver a visitarla en ciclos futuros — misma fórmula que
+     * {@link #calculateSLAPenalties}/{@link #calculateLayoverPenalties}/
+     * {@link #calculateTimeSlackRewards} aplicada a una sola ruta.
+     *
+     * @param route Ruta recién creada
+     * @return Penalización de SLA + penalización de escala - premio de holgura, para esta ruta
+     */
+    public double calculateIntrinsicRoutePenalty(com.equipo2b.scheduler.model.AssignedRoute route) {
+        double penalty = 0.0;
+
+        if (!route.meetsSLA()) {
+            java.time.Duration slack = route.getSLASlack();
+            double delayHours = Math.abs(slack.toMinutes()) / 60.0;
+            penalty += delayHours * PENALTY_SLA_VIOLATION;
+        } else {
+            java.time.Duration slack = route.getSLASlack();
+            double slackHours = slack.toMinutes() / 60.0;
+            double routeReward = Math.min(slackHours * REWARD_TIME_SLACK_PER_HOUR, REWARD_TIME_SLACK_MAX);
+            routeReward += slackHours * REWARD_SLACK_TIEBREAK_PER_HOUR;
+            penalty -= routeReward;
+        }
+
+        java.util.List<com.equipo2b.scheduler.model.Flight> flights = route.getFlights();
+        for (int i = 0; i < flights.size() - 1; i++) {
+            java.time.Duration layover = java.time.Duration.between(
+                flights.get(i).arrivalTime(),
+                flights.get(i + 1).departureTime()
+            );
+            if (layover.toMinutes() < 10) {
+                penalty += PENALTY_LAYOVER_VIOLATION;
+            }
+        }
+
+        return penalty;
+    }
+
     /**
      * Calcula premios por vuelos no utilizados.
      *

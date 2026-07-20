@@ -43,7 +43,7 @@ public record SimulationResultsDTO(
 
     /** Condiciones bajo las que se declaró el colapso (cuándo, qué lo provocó y por qué). */
     public record CollapseInfoDTO(
-        String causeCode,         // WAREHOUSE_SATURATION, UNSERVICEABLE_BATCHES, CAPACITY_SATURATION, ALGORITHM_FITNESS
+        String causeCode,         // WAREHOUSE_OVER_CAPACITY, SLA_VIOLATION, UNSERVICEABLE_BATCHES, CAPACITY_SATURATION, ALGORITHM_FITNESS
         String causeLabel,        // etiqueta legible
         String reason,            // por qué se consideró colapso (con métricas)
         String detectedAtReal,    // ISO-8601, reloj real
@@ -52,6 +52,11 @@ public record SimulationResultsDTO(
         double unserviceablePct,
         int criticalAirports,
         int totalAirports,
-        int cycle
+        int cycle,
+        int lastCycleBatches,          // lotes consumidos en el último ciclo (nuevos + reintentos)
+        int lastCycleBags,             // maletas consumidas en el último ciclo
+        int lastCycleBatchesUnrouted,  // lotes del último ciclo sin ruta
+        int lastCycleBagsUnrouted,     // maletas del último ciclo sin ruta
+        int lastCycleSlaExpired        // lotes del último ciclo con SLA vencido
     ) {}
 }

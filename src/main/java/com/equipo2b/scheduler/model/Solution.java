@@ -34,16 +34,18 @@ public final class Solution {
     }
     
     /**
-     * Constructor de copia profunda.
-     * Esencial para operaciones genéticas sin efectos secundarios.
-     * 
+     * Constructor de copia. Superficial a propósito: {@link AssignedRoute} es inmutable
+     * tras construirse (sin setters, todos los campos final), así que compartir instancias
+     * entre copias es seguro — cada copia tiene su propio HashMap, por lo que addRoute/
+     * removeRoute en una copia nunca afecta a otra. Evita reconstruir cada AssignedRoute
+     * (listas de vuelos/eventos) en soluciones con miles de rutas acumuladas, donde antes
+     * este constructor por sí solo era O(N) en asignaciones por cada copia (GA/Tabú generan
+     * muchas copias por ciclo).
+     *
      * @param other La solución a copiar
      */
     public Solution(Solution other) {
-        this.routes = new HashMap<>();
-        for (Map.Entry<String, AssignedRoute> entry : other.routes.entrySet()) {
-            this.routes.put(entry.getKey(), new AssignedRoute(entry.getValue()));
-        }
+        this.routes = new HashMap<>(other.routes);
         this.fitness = other.fitness;
         this.evaluated = other.evaluated;
     }

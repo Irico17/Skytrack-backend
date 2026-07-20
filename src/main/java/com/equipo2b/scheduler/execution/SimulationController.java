@@ -28,14 +28,17 @@ import java.util.UUID;
  */
 public class SimulationController {
     private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
-    /** Intervalo normal de STORAGE_UPDATE (reloj + inventario). */
-    private static final long STORAGE_UPDATE_INTERVAL_MS = 1_000L;
     /**
-     * Durante executePlanningCycle el hilo de inventario NO debe competir con el GA/Tabú
-     * en VMs de 1 CPU: cada calculateCurrentBags + métricas + JSON robaba el núcleo y
-     * alargaba el ciclo a minutos. Solo tick de reloj liviano.
+     * Intervalo normal de STORAGE_UPDATE (reloj + inventario).
+     * 500 ms ≈ casi tiempo real en UI; con K=120 son ~1 min simulado por tick.
+     * El recálculo es barato (cache de eventos por identidad de solución).
      */
-    private static final long STORAGE_UPDATE_INTERVAL_PLANNING_MS = 2_000L;
+    private static final long STORAGE_UPDATE_INTERVAL_MS = 500L;
+    /**
+     * Durante executePlanningCycle el GA/Tabú usa el otro core: espaciamos un poco más
+     * (1 s) para no competir innecesariamente, sin volver al congelamiento visual.
+     */
+    private static final long STORAGE_UPDATE_INTERVAL_PLANNING_MS = 1_000L;
     /** Relleno de capacidad por sub-lotes (split en vuelos directos). Aditivo y seguro. */
     private static final boolean PARTIAL_FILL_ENABLED = true;
     /**
@@ -65,17 +68,6 @@ public class SimulationController {
      */
     private static final int PERIOD_CHUNK_DAYS = 1;
     private static final int PERIOD_REFILL_MARGIN_HOURS = 12;
-    /**
-     * Umbral de sobrecarga SEVERA por aeropuerto (120% de su capacidad de almacén) y
-     * cantidad mínima de aeropuertos en ese estado para declarar colapso. Complementa
-     * evaluateWarehouseSaturation (que exige más del 50% de TODA la red): un puñado de
-     * hubs importantes desbordados muy por encima del 100% (ej. varios entre 120% y 172%,
-     * visto en pruebas reales) representa un colapso real aunque sean pocos frente al total
-     * de 30 aeropuertos — sin este chequeo, ese escenario nunca disparaba colapso.
-     */
-    private static final double SEVERE_OVERLOAD_RATIO = 1.20;
-    private static final int SEVERE_OVERLOAD_MIN_AIRPORTS = 3;
-
     // Componentes del sistema
     private final FlightPlan flightPlan;
     private final AirportManager airportManager;
@@ -86,8 +78,16 @@ public class SimulationController {
     private Thread simulationThread;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean paused = new AtomicBoolean(false);
-    /** True mientras corre GA/Tabú/split del ciclo actual (el hilo de storage se aligera). */
+    /** True mientras corre GA/Tabú/split del ciclo actual (storage usa intervalo más largo). */
     private final AtomicBoolean planningInProgress = new AtomicBoolean(false);
+    /**
+     * Cierre atómico "primero en llegar, gana" entre las tres vías de detección de colapso:
+     * el chequeo de fitness/ocupación del loop principal (una vez por ciclo) y los chequeos
+     * de sobrecarga severa/saturación de almacén del hilo de storage (en vivo, cada 0.5–1 s,
+     * ver {@link #checkLiveCollapseTriggers}). Sin esto, dos hilos podrían detectar colapso
+     * casi al mismo tiempo y pisarse el {@link #collapseInfo} o notificar el fin dos veces.
+     */
+    private final AtomicBoolean collapseTriggered = new AtomicBoolean(false);
     
     // Scheduler y componentes
     private Scheduler scheduler;
@@ -109,12 +109,20 @@ public class SimulationController {
     // Estadísticas
     /** Número de ciclos COMPLETADOS. Durante el primer planning permanece en 0. */
     private volatile int currentCycle = 0;
-    private ZonedDateTime simulatedTime;
+    // volatile: leído/escrito tanto por el hilo principal de planificación como por
+    // storageUpdateThread (updateSimulatedClock corre desde ambos). Antes era un campo
+    // plano pese a la carrera de datos preexistente; con A.2 el hilo de storage también
+    // lo lee para evaluar colapso en vivo, así que se endurece aquí.
+    private volatile ZonedDateTime simulatedTime;
     private int batchesProcessed = 0;
     private int batchesFailed = 0;
-    
-    // Almacena los lotes procesados para persistencia final
-    private List<ShipmentBatch> currentBatches;
+
+    // Almacena los lotes procesados para persistencia final.
+    // volatile: refillChunk() lo muta desde el hilo principal; storageUpdateThread y
+    // SimulationService.getCurrentBatchesSnapshot() lo leen concurrentemente para
+    // inventario/colapso en vivo. El synchronized(activeController) del lado del
+    // servicio no protege contra este escritor, así que la visibilidad la da volatile.
+    private volatile List<ShipmentBatch> currentBatches;
 
     // Fecha de inicio para calcular días transcurridos
     private ZonedDateTime startDate;
@@ -674,61 +682,58 @@ public class SimulationController {
                     System.out.println("\n⚠️  Ciclo de colapso muy lento (>3×Ta) — posible sobrecarga de la VM");
                 }
 
-                if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
-                    List<Airport> severeAirports = evaluateSevereOverload();
-                    if (severeAirports.size() >= SEVERE_OVERLOAD_MIN_AIRPORTS) {
-                        String names = severeAirports.stream().map(Airport::id)
-                            .collect(java.util.stream.Collectors.joining(", "));
-                        System.out.println("\n⚠️  COLAPSO POR SOBRECARGA SEVERA - " + severeAirports.size()
-                            + " aeropuertos por encima del " + (int) (SEVERE_OVERLOAD_RATIO * 100) + "% de capacidad: " + names);
-                        this.collapseInfo = new CollapseInfo(
-                            "SEVERE_OVERLOAD",
-                            "Sobrecarga severa en varios aeropuertos",
-                            String.format("Se consideró colapso porque %d aeropuertos (%s) superaron el %.0f%% de su "
-                                + "capacidad de almacén simultáneamente — aunque no lleguen a ser la mitad de la red, "
-                                + "esos hubs ya no pueden recibir más carga.",
-                                severeAirports.size(), names, SEVERE_OVERLOAD_RATIO * 100),
-                            ZonedDateTime.now(),
-                            simulatedTime,
-                            collapseStatus.occupancyPercentage(),
-                            collapseStatus.unserviceablePercentage(),
-                            severeAirports.size(),
-                            airportManager.getAllAirports().size(),
-                            currentCycle
-                        );
-                        completedNaturally = true;
-                        break;
-                    }
-
-                    int[] sat = evaluateWarehouseSaturation(); // [críticos, total]
-                    if (sat[1] > 0 && sat[0] * 2 > sat[1]) {
-                        System.out.println("\n⚠️  COLAPSO POR SATURACIÓN DE ALMACENES - más del 50% de aeropuertos críticos");
-                        this.collapseInfo = new CollapseInfo(
-                            "WAREHOUSE_SATURATION",
-                            "Saturación de la red de almacenes",
-                            String.format("Se consideró colapso porque %d de %d aeropuertos (%.0f%%) superaron el 90%% "
-                                + "de su capacidad de almacén simultáneamente, dejando la red sin espacio para recibir más maletas.",
-                                sat[0], sat[1], sat[1] > 0 ? sat[0] * 100.0 / sat[1] : 0.0),
-                            ZonedDateTime.now(),
-                            simulatedTime,
-                            collapseStatus.occupancyPercentage(),
-                            collapseStatus.unserviceablePercentage(),
-                            sat[0],
-                            sat[1],
-                            currentCycle
-                        );
-                        completedNaturally = true;
-                        break;
-                    }
+                // Requisito del curso: colapso también se declara apenas UN lote incumple su
+                // SLA (su deadline pasó sin haber sido entregado — "SLA vencido" en el log de
+                // registerUnroutedForRetry). A diferencia del almacén (chequeado en vivo cada
+                // 0.5-1s en checkLiveCollapseTriggers), el SLA solo se re-clasifica una vez por
+                // ciclo dentro de executePlanningCycle, así que este chequeo va aquí mismo, justo
+                // después de que el ciclo corrió — no hace falta muestreo más fino que eso.
+                if (scenario == ScenarioType.COLLAPSE_SIMULATION
+                        && scheduler.getLastCycleSlaExpired() > 0
+                        && collapseTriggered.compareAndSet(false, true)) {
+                    int expiredBatches = scheduler.getLastCycleSlaExpired();
+                    System.out.println("\n⚠️  COLAPSO POR SLA INCUMPLIDO - " + expiredBatches
+                        + " lote(s) vencieron sin ser entregados en el ciclo " + cycleNumber);
+                    CollapseStatus slaCollapseStatus = collapseDetector.evaluateCollapse(
+                        currentSolution, batchesProcessed, batchesFailed);
+                    this.collapseInfo = new CollapseInfo(
+                        "SLA_VIOLATION",
+                        "SLA incumplido",
+                        String.format("Se consideró colapso porque %d lote(s) del ciclo %d vencieron su plazo de "
+                            + "entrega (SLA) sin haber sido despachados — la red ya no puede cumplir sus "
+                            + "compromisos de entrega.",
+                            expiredBatches, cycleNumber),
+                        ZonedDateTime.now(),
+                        cyclePlanningTime,
+                        slaCollapseStatus.occupancyPercentage(),
+                        slaCollapseStatus.unserviceablePercentage(),
+                        0,
+                        airportManager.getAllAirports().size(),
+                        currentCycle,
+                        scheduler.getLastCycleBatchesTotal(), scheduler.getLastCycleBagsTotal(),
+                        scheduler.getLastCycleBatchesUnrouted(), scheduler.getLastCycleBagsUnrouted(),
+                        expiredBatches
+                    );
+                    completedNaturally = true;
+                    break;
                 }
 
+                // La sobrecarga severa y la saturación de almacén (evaluateSevereOverload /
+                // evaluateWarehouseSaturation) dependen de simulatedTime en un instante — antes
+                // se chequeaban aquí, una vez por ciclo (cada Sa=45s reales / Sc=90min simulados).
+                // Ahora corren en checkLiveCollapseTriggers(), en el hilo de storage, cada 0.5–1 s
+                // reales — muestreo mucho más fino, sin depender de la cadencia de ciclos. Ver A.2.
+
                 if (collapseStatus.isCollapsed()) {
-                    if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                    // Guard solo en la rama que detiene la simulación: la rama informativa de
+                    // PERIOD_SIMULATION debe poder seguir avisando en cada ciclo sin "consumir"
+                    // el cierre atómico que protege contra doble-detección de colapso real.
+                    if (scenario == ScenarioType.COLLAPSE_SIMULATION && collapseTriggered.compareAndSet(false, true)) {
                         System.out.println("\n⚠️  COLAPSO DETECTADO - Deteniendo simulación");
                         this.collapseInfo = buildCollapseInfoFromStatus(collapseStatus);
                         completedNaturally = true;
                         break;
-                    } else {
+                    } else if (scenario != ScenarioType.COLLAPSE_SIMULATION) {
                         System.out.println("⚠️  Alerta de colapso (informativo) - la simulación continúa");
                     }
                 }
@@ -901,28 +906,6 @@ public class SimulationController {
     }
 
     /**
-     * Devuelve los aeropuertos con sobrecarga SEVERA (≥ {@link #SEVERE_OVERLOAD_RATIO} de
-     * su capacidad de almacén) en el instante simulado actual — no solo "casi llenos", sino
-     * genuinamente desbordados.
-     */
-    private List<Airport> evaluateSevereOverload() {
-        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
-            return List.of();
-        }
-
-        StorageInventoryService inventory = inventoryService != null
-            ? inventoryService
-            : new StorageInventoryService(airportManager);
-        Map<Airport, Integer> currentBags = inventory.calculateCurrentBags(currentSolution, simulatedTime, currentBatches);
-
-        return currentBags.entrySet().stream()
-            .filter(entry -> entry.getKey().storageCapacity() > 0
-                && entry.getValue() >= entry.getKey().storageCapacity() * SEVERE_OVERLOAD_RATIO)
-            .map(Map.Entry::getKey)
-            .toList();
-    }
-
-    /**
      * Construye las condiciones del colapso a partir del estado del detector, traduciendo
      * la causa concreta (no atendibles / saturación de capacidad / fitness) a un motivo legible.
      */
@@ -958,9 +941,22 @@ public class SimulationController {
             causeCode, causeLabel, reason,
             ZonedDateTime.now(), simulatedTime,
             status.occupancyPercentage(), status.unserviceablePercentage(),
-            sat[0], sat[1], currentCycle
+            sat[0], sat[1], currentCycle,
+            lastCycleBatches(), lastCycleBags(), lastCycleBatchesUnrouted(),
+            lastCycleBagsUnrouted(), lastCycleSlaExpired()
         );
     }
+
+    /**
+     * Snapshot del último ciclo ejecutado (lotes/maletas consumidos y sin ruta), para
+     * publicar en el reporte de colapso. {@code scheduler} puede ser null si el colapso se
+     * detecta antes del primer ciclo (no debería pasar en la práctica, pero se cubre).
+     */
+    private int lastCycleBatches() { return scheduler != null ? scheduler.getLastCycleBatchesTotal() : 0; }
+    private int lastCycleBags() { return scheduler != null ? scheduler.getLastCycleBagsTotal() : 0; }
+    private int lastCycleBatchesUnrouted() { return scheduler != null ? scheduler.getLastCycleBatchesUnrouted() : 0; }
+    private int lastCycleBagsUnrouted() { return scheduler != null ? scheduler.getLastCycleBagsUnrouted() : 0; }
+    private int lastCycleSlaExpired() { return scheduler != null ? scheduler.getLastCycleSlaExpired() : 0; }
 
     /** Condiciones del colapso si la simulación colapsó; null si no hubo colapso. */
     public CollapseInfo getCollapseInfo() {
@@ -1283,6 +1279,20 @@ public class SimulationController {
         sleepInterruptibly(totalMs);
     }
 
+    /**
+     * Hilo de fondo que mantiene vivos, en tiempo real, tanto el inventario de almacenes
+     * como (para COLAPSO) la detección de saturación — independiente de la cadencia de
+     * ciclos del GA/Tabú.
+     *
+     * <p>Antes, mientras {@code planningInProgress} era true (hasta ~25s reales por ciclo),
+     * este hilo solo avanzaba el reloj y reenviaba el último inventario conocido sin
+     * recalcular ("modo liviano" — ahorro de CPU de la época en que la VM tenía 1 core).
+     * Con 2 CPUs reales ya no hace falta: {@code currentSolution} no cambia durante el
+     * planning (la acumulación crea una nueva instancia recién al final del ciclo), y
+     * {@link StorageInventoryService#calculateCurrentBags} cachea los eventos ordenados
+     * por identidad de solución — recalcular en cada tick durante el planning es, en la
+     * práctica, un cache-hit barato, no un recálculo O(rutas) completo.</p>
+     */
     private void startStorageUpdateLoop(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {
         storageUpdateThread = new Thread(() -> {
             while (running.get()) {
@@ -1294,9 +1304,12 @@ public class SimulationController {
 
                     boolean planning = planningInProgress.get();
                     updateSimulatedClock(simStartRealMs, simStartSimMs, scenario);
-                    // Durante el GA: no recalcular inventario ni saturar el WS (1 CPU / buffer DROP).
-                    // El reloj sí avanza vía frames livianos en onStorageUpdated.
-                    notifyStorageUpdated(planning);
+                    notifyStorageUpdated();
+                    if (scenario == ScenarioType.COLLAPSE_SIMULATION) {
+                        checkLiveCollapseTriggers();
+                    }
+                    // Intervalo más largo durante planning: el GA usa el otro core; el
+                    // recálculo es barato (cache-hit) pero no hace falta spamear el WS.
                     Thread.sleep(planning
                         ? STORAGE_UPDATE_INTERVAL_PLANNING_MS
                         : STORAGE_UPDATE_INTERVAL_MS);
@@ -1311,28 +1324,84 @@ public class SimulationController {
     }
 
     private void notifyStorageUpdated() {
-        notifyStorageUpdated(false);
-    }
-
-    private void notifyStorageUpdated(boolean lightweight) {
         if (listener == null) return;
         try {
-            if (lightweight && listener instanceof LightweightStorageAware aware) {
-                aware.onStorageUpdatedLightweight(buildLightweightStatus());
-            } else {
-                listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
-            }
+            listener.onStorageUpdated(buildLightweightStatus(), currentSolution);
         } catch (Exception e) {
             System.err.println("⚠️ Error notificando inventario: " + e.getMessage());
         }
     }
 
     /**
-     * Extensión opcional del listener: tick de reloj sin inventario O(rutas).
-     * SimulationService la implementa para no matar el núcleo único durante el GA.
+     * Chequeo de colapso EN VIVO para COLAPSO: antes, evaluateSevereOverload/
+     * evaluateWarehouseSaturation solo corrían una vez por ciclo en el loop principal
+     * (cada Sa=45s reales / Sc=90min simulados). Aquí el muestreo es cada tick de storage
+     * (0.5–1 s reales). Un solo {@code calculateCurrentBags} alimenta la comprobación.
+     *
+     * <p>Requisito del curso: el colapso se declara apenas UN SOLO almacén supera el 100% de
+     * su capacidad — no hace falta que sean varios ni que sea severo. Esto reemplaza los
+     * umbrales anteriores (120% en ≥3 aeropuertos, o 50% de la red en ≥90%), que existían
+     * para absorber el ruido de un bug de enrutamiento ya corregido (RouteGenerator/
+     * placeBagsInLeftover podían forzar un desborde de almacén bajo presión; ahora la
+     * capacidad de almacén es una restricción DURA que el planificador nunca cruza por su
+     * cuenta — así que cualquier >100% que se observe hoy es saturación real de la red, no
+     * ruido del algoritmo, y el umbral relajado ya no hace falta.</p>
+     *
+     * <p>Señaliza el colapso al loop principal escribiendo {@link #collapseInfo}/
+     * {@link #completedNaturally} (volatile) y recién después {@code running.set(false)}.
+     * El loop principal revisa {@code running} al tope de cada iteración y en
+     * {@link #sleepInterruptibly}.</p>
      */
-    public interface LightweightStorageAware {
-        void onStorageUpdatedLightweight(SimulationStatus status);
+    private void checkLiveCollapseTriggers() {
+        if (collapseTriggered.get()) {
+            return;
+        }
+        if (currentSolution == null || currentSolution.getRoutes().isEmpty() || simulatedTime == null) {
+            return;
+        }
+
+        StorageInventoryService inventory = inventoryService != null
+            ? inventoryService
+            : new StorageInventoryService(airportManager);
+        Map<Airport, Integer> currentBags = inventory.calculateCurrentBags(
+            currentSolution, simulatedTime, currentBatches);
+        if (currentBags.isEmpty()) {
+            return;
+        }
+
+        Optional<Map.Entry<Airport, Integer>> overCapacity = currentBags.entrySet().stream()
+            .filter(entry -> entry.getKey().storageCapacity() > 0
+                && entry.getValue() > entry.getKey().storageCapacity())
+            .max(Comparator.comparingDouble(
+                entry -> (double) entry.getValue() / entry.getKey().storageCapacity()));
+
+        if (overCapacity.isPresent() && collapseTriggered.compareAndSet(false, true)) {
+            Airport airport = overCapacity.get().getKey();
+            int bags = overCapacity.get().getValue();
+            double pct = 100.0 * bags / airport.storageCapacity();
+            System.out.printf("%n⚠️  COLAPSO POR ALMACÉN SOBRE CAPACIDAD - %s (%s) al %.0f%% (%d/%d maletas)%n",
+                airport.id(), airport.city(), pct, bags, airport.storageCapacity());
+            CollapseStatus collapseStatus = collapseDetector.evaluateCollapse(
+                currentSolution, batchesProcessed, batchesFailed);
+            this.collapseInfo = new CollapseInfo(
+                "WAREHOUSE_OVER_CAPACITY",
+                "Almacén sobre capacidad",
+                String.format("Se consideró colapso porque el almacén %s (%s) superó el 100%% de su capacidad "
+                    + "(%.0f%%, %d/%d maletas) — la red ya no puede recibir más carga en ese punto.",
+                    airport.id(), airport.city(), pct, bags, airport.storageCapacity()),
+                ZonedDateTime.now(),
+                simulatedTime,
+                collapseStatus.occupancyPercentage(),
+                collapseStatus.unserviceablePercentage(),
+                1,
+                airportManager.getAllAirports().size(),
+                currentCycle,
+                lastCycleBatches(), lastCycleBags(), lastCycleBatchesUnrouted(),
+                lastCycleBagsUnrouted(), lastCycleSlaExpired()
+            );
+            completedNaturally = true;
+            running.set(false);
+        }
     }
 
     private void updateSimulatedClock(long simStartRealMs, long simStartSimMs, ScenarioType scenario) {

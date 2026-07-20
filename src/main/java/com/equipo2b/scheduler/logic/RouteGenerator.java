@@ -307,10 +307,27 @@ public class RouteGenerator {
         if (filtered != null) {
             return filtered;
         }
-        // FALLBACK BEST-EFFORT: con hubs/destino saturados por la línea base, el filtro de
-        // capacidad puede vetar todos los caminos; mejor una ruta que sobrecarga (penalizada
-        // proporcionalmente por el fitness) que un lote sin asignar (50k fijos, no viaja).
-        return capacity != null ? earliestPathRoute(batch, sla, null) : null;
+        if (capacity == null) {
+            return null;
+        }
+        // FALLBACK NIVEL 2: relajar solo el umbral suave de proximidad a hubs (92%). La
+        // capacidad DURA de almacén (hasHubCapacity) se sigue exigiendo en cada escala —
+        // nunca se permite desbordar un almacén, solo se amplía qué caminos se consideran.
+        AssignedRoute relaxedSoft = earliestPathRoute(batch, sla, capacity.withHubSoftLimitRelaxed());
+        if (relaxedSoft != null) {
+            return relaxedSoft;
+        }
+        // FALLBACK NIVEL 3: además ignorar capacidad de VUELO (un desborde de vuelo se
+        // corrige después vía applyCapacityAwareSplitting; uno de almacén no tiene
+        // corrección posterior, así que su capacidad dura nunca se relaja aquí tampoco).
+        AssignedRoute relaxedFlight = earliestPathRoute(
+            batch, sla, capacity.withHubSoftLimitRelaxed().withFlightCapacityRelaxed());
+        if (relaxedFlight != null) {
+            return relaxedFlight;
+        }
+        // Ningún camino en la red respeta la capacidad de almacén dentro del SLA: el lote
+        // queda sin ruta este ciclo (retry) en vez de forzar un desborde de almacén.
+        return null;
     }
 
     private AssignedRoute earliestPathRoute(ShipmentBatch batch, Duration sla, CapacityContext capacity) {
@@ -395,13 +412,16 @@ public class RouteGenerator {
                 }
             }
 
-            // FALLBACK BEST-EFFORT: bajo saturación real (época pre-colapso) el filtro de
-            // capacidad rechaza TODOS los caminos —incluido el destino del lote, al que sí
-            // o sí debe llegar— y sin esto la asignación caía a 0%. Una ruta que sobrecarga
-            // un almacén cuesta penalización proporcional en el fitness; un lote SIN RUTA
-            // cuesta 50.000 fijos y no se transporta. El filtro es preferencia, no veto.
+            // FALLBACK NIVEL 2/3 sobre los paths cacheados: relajar umbral suave de hubs y,
+            // si hace falta, capacidad de vuelo — la capacidad DURA de almacén nunca se
+            // relaja (ver CapacityContext). Si ni así cabe, el lote queda sin ruta este
+            // ciclo (retry) en vez de forzar un desborde de almacén.
             if (capacity != null) {
-                return pickCapacityFeasible(batch, candidates, null);
+                AssignedRoute relaxedFromCache = pickCapacityFeasible(
+                    batch, candidates, capacity.withHubSoftLimitRelaxed().withFlightCapacityRelaxed());
+                if (relaxedFromCache != null) {
+                    return relaxedFromCache;
+                }
             }
             return null;
         }
@@ -475,7 +495,41 @@ public class RouteGenerator {
             .orElse("");
     }
 
+    /**
+     * Busca una ruta factible con hasta 3 niveles de relajación de capacidad, NINGUNO de
+     * los cuales relaja jamás {@link CapacityContext#hasHubCapacity} — así un almacén nunca
+     * se desborda por esta vía, a costa de que el lote pueda quedar sin ruta este ciclo (va
+     * a reintento) si de verdad no existe ningún camino que respete su capacidad.
+     */
     private AssignedRoute generateFeasibleRouteUncached(
+            ShipmentBatch batch,
+            Duration sla,
+            List<Flight> allowedFlights,
+            int maxAttempts,
+            CapacityContext capacity,
+            boolean preferMultiHop) {
+
+        AssignedRoute strict = tryGenerateRoute(batch, sla, allowedFlights, maxAttempts, capacity, preferMultiHop);
+        if (strict != null || capacity == null) {
+            return strict;
+        }
+
+        int relaxedAttempts = Math.max(2, maxAttempts / 2);
+
+        // FALLBACK NIVEL 2: relajar solo el umbral suave de proximidad a hubs (92%).
+        AssignedRoute relaxedSoft = tryGenerateRoute(
+            batch, sla, allowedFlights, relaxedAttempts, capacity.withHubSoftLimitRelaxed(), preferMultiHop);
+        if (relaxedSoft != null) {
+            return relaxedSoft;
+        }
+
+        // FALLBACK NIVEL 3: además ignorar capacidad de VUELO (se corrige después vía
+        // applyCapacityAwareSplitting). La capacidad de almacén se sigue exigiendo siempre.
+        return tryGenerateRoute(batch, sla, allowedFlights, relaxedAttempts,
+            capacity.withHubSoftLimitRelaxed().withFlightCapacityRelaxed(), preferMultiHop);
+    }
+
+    private AssignedRoute tryGenerateRoute(
             ShipmentBatch batch,
             Duration sla,
             List<Flight> allowedFlights,
@@ -534,15 +588,6 @@ public class RouteGenerator {
             } catch (IllegalArgumentException e) {
                 continue;
             }
-        }
-
-        // FALLBACK BEST-EFFORT: si el filtro de capacidad no dejó ningún camino (hubs o
-        // destino saturados por la línea base en época de alta demanda), buscar ruta SIN
-        // filtro — el fitness castiga la sobrecarga proporcionalmente, pero un lote sin
-        // ruta (50k) es siempre peor. Sin esto la asignación caía a 0% en pre-colapso.
-        if (capacity != null) {
-            return generateFeasibleRouteUncached(batch, sla, allowedFlights,
-                Math.max(2, maxAttempts / 2), null, preferMultiHop);
         }
 
         return null;

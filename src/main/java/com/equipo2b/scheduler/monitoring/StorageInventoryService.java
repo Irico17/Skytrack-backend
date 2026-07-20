@@ -119,20 +119,12 @@ public class StorageInventoryService {
                 events.addAll(route.getStorageEvents());
             }
 
-            events.sort((a, b) -> {
-                int byTime = a.timestamp().compareTo(b.timestamp());
-                if (byTime != 0) return byTime;
-                return Integer.compare(eventPriority(a.type()), eventPriority(b.type()));
-            });
+            events.sort(StorageEvent.CHRONOLOGICAL_ORDER);
 
             cachedSolution = solution;
             cachedRouteCount = routeCount;
             cachedSortedEvents = List.copyOf(events);
             return cachedSortedEvents;
         }
-    }
-
-    private static int eventPriority(StorageEventType type) {
-        return type == StorageEventType.ARRIVAL ? 0 : 1;
     }
 }

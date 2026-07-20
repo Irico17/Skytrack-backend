@@ -21,6 +21,11 @@ import java.time.ZonedDateTime;
  * @param criticalAirports Nº de aeropuertos en estado crítico (≥90% de su capacidad).
  * @param totalAirports    Nº total de aeropuertos evaluados.
  * @param cycle            Ciclo de planificación en el que se detectó.
+ * @param lastCycleBatches Lotes consumidos en el último ciclo ejecutado (nuevos + reintentos).
+ * @param lastCycleBags    Maletas consumidas en el último ciclo ejecutado.
+ * @param lastCycleBatchesUnrouted Lotes del último ciclo que quedaron SIN ruta.
+ * @param lastCycleBagsUnrouted    Maletas del último ciclo que quedaron SIN ruta.
+ * @param lastCycleSlaExpired      Lotes del último ciclo con SLA vencido (irrecuperables).
  */
 public record CollapseInfo(
     String causeCode,
@@ -32,5 +37,10 @@ public record CollapseInfo(
     double unserviceablePct,
     int criticalAirports,
     int totalAirports,
-    int cycle
+    int cycle,
+    int lastCycleBatches,
+    int lastCycleBags,
+    int lastCycleBatchesUnrouted,
+    int lastCycleBagsUnrouted,
+    int lastCycleSlaExpired
 ) {}
