@@ -54,10 +54,10 @@ public class TrafficLightIndicator {
     
     /**
      * Constructor con umbrales por defecto.
-     * Verde: <= 50%, Ámbar: <= 70%, Rojo: > 70%
+     * Verde: <= 50%, Ámbar: <= 80%, Rojo: > 80%
      */
     public TrafficLightIndicator() {
-        this(0.5, 0.7);
+        this(0.5, 0.8);
     }
     
     /**

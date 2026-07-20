@@ -900,7 +900,7 @@ public class SimulationController {
 
         int criticalAirports = (int) currentBags.entrySet().stream()
             .filter(entry -> entry.getKey().storageCapacity() > 0
-                && entry.getValue() >= entry.getKey().storageCapacity() * 0.90)
+                && entry.getValue() >= entry.getKey().storageCapacity() * 0.80)
             .count();
         return new int[]{criticalAirports, currentBags.size()};
     }
