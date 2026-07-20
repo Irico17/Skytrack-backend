@@ -64,8 +64,17 @@ public class StorageInventoryService {
             return routedBatchIds;
         }
 
+        // Id BASE (sin sufijo "-S<n>"): un lote dividido por applyCapacityAwareSplitting solo
+        // existe en la solución bajo sus sub-lotes ("B16-S1", "B16-S2"), nunca bajo su id
+        // original ("B16"). Guardar el id exacto de cada ruta hacía que applyUnroutedOriginInventory
+        // (más abajo) NUNCA reconociera a "B16" como ya-enrutado — y le sumaba su cantidad
+        // ORIGINAL completa de nuevo en el origen, ENCIMA de lo que sus sub-lotes ya aportaban
+        // por sus propios eventos de almacén. Con splitting poco frecuente pasaba casi
+        // desapercibido; al volverse la capacidad de almacén una restricción dura (más lotes
+        // necesitan dividirse para caber), este doble conteo se volvió sistémico y creciente en
+        // toda la red — exactamente el patrón de sobrecarga generalizada reportado en producción.
         for (AssignedRoute route : solution.getRoutes().values()) {
-            routedBatchIds.add(route.getBatch().batchId());
+            routedBatchIds.add(baseBatchId(route.getBatch().batchId()));
         }
 
         List<StorageEvent> events = getSortedEvents(solution);
@@ -101,6 +110,19 @@ public class StorageInventoryService {
             int next = inventory.getOrDefault(origin, 0) + batch.quantity();
             inventory.put(origin, Math.max(0, next));
         }
+    }
+
+    /** Quita los sufijos "-S&lt;n&gt;" finales de un id de lote (mismo criterio que Scheduler). */
+    private static String baseBatchId(String id) {
+        String s = id;
+        while (true) {
+            int idx = s.lastIndexOf("-S");
+            if (idx < 0 || idx + 2 >= s.length()) break;
+            String suffix = s.substring(idx + 2);
+            if (!suffix.chars().allMatch(Character::isDigit)) break;
+            s = s.substring(0, idx);
+        }
+        return s;
     }
 
     private List<StorageEvent> getSortedEvents(Solution solution) {
