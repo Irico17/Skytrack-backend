@@ -1360,13 +1360,13 @@ public class SimulationController {
      * momentos completamente distintos sin ninguna razón de fondo.</p>
      *
      * <p>La escala es inversa a la severidad: mientras más lejos de 100% esté, menos tiempo
-     * hace falta esperar — un 110%+ ya es una sobrecarga difícil de explicar como simple
-     * ruido de buffering, así que se declara casi de inmediato.</p>
+     * hace falta esperar — a partir de 105% ya es una sobrecarga difícil de explicar como
+     * simple ruido de buffering, así que se declara casi de inmediato (2s, solo para
+     * confirmar que no es un error de un único tick).</p>
      */
     private static long requiredPersistenceMs(double ratio) {
-        if (ratio >= 1.10) return 2_000L;
-        if (ratio >= 1.05) return 5_000L;
-        return 10_000L; // 100%–105%
+        if (ratio >= 1.05) return 2_000L;
+        return 5_000L; // 100%–105%
     }
 
     /**
