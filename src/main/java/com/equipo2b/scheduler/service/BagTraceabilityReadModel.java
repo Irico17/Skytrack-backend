@@ -250,7 +250,16 @@ final class BagTraceabilityReadModel {
         if (!query.clientId().isBlank() && !batch.clientId().toLowerCase(Locale.ROOT).contains(query.clientId())) {
             return false;
         }
-        return query.batchId().isBlank() || batch.batchId().toLowerCase(Locale.ROOT).contains(query.batchId());
+        if (query.batchId().isBlank()) {
+            return true;
+        }
+        // Filtro por FAMILIA exacta, no contains: pedir "B16" debe traer B16 y todos sus
+        // sub-lotes ("B16-S1", "B16-S2-S1", ...) — así el inspector de un envío dividido ve
+        // las maletas de TODAS sus rutas — pero nunca a "B168" (el contains anterior sí lo
+        // traía) ni a hermanos ajenos cuando se pide un sub-lote concreto ("B16-S1" trae su
+        // propio subárbol, no a "B16-S2").
+        String id = batch.batchId().toLowerCase(Locale.ROOT);
+        return id.equals(query.batchId()) || id.startsWith(query.batchId() + "-s");
     }
 
     private static boolean matchesBagFilters(
