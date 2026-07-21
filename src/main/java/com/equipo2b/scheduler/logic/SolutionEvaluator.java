@@ -194,7 +194,7 @@ public class SolutionEvaluator {
      * 50/50 = α·50. Con α=2 la diferencia (100 pts) equivale a 1 h de holgura — orienta la
      * búsqueda sin sacrificar jamás SLA ni factibilidad (que valen 10k-50k pts).
      */
-    public static final double PENALTY_LOAD_CONVEX_FACTOR = 2.0;
+    public static final double PENALTY_LOAD_CONVEX_FACTOR = 5.0;
 
     /**
      * Costo marginal CONVEXO por ocupación PICO de almacén: β · pico²/capacidad por aeropuerto.

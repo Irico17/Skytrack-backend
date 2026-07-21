@@ -791,7 +791,9 @@ public class Scheduler {
             // tiene almacén libre, empujándolo sobre el 100%.
             int hubResidual = t.destination().storageCapacity() - hubCapacity.storageOccupancy(t.destination());
             if (hubResidual < MIN_FILL_BAGS) continue;
-            int take = Math.min(Math.min(leftover, remaining), hubResidual);
+            int originResidual = hubCapacity.storageResidual(t.origin());
+            if (originResidual < MIN_FILL_BAGS) continue;
+            int take = Math.min(Math.min(leftover, remaining), Math.min(hubResidual, originResidual));
             int idx = splitCounter.merge(rem.baseId(), 1, Integer::sum);
             String subId = rem.baseId() + "-S" + idx;
             try {

@@ -141,7 +141,8 @@ public class RouteGenerator {
                     // Origen ya ocupa espacio; hubs intermedios y destino final necesitan residual.
                     // Intermedios: filtrar duro + soft-limit. Destino: solo residual duro.
                     if (!isFinalDestination) {
-                        if (!capacity.hasHubCapacity(hub, batchQuantity) || capacity.isHubNearLimit(hub)) {
+                        if (!capacity.hasHubCapacity(hub, batchQuantity)
+                                || capacity.isHubNearLimit(hub, batchQuantity)) {
                             continue;
                         }
                     } else if (!capacity.hasHubCapacity(hub, batchQuantity)) {
@@ -225,7 +226,8 @@ public class RouteGenerator {
                     Airport hub = flight.destination();
                     boolean isFinalDestination = hub.equals(destination);
                     if (!isFinalDestination) {
-                        if (!capacity.hasHubCapacity(hub, batchQuantity) || capacity.isHubNearLimit(hub)) {
+                        if (!capacity.hasHubCapacity(hub, batchQuantity)
+                                || capacity.isHubNearLimit(hub, batchQuantity)) {
                             continue;
                         }
                     } else if (!capacity.hasHubCapacity(hub, batchQuantity)) {
@@ -310,24 +312,10 @@ public class RouteGenerator {
         if (capacity == null) {
             return null;
         }
-        // FALLBACK NIVEL 2: relajar solo el umbral suave de proximidad a hubs (92%). La
-        // capacidad DURA de almacén (hasHubCapacity) se sigue exigiendo en cada escala —
-        // nunca se permite desbordar un almacén, solo se amplía qué caminos se consideran.
-        AssignedRoute relaxedSoft = earliestPathRoute(batch, sla, capacity.withHubSoftLimitRelaxed());
-        if (relaxedSoft != null) {
-            return relaxedSoft;
-        }
-        // FALLBACK NIVEL 3: además ignorar capacidad de VUELO (un desborde de vuelo se
-        // corrige después vía applyCapacityAwareSplitting; uno de almacén no tiene
-        // corrección posterior, así que su capacidad dura nunca se relaja aquí tampoco).
-        AssignedRoute relaxedFlight = earliestPathRoute(
-            batch, sla, capacity.withHubSoftLimitRelaxed().withFlightCapacityRelaxed());
-        if (relaxedFlight != null) {
-            return relaxedFlight;
-        }
-        // Ningún camino en la red respeta la capacidad de almacén dentro del SLA: el lote
-        // queda sin ruta este ciclo (retry) en vez de forzar un desborde de almacén.
-        return null;
+        // FALLBACK NIVEL 2: relajar solo el umbral suave de hubs. Capacidad DURA de almacén
+        // y de VUELO se mantienen — el sobrebookeo (antiguo nivel 3) se sustituye por split
+        // parcial en la semilla GA / applyCapacityAwareSplitting, no aquí.
+        return earliestPathRoute(batch, sla, capacity.withHubSoftLimitRelaxed());
     }
 
     private AssignedRoute earliestPathRoute(ShipmentBatch batch, Duration sla, CapacityContext capacity) {
@@ -412,15 +400,13 @@ public class RouteGenerator {
                 }
             }
 
-            // FALLBACK NIVEL 2/3 sobre los paths cacheados: relajar umbral suave de hubs y,
-            // si hace falta, capacidad de vuelo — la capacidad DURA de almacén nunca se
-            // relaja (ver CapacityContext). Si ni así cabe, el lote queda sin ruta este
-            // ciclo (retry) en vez de forzar un desborde de almacén.
+            // FALLBACK NIVEL 2 sobre paths cacheados: solo relajar soft de hubs.
+            // No sobrebookear vuelos desde el cache (el split parcial lo hace la semilla).
             if (capacity != null) {
-                AssignedRoute relaxedFromCache = pickCapacityFeasible(
-                    batch, candidates, capacity.withHubSoftLimitRelaxed().withFlightCapacityRelaxed());
-                if (relaxedFromCache != null) {
-                    return relaxedFromCache;
+                AssignedRoute softOnly = pickCapacityFeasible(
+                    batch, candidates, capacity.withHubSoftLimitRelaxed());
+                if (softOnly != null) {
+                    return softOnly;
                 }
             }
             return null;
@@ -466,7 +452,7 @@ public class RouteGenerator {
             Airport hub = flight.destination();
             boolean isFinal = hub.equals(destination);
             if (!isFinal) {
-                if (!capacity.hasHubCapacity(hub, qty) || capacity.isHubNearLimit(hub)) {
+                if (!capacity.hasHubCapacity(hub, qty) || capacity.isHubNearLimit(hub, qty)) {
                     return false;
                 }
             } else if (!capacity.hasHubCapacity(hub, qty)) {
@@ -516,17 +502,16 @@ public class RouteGenerator {
 
         int relaxedAttempts = Math.max(2, maxAttempts / 2);
 
-        // FALLBACK NIVEL 2: relajar solo el umbral suave de proximidad a hubs (92%).
+        // FALLBACK NIVEL 2: relajar solo el umbral suave de proximidad a hubs.
         AssignedRoute relaxedSoft = tryGenerateRoute(
             batch, sla, allowedFlights, relaxedAttempts, capacity.withHubSoftLimitRelaxed(), preferMultiHop);
         if (relaxedSoft != null) {
             return relaxedSoft;
         }
 
-        // FALLBACK NIVEL 3: además ignorar capacidad de VUELO (se corrige después vía
-        // applyCapacityAwareSplitting). La capacidad de almacén se sigue exigiendo siempre.
-        return tryGenerateRoute(batch, sla, allowedFlights, relaxedAttempts,
-            capacity.withHubSoftLimitRelaxed().withFlightCapacityRelaxed(), preferMultiHop);
+        // Ya no hay Nivel 3 (flight-relax): sobrebookear aquí concentraba carga y delegaba
+        // el desastre a applyCapacityAwareSplitting. Sin ruta → split parcial en semilla o retry.
+        return null;
     }
 
     private AssignedRoute tryGenerateRoute(

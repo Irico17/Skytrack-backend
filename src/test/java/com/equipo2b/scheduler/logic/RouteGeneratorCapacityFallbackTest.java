@@ -73,7 +73,8 @@ class RouteGeneratorCapacityFallbackTest {
 
     @Test
     void hubNearSoftLimitButRoomLeft_relaxesOnlySoftThreshold() {
-        // Hub al 95% (por encima del umbral suave 92%) pero con residual real para el lote.
+        // Hub al 95% (por encima del umbral suave 80%) pero con residual duro para el lote.
+        // Soft predictivo (used+qty) también bloquea en el primer intento; Nivel 2 relaja soft.
         AirportManager airports = new AirportManager(List.of(origin, hub, dest));
         FlightPlan flightPlan = new FlightPlan(List.of(leg1, leg2)); // solo vía hub
         RouteGenerator generator = new RouteGenerator(flightPlan, airports);
@@ -81,12 +82,31 @@ class RouteGeneratorCapacityFallbackTest {
         int used = 95; // capacidad total = 100
         CapacityContext capacity = CapacityContext.fromBaseline(Map.of(hub, used));
 
-        int quantity = 4; // 95 + 4 = 99 <= 100: cabe, pero dispara el umbral suave (95 >= 92)
+        int quantity = 4; // 95 + 4 = 99 <= 100: cabe duro; soft predictivo sí dispara
+        assertTrue(capacity.isHubNearLimit(hub, quantity),
+            "Soft predictivo debe ver used+qty sobre el umbral");
         AssignedRoute route = generator.generateFeasibleRoute(batch(quantity), capacity);
 
         assertNotNull(route, "El umbral SUAVE debe poder relajarse cuando de verdad hay residual duro");
         assertTrue(capacity.hasHubCapacity(hub, quantity),
             "La ruta encontrada debe respetar la capacidad DURA del almacén");
+    }
+
+    @Test
+    void softPredictive_blocksLargeBatchBeforeHubLooksFull() {
+        // Hub al 70%: soft antiguo (solo used) dejaría pasar; used+qty=95 >= 80*100 → bloquea.
+        AirportManager airports = new AirportManager(List.of(origin, hub, dest));
+        FlightPlan flightPlan = new FlightPlan(List.of(leg1, leg2, direct));
+        RouteGenerator generator = new RouteGenerator(flightPlan, airports);
+
+        CapacityContext capacity = CapacityContext.fromBaseline(Map.of(hub, 70));
+        assertFalse(capacity.isHubNearLimit(hub, 0));
+        assertTrue(capacity.isHubNearLimit(hub, 25));
+
+        AssignedRoute route = generator.generateFeasibleRoute(batch(25), capacity);
+        assertNotNull(route, "Debe existir alternativa (directo) sin pasar por el hub");
+        assertFalse(route.getFlights().contains(leg1),
+            "No debe usar el hub cuando used+qty dispara soft y hay directo");
     }
 
     @Test

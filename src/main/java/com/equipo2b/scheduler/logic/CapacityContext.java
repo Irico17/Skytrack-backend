@@ -68,7 +68,7 @@ public final class CapacityContext {
     }
 
     /**
-     * Vista de fallback NIVEL 2: ignora el umbral suave de proximidad a hubs (92%), pero
+     * Vista de fallback NIVEL 2: ignora el umbral suave de proximidad a hubs, pero
      * sigue exigiendo capacidad DURA de almacén ({@link #hasHubCapacity}) en cada escala —
      * nunca permite desbordar un almacén. Comparte los mapas subyacentes (solo lectura
      * durante la búsqueda de camino; no se le debe llamar {@link #applyRoute}/{@link
@@ -79,9 +79,9 @@ public final class CapacityContext {
     }
 
     /**
-     * Vista de fallback NIVEL 3: además ignora capacidad de VUELO (un desborde de vuelo se
-     * corrige después vía {@code applyCapacityAwareSplitting}, a diferencia de almacén, que
-     * no tiene corrección posterior). La capacidad de almacén sigue siendo dura.
+     * Vista legacy: ignora capacidad de VUELO. Preferir split parcial en construcción
+     * en vez de sobrebookear; se mantiene por compatibilidad. La capacidad de almacén
+     * sigue siendo dura.
      */
     public CapacityContext withFlightCapacityRelaxed() {
         return new CapacityContext(flightLoad, storageOccupancy, hubSoftLimitEnabled, false);
@@ -96,6 +96,15 @@ public final class CapacityContext {
         return flight.capacity() - used >= quantity;
     }
 
+    /** Asientos libres en el vuelo (capacidad nominal si la capacidad de vuelo está relajada). */
+    public int flightResidual(Flight flight) {
+        Objects.requireNonNull(flight, "flight");
+        if (!flightCapacityEnabled) {
+            return flight.capacity();
+        }
+        return Math.max(0, flight.capacity() - flightLoad.getOrDefault(flight.flightId(), 0));
+    }
+
     /**
      * Residual duro: cabe {@code quantity} sin exceder capacidad del almacén. A diferencia
      * de {@link #isHubNearLimit} y {@link #hasFlightCapacity}, este chequeo NUNCA se relaja
@@ -108,14 +117,36 @@ public final class CapacityContext {
         return used + quantity <= airport.storageCapacity();
     }
 
-    /** Hub cerca del límite (filtro suave durante BFS de construcción). */
+    /** Maletas que aún caben en el almacén sin superar el 100%. */
+    public int storageResidual(Airport airport) {
+        Objects.requireNonNull(airport, "airport");
+        int used = storageOccupancy.getOrDefault(airport, 0);
+        return Math.max(0, airport.storageCapacity() - used);
+    }
+
+    /**
+     * Hub cerca del límite (filtro suave). Compatibilidad: equivale a
+     * {@link #isHubNearLimit(Airport, int)} con quantity=0 (ya está en/sobre el umbral).
+     */
     public boolean isHubNearLimit(Airport airport) {
+        return isHubNearLimit(airport, 0);
+    }
+
+    /**
+     * Soft predictivo: true si al colocar {@code quantity} el hub quedaría en o por encima
+     * del umbral suave ({@link #HUB_SOFT_LIMIT_RATIO}). Evita que un lote grande "salte"
+     * el colchón cuando la ocupación actual aún está por debajo del umbral.
+     */
+    public boolean isHubNearLimit(Airport airport, int quantity) {
         Objects.requireNonNull(airport, "airport");
         if (!hubSoftLimitEnabled) {
             return false;
         }
+        if (quantity < 0) {
+            throw new IllegalArgumentException("quantity must be >= 0, got: " + quantity);
+        }
         int used = storageOccupancy.getOrDefault(airport, 0);
-        return used >= airport.storageCapacity() * HUB_SOFT_LIMIT_RATIO;
+        return used + quantity >= airport.storageCapacity() * HUB_SOFT_LIMIT_RATIO;
     }
 
     public int flightLoad(Flight flight) {

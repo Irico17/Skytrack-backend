@@ -198,16 +198,51 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         orderedBatches.sort(Comparator.comparing(ShipmentBatch::ingressTime));
         CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
 
+        ArrayDeque<ShipmentBatch> queue = new ArrayDeque<>(orderedBatches);
+        Map<String, Integer> nextSplitSuffix = new HashMap<>();
         int unroutable = 0;
         int routed = 0;
-        for (ShipmentBatch batch : orderedBatches) {
+        int partialSplits = 0;
+
+        while (!queue.isEmpty()) {
             if (System.currentTimeMillis() >= deadline) {
                 System.out.printf(
-                    "⏱ Semilla greedy truncada por Ta tras %d/%d lotes%n",
-                    routed, orderedBatches.size());
+                    "⏱ Semilla greedy truncada por Ta tras %d/%d lotes (cola restante=%d)%n",
+                    routed, orderedBatches.size(), queue.size());
                 break;
             }
+
+            ShipmentBatch batch = queue.poll();
+            int originResidual = capacity.storageResidual(batch.origin());
+            if (originResidual <= 0) {
+                unroutable++;
+                continue;
+            }
+
+            // Admisión de origen: si el lote entero no cabe, partir antes de buscar ruta.
+            if (batch.quantity() > originResidual) {
+                ShipmentBatch head = splitPortion(batch, originResidual, nextSplitSuffix);
+                ShipmentBatch tail = splitPortion(batch, batch.quantity() - originResidual, nextSplitSuffix);
+                queue.addFirst(tail);
+                batch = head;
+                partialSplits++;
+            }
+
             AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(batch, capacity);
+            if (route == null && batch.quantity() > 1) {
+                // Sin sobrebookeo de vuelo: probar la mayor cantidad que sí quepa.
+                int fitted = findMaxRoutableQuantity(batch, capacity);
+                if (fitted >= 1 && fitted < batch.quantity()) {
+                    ShipmentBatch head = splitPortion(batch, fitted, nextSplitSuffix);
+                    ShipmentBatch tail = splitPortion(batch, batch.quantity() - fitted, nextSplitSuffix);
+                    route = routeGenerator.generateEarliestFeasibleRoute(head, capacity);
+                    if (route != null) {
+                        queue.addFirst(tail);
+                        partialSplits++;
+                    }
+                }
+            }
+
             if (route != null) {
                 solution.addRoute(route);
                 capacity.applyRoute(route);
@@ -217,10 +252,71 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             }
         }
 
-        if (unroutable > 0) {
-            System.err.printf("Warning: %d batches could not be routed in seed construction%n", unroutable);
+        if (unroutable > 0 || partialSplits > 0) {
+            System.err.printf(
+                "Warning: seed construction — %d unroutable, %d partial splits, %d routed%n",
+                unroutable, partialSplits, routed);
         }
         return solution;
+    }
+
+    /**
+     * Mayor cantidad en [1, batch.quantity()] para la que existe ruta earliest con capacidad
+     * de vuelo/almacén (soft relajable). Búsqueda binaria — qty típica es pequeña.
+     */
+    private int findMaxRoutableQuantity(ShipmentBatch batch, CapacityContext capacity) {
+        int lo = 1;
+        int hi = batch.quantity() - 1;
+        int best = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            ShipmentBatch probe = new ShipmentBatch(
+                batch.batchId() + "#probe",
+                batch.airportBatchId(),
+                batch.clientId(),
+                batch.origin(),
+                batch.destination(),
+                mid,
+                batch.ingressTime());
+            AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(probe, capacity);
+            if (route != null) {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return best;
+    }
+
+    private static String batchRootId(String batchId) {
+        String s = batchId;
+        while (true) {
+            int idx = s.lastIndexOf("-S");
+            if (idx < 0) {
+                return s;
+            }
+            String suffix = s.substring(idx + 2);
+            if (suffix.isEmpty() || !suffix.chars().allMatch(Character::isDigit)) {
+                return s;
+            }
+            s = s.substring(0, idx);
+        }
+    }
+
+    private static ShipmentBatch splitPortion(
+            ShipmentBatch source, int quantity, Map<String, Integer> nextSplitSuffix) {
+        String root = batchRootId(source.batchId());
+        int n = nextSplitSuffix.merge(root, 1, Integer::sum);
+        String id = root + "-S" + n;
+        return new ShipmentBatch(
+            id,
+            source.airportBatchId() + "-S" + n,
+            source.clientId(),
+            source.origin(),
+            source.destination(),
+            quantity,
+            source.ingressTime());
     }
     
     /**
