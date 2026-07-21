@@ -204,13 +204,17 @@ public class SolutionEvaluator {
      * nadie exceda su capacidad (por eso existen las rutas con escalas). La penalización
      * dura de almacén solo castiga el DESBORDE; entre 0% y 100% el algoritmo era
      * indiferente y concentraba tránsito en los mismos hubs. Igual que el término convexo
-     * de vuelos: concentrar 400 maletas en un almacén de 440 cuesta β·400²/440 ≈ 727 pts,
-     * repartirlas 200/200 entre dos hubs ≈ 363 pts → el GA/Tabú prefiere repartir.</p>
+     * de vuelos: con β=6, concentrar 420 maletas en un almacén de 420 (100%) cuesta
+     * β·420²/420 = 2,520 pts; repartirlas 210/210 entre dos hubs (50% cada uno) ≈ 1,260 pts
+     * → el GA/Tabú prefiere repartir, con un empuje más fuerte que antes (β=2 → 840 vs 420)
+     * para que además ayude a suavizar los picos transitorios de un solo hub, no solo el
+     * desbalance en régimen permanente.</p>
      *
-     * <p>Del mismo orden que los premios (cientos de puntos) y muy por debajo de las
-     * restricciones duras (10k-50k): balancea sin sacrificar SLA ni factibilidad.</p>
+     * <p>Sigue muy por debajo de las restricciones duras (10k-50k) y de PENALTY_SLA_VIOLATION
+     * (20k/hora) — nunca puede ganarle a SLA ni a factibilidad, solo desempata más fuerte
+     * entre rutas de costo similar.</p>
      */
-    public static final double PENALTY_STORAGE_CONVEX_FACTOR = 2.0;
+    public static final double PENALTY_STORAGE_CONVEX_FACTOR = 6.0;
 
     /**
      * Penalización por desbalance GLOBAL de ocupación de almacenes (varianza de ratios).
