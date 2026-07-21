@@ -5,6 +5,7 @@ import com.equipo2b.scheduler.logic.RouteGenerator;
 import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
@@ -90,8 +91,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     * superar la ganancia.
      * 
      * <p><strong>Validates: Requirement 10.1</strong>
-     * 
-     * @param batches Lista de lotes para los cuales generar rutas
+     *
+     * @param batches Lista EFECTIVA post-split de la semilla (Tarea A) — sus ids deben
+     *     coincidir con los de las rutas de {@code seed}, nunca la lista original del ciclo
      * @return Población inicial de soluciones
      */
     private List<Solution> initializePopulation(List<ShipmentBatch> batches, int effectivePopulationSize,
@@ -143,16 +145,20 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             })
             .collect(Collectors.toList());
 
-        // INVARIANTE DE TRANSPORTE: ningún individuo compite con MENOS rutas que la
-        // semilla. Bajo saturación real, el fitness puede preferir una solución parcial
+        // INVARIANTE DE TRANSPORTE: ningún individuo compite con MENOS MALETAS transportadas
+        // que la semilla (Tarea B — antes comparaba número de RUTAS, que con lotes partidos
+        // por la semilla —splits "-S<n>"— ya no es comparable 1:1 contra un individuo fresco
+        // que enrutó el mismo lote atómicamente en una sola ruta: menos rutas no significa
+        // menos maletas). Bajo saturación real, el fitness puede preferir una solución parcial
         // (50k/lote sin asignar es más barato que el exceso de almacén acumulado) y un
         // individuo truncado por deadline le GANABA a la semilla completa — el ciclo
         // terminaba con 12-64% de asignación. Los truncados/vacíos se reemplazan por
-        // copias de la semilla; como crossover y mutación nunca reducen el número de
-        // rutas, el invariante se conserva en toda la evolución.
-        final int seedRouteCount = seed.getRoutes().size();
+        // copias de la semilla; como crossover y mutación nunca reducen las maletas
+        // transportadas (Tarea E evita que la mutación descarte lotes sin forzarlos), el
+        // invariante se conserva en toda la evolución.
+        final int seedTotalBags = seed.getTotalBags();
         for (int j = 0; j < population.size(); j++) {
-            if (population.get(j).getRoutes().size() < seedRouteCount) {
+            if (population.get(j).getTotalBags() < seedTotalBags) {
                 population.set(j, new Solution(seed));
             }
         }
@@ -192,14 +198,44 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             && effectivePopulationSize >= parallelPopulationThreshold;
     }
 
-    private Solution buildHeuristicSolution(List<ShipmentBatch> batches, long deadline) {
+    /**
+     * Resultado de construir la semilla greedy: la solución y la lista EFECTIVA de lotes
+     * realmente procesados (sub-lotes de splitPortion + lotes no partidos + lotes que
+     * quedaron sin ruta, todos en su forma FINAL — mismos ids que aparecen en las rutas de
+     * {@code seed}). Población, crossover (implícitamente, por ids) y mutación deben operar
+     * sobre esta lista, nunca sobre la lista original de lotes del ciclo — ver Tarea A.
+     */
+    private record SeedResult(Solution seed, List<ShipmentBatch> effectiveBatches) {}
+
+    /**
+     * Ventana de agrupación temporal para el orden de la semilla greedy (Tarea C).
+     */
+    private static final Duration REGRET_BLOCK_WINDOW = Duration.ofMinutes(30);
+
+    private SeedResult buildHeuristicSolution(List<ShipmentBatch> batches, long deadline) {
         Solution solution = new Solution();
         List<ShipmentBatch> orderedBatches = new ArrayList<>(batches);
-        orderedBatches.sort(Comparator.comparing(ShipmentBatch::ingressTime));
+        // SEMILLA REGRET-LITE: prioridad temporal por ventana de ingreso (bloques de 30 min,
+        // igual que antes) preservada como criterio PRIMARIO — no queremos que un lote grande
+        // le robe el turno a uno con ventana de ingreso muy anterior. Dentro del MISMO bloque,
+        // sin embargo, se ordenan primero los lotes "difíciles": cantidad grande primero (más
+        // fácil de fragmentar más tarde si no cabe, y son los que más presionan la capacidad
+        // residual) y, como desempate, el SLA más apretado primero. Razonamiento del desempate:
+        // aunque "intercontinental" suena más restrictivo, el SLA real es 24h mismo continente
+        // vs 48h distinto continente — el intracontinental tiene la MITAD de margen, así que es
+        // el que en verdad hay que colocar primero; el intercontinental (48h) tiene holgura de
+        // sobra para esperar su turno. Los lotes chicos, con SLA laxo, quedan al final del
+        // bloque y rellenan los huecos de capacidad que dejan los grandes.
+        orderedBatches.sort(
+            Comparator.<ShipmentBatch>comparingLong(
+                    b -> b.ingressTime().toEpochSecond() / REGRET_BLOCK_WINDOW.toSeconds())
+                .thenComparing(Comparator.comparingInt(ShipmentBatch::quantity).reversed())
+                .thenComparing(ShipmentBatch::calculateSLA));
         CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
 
         ArrayDeque<ShipmentBatch> queue = new ArrayDeque<>(orderedBatches);
         Map<String, Integer> nextSplitSuffix = new HashMap<>();
+        List<ShipmentBatch> effectiveBatches = new ArrayList<>();
         int unroutable = 0;
         int routed = 0;
         int partialSplits = 0;
@@ -216,6 +252,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             int originResidual = capacity.storageResidual(batch.origin());
             if (originResidual <= 0) {
                 unroutable++;
+                effectiveBatches.add(batch);
                 continue;
             }
 
@@ -243,12 +280,18 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 }
             }
 
+            // Lista EFECTIVA (Tarea A): registrar la forma FINAL de esta porción — el batch
+            // del route (puede ser un sub-lote -S<n> o el lote sin partir) si se enrutó, o
+            // `batch` tal cual quedó (ya con el split de admisión de origen aplicado, si hubo)
+            // si no se pudo enrutar. Nunca la lista original.
             if (route != null) {
                 solution.addRoute(route);
                 capacity.applyRoute(route);
                 routed++;
+                effectiveBatches.add(route.getBatch());
             } else {
                 unroutable++;
+                effectiveBatches.add(batch);
             }
         }
 
@@ -257,58 +300,88 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 "Warning: seed construction — %d unroutable, %d partial splits, %d routed%n",
                 unroutable, partialSplits, routed);
         }
-        return solution;
+        return new SeedResult(solution, effectiveBatches);
     }
 
     /**
-     * Mayor cantidad en [1, batch.quantity()] para la que existe ruta earliest con capacidad
-     * de vuelo/almacén (soft relajable). Búsqueda binaria — qty típica es pequeña.
+     * Mayor cantidad en [1, batch.quantity() - 1] para la que existe ruta earliest con
+     * capacidad de vuelo/almacén. Solo se llama cuando el batch COMPLETO ya falló, así que
+     * el tope nunca es la cantidad total (igual que la búsqueda binaria anterior).
+     *
+     * <p>ANTES: búsqueda binaria con un Dijkstra completo por probe (~6-8 corridas por lote
+     * fallido). AHORA (Tarea D): UNA sola corrida earliest con quantity=1 fija la TOPOLOGÍA
+     * de la ruta (un solo asiento casi siempre cabe); el cuello de botella real —cuánta
+     * cantidad soporta esa topología concreta— se calcula en O(tramos) tomando el mínimo de
+     * los residuales de vuelo y almacén a lo largo del camino, sin más búsquedas de ruta.</p>
      */
     private int findMaxRoutableQuantity(ShipmentBatch batch, CapacityContext capacity) {
-        int lo = 1;
-        int hi = batch.quantity() - 1;
-        int best = -1;
-        while (lo <= hi) {
-            int mid = (lo + hi) >>> 1;
-            ShipmentBatch probe = new ShipmentBatch(
-                batch.batchId() + "#probe",
-                batch.airportBatchId(),
-                batch.clientId(),
-                batch.origin(),
-                batch.destination(),
-                mid,
-                batch.ingressTime());
-            AssignedRoute route = routeGenerator.generateEarliestFeasibleRoute(probe, capacity);
-            if (route != null) {
-                best = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
+        ShipmentBatch probe = new ShipmentBatch(
+            batch.batchId() + "#probe",
+            batch.airportBatchId(),
+            batch.clientId(),
+            batch.origin(),
+            batch.destination(),
+            1,
+            batch.ingressTime());
+        AssignedRoute probeRoute = routeGenerator.generateEarliestFeasibleRoute(probe, capacity);
+        if (probeRoute == null) {
+            return -1;
         }
-        return best;
+
+        // Cuello de botella: mínimo residual entre almacén de origen, cada tramo de vuelo y
+        // cada hub tocado (escalas intermedias y destino) a lo largo del camino del probe.
+        int bottleneck = capacity.storageResidual(batch.origin());
+        for (Flight flight : probeRoute.getFlights()) {
+            bottleneck = Math.min(bottleneck, capacity.flightResidual(flight));
+            bottleneck = Math.min(bottleneck, capacity.storageResidual(flight.destination()));
+        }
+        int candidate = Math.min(bottleneck, batch.quantity() - 1);
+
+        // Verificación DURA tramo por tramo antes de confiar el candidato: el probe se
+        // resolvió con quantity=1, así que su camino pudo pasar por un hub que a mayor
+        // cantidad ya no está 100% garantizado (p.ej. justo en el borde del soft-limit).
+        // Si no pasa, degradar al máximo que sí pase (nunca sobrebookear vuelo ni almacén).
+        while (candidate >= 1 && !fitsAlongRoute(probeRoute, candidate, capacity)) {
+            candidate--;
+        }
+        return candidate >= 1 ? candidate : -1;
     }
 
-    private static String batchRootId(String batchId) {
-        String s = batchId;
-        while (true) {
-            int idx = s.lastIndexOf("-S");
-            if (idx < 0) {
-                return s;
-            }
-            String suffix = s.substring(idx + 2);
-            if (suffix.isEmpty() || !suffix.chars().allMatch(Character::isDigit)) {
-                return s;
-            }
-            s = s.substring(0, idx);
+    /** Capacidad DURA (vuelo + almacén) para colocar {@code quantity} a lo largo de {@code route}. */
+    private boolean fitsAlongRoute(AssignedRoute route, int quantity, CapacityContext capacity) {
+        if (!capacity.hasHubCapacity(route.getBatch().origin(), quantity)) {
+            return false;
         }
+        for (Flight flight : route.getFlights()) {
+            if (!capacity.hasFlightCapacity(flight, quantity)) {
+                return false;
+            }
+            if (!capacity.hasHubCapacity(flight.destination(), quantity)) {
+                return false;
+            }
+        }
+        return true;
     }
 
+    /**
+     * Crea una porción del lote {@code source} ANIDANDO el sufijo bajo el id del propio
+     * fuente ("B1-S2" → "B1-S2-S1"), nunca aplanando hasta la raíz de la familia.
+     *
+     * <p><b>Por qué es obligatorio anidar:</b> un lote de reintento puede llegar aquí ya con
+     * sufijo (p. ej. "B1-S2", acuñado por el carryover del Scheduler). Aplanar a la raíz
+     * ("B1") re-acuñaría "B1-S1" — un id que puede EXISTIR en la solución acumulada de un
+     * ciclo anterior; al acumularse, {@code addRoute} (que reemplaza por batchId)
+     * sobrescribiría en silencio esa ruta vieja, perdiendo maletas ya colocadas (incluso ya
+     * voladas). Anidando, los ids nuevos viven en el subárbol EXCLUSIVO del lote fuente
+     * (garantizado libre por freshCarryoverId al acuñar el carryover), así que no pueden
+     * colisionar con nada preexistente — y la contabilidad por maletas del Scheduler
+     * ({@code routedQuantity}, que suma el subárbol del id del lote) los ve todos.</p>
+     */
     private static ShipmentBatch splitPortion(
             ShipmentBatch source, int quantity, Map<String, Integer> nextSplitSuffix) {
-        String root = batchRootId(source.batchId());
-        int n = nextSplitSuffix.merge(root, 1, Integer::sum);
-        String id = root + "-S" + n;
+        String parent = source.batchId();
+        int n = nextSplitSuffix.merge(parent, 1, Integer::sum);
+        String id = parent + "-S" + n;
         return new ShipmentBatch(
             id,
             source.airportBatchId() + "-S" + n,
@@ -403,7 +476,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      * <p><strong>Validates: Requirements 8.4, 10.5</strong>
      * 
      * @param solution Solución a mutar (se modifica in-place)
-     * @param batches Lista de lotes disponibles
+     * @param batches Lista EFECTIVA post-split de la semilla (Tarea A) — NUNCA la lista
+     *     original: sus ids deben coincidir 1:1 con las claves de {@code solution.getRoutes()},
+     *     o {@code solution.getRoute(batch.batchId())} da falso null y se duplica la cantidad
+     *     completa del lote además de sus sub-lotes ya existentes (Defecto verificado #2)
      */
     /**
      * Probabilidad de generar la ruta mutada SIN cache (diversidad genuina + multi-hop).
@@ -423,6 +499,15 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         for (int m = 0; m < mutationCount; m++) {
             ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
             AssignedRoute existing = solution.getRoute(batch.batchId());
+
+            // Tarea E — admisión de origen: un lote SIN ruta previa (típicamente uno que quedó
+            // sin asignar en la semilla) no debe forzarse si ni siquiera cabe en el almacén de
+            // origen; intentarlo solo produce búsquedas fallidas repetidas. Si YA tenía ruta,
+            // removerla libera su propio espacio de origen, así que no aplica este chequeo.
+            if (existing == null && capacity.storageResidual(batch.origin()) < batch.quantity()) {
+                continue;
+            }
+
             if (existing != null) {
                 capacity.removeRoute(existing);
             }
@@ -476,8 +561,11 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             throw new NullPointerException("Batches cannot be null");
         }
 
-        // Configurar evaluador con cantidad esperada de lotes
+        // Configurar evaluador con cantidad esperada de lotes y de MALETAS (Tarea F). El
+        // conteo de maletas se fija con la lista ORIGINAL del ciclo — los splits de la
+        // semilla greedy solo fragmentan lotes existentes, nunca cambian el total transportable.
         evaluator.setExpectedBatchCount(batches.size());
+        evaluator.setExpectedBagCount(batches.stream().mapToInt(ShipmentBatch::quantity).sum());
         if (batches.isEmpty()) {
             Solution empty = new Solution();
             empty.setFitness(evaluator.evaluate(empty));
@@ -503,7 +591,13 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         // decisión de correr o no la evolución poblacional se toma con tiempo MEDIDO en
         // esta máquina y este ciclo, no con un umbral fijo de lotes que hay que recalibrar
         // en cada VM.
-        Solution seed = buildHeuristicSolution(batches, deadline);
+        SeedResult seedResult = buildHeuristicSolution(batches, deadline);
+        Solution seed = seedResult.seed();
+        // Lista EFECTIVA post-split (Tarea A): población, crossover (por ids) y mutación
+        // operan sobre ESTA lista, nunca sobre `batches` — sus ids coinciden exactamente con
+        // las claves de las rutas de la semilla, así que la mutación nunca genera una ruta
+        // "fantasma" para un lote que en realidad ya está partido en sub-lotes.
+        List<ShipmentBatch> effectiveBatches = seedResult.effectiveBatches();
         seed.setFitness(evaluator.evaluate(seed));
         final long seedMs = Math.max(1, System.currentTimeMillis() - startMs);
         final long remainingAfterSeed = deadline - System.currentTimeMillis();
@@ -554,17 +648,20 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             }
 
             EvolutionResult result = runEvolution(
-                batches, effectivePopulationSize, effectiveGenerations, effectiveStagnationLimit, deadline, seed);
+                effectiveBatches, effectivePopulationSize, effectiveGenerations, effectiveStagnationLimit,
+                deadline, seed);
             runs++;
             totalGenerations += result.generationsExecuted;
             if (runs == 1) {
                 firstRunFitness = result.best.getFitness();
             }
 
-            // Aceptar solo si mejora el fitness SIN transportar menos que el mejor actual
-            // (refuerzo del invariante de transporte de initializePopulation).
+            // Aceptar solo si mejora el fitness SIN transportar menos MALETAS que el mejor
+            // actual (Tarea B — refuerzo del invariante de transporte de initializePopulation,
+            // ahora medido por maletas en vez de número de rutas por la misma razón: los
+            // splits de la semilla inflan el conteo de rutas sin inflar las maletas).
             if (result.best.getFitness() < globalBest.getFitness() - 0.01
-                    && result.best.getRoutes().size() >= globalBest.getRoutes().size()) {
+                    && result.best.getTotalBags() >= globalBest.getTotalBags()) {
                 if (runs > 1) improvements++;
                 globalBest = result.best;
                 runsWithoutImprovement = 0;
@@ -594,9 +691,12 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     /**
      * Una corrida evolutiva completa (población fresca → early-stop/deadline/límite de
      * generaciones). Extraída de optimize() para poder reiniciarla con semillas nuevas.
+     *
+     * @param effectiveBatches Lista EFECTIVA post-split de la semilla (Tarea A) — NUNCA la
+     *     lista original de lotes del ciclo. Gobierna initializePopulation y mutate().
      */
     private EvolutionResult runEvolution(
-            List<ShipmentBatch> batches,
+            List<ShipmentBatch> effectiveBatches,
             int effectivePopulationSize,
             int effectiveGenerations,
             int effectiveStagnationLimit,
@@ -604,7 +704,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             Solution seed) {
 
         // 1. Inicializar población con rutas factibles (aleatoriedad nueva en cada corrida)
-        List<Solution> population = initializePopulation(batches, effectivePopulationSize, deadline, seed);
+        List<Solution> population = initializePopulation(effectiveBatches, effectivePopulationSize, deadline, seed);
 
         double bestFitnessSoFar = Double.MAX_VALUE;
         int stagnationCounter = 0;
@@ -652,7 +752,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 Solution child = crossover(parent1, parent2);
 
                 if (ThreadLocalRandom.current().nextDouble() < mutationRate) {
-                    mutate(child, batches);
+                    mutate(child, effectiveBatches);
                 }
 
                 nextGeneration.add(child);

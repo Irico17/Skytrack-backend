@@ -47,6 +47,22 @@ public class RouteGenerator {
     private static final double DEFER_DIRECT_PROBABILITY = 0.55;
 
     /**
+     * Probabilidad de elegir, entre los caminos cacheados factibles, el de MENOR score de
+     * congestión en {@link #pickCapacityFeasible}. El complemento (25%) elige al azar entre
+     * TODOS los factibles (incluido el mejor) para conservar diversidad: si siempre se eligiera
+     * el mínimo, el GA/Tabú perdería la variedad de vecinos que necesita para explorar, y varios
+     * lotes con el mismo origen/destino convergerían siempre al mismo camino, recreando el
+     * problema que este cambio busca evitar (concentración en los mismos hubs "buenos").
+     */
+    private static final double CONGESTION_LEAST_LOADED_PROBABILITY = 0.75;
+
+    /** Peso del término de ocupación de VUELO en el score de congestión de un camino. */
+    private static final double CONGESTION_FLIGHT_WEIGHT = 0.5;
+
+    /** Peso del término de ocupación de ALMACÉN (hubs intermedios) en el score de congestión. */
+    private static final double CONGESTION_HUB_WEIGHT = 0.5;
+
+    /**
      * @param flightPlan Plan maestro de vuelos disponibles
      * @param airportManager Gestor de aeropuertos (capacidades de almacén para filtros)
      */
@@ -185,6 +201,11 @@ public class RouteGenerator {
      * <p>Mismos filtros que el BFS: escala mínima 10 min, deadline de SLA, capacidad residual
      * de vuelos y hubs cuando hay {@link CapacityContext}. El tope {@link #MAX_HOPS} acota la
      * profundidad (con la poda por dominancia casi nunca se alcanza).</p>
+     *
+     * <p>El criterio de expansión de la cola de prioridad es SIEMPRE la hora de llegada; a
+     * igualdad exacta de hora (rara en la práctica) se añade un desempate secundario por menor
+     * ocupación relativa de almacén cuando hay {@link CapacityContext} — ver el comentario junto
+     * a la construcción de la cola dentro del método.</p>
      */
     private List<Flight> findEarliestArrivalPath(Airport origin, Airport destination,
                                                  ZonedDateTime startTime, Duration sla,
@@ -192,7 +213,23 @@ public class RouteGenerator {
         ZonedDateTime deadline = startTime.plus(sla);
 
         record Label(Airport airport, ZonedDateTime time, List<Flight> path) {}
-        PriorityQueue<Label> frontier = new PriorityQueue<>(Comparator.comparing(Label::time));
+
+        // Desempate SECUNDARIO a igualdad EXACTA de hora de llegada: entre labels con el mismo
+        // tiempo, se expande primero el de aeropuerto relativamente MENOS ocupado. No toca el
+        // criterio principal (llegada más temprana sigue siendo el piso de calidad del SLA,
+        // inquebrantable) — solo decide el ORDEN de expansión en el raro caso de un empate
+        // exacto de timestamp entre dos aeropuertos DISTINTOS, empujando a explorar antes las
+        // ramas que pasan por hubs más libres. Si el empate es entre dos labels DEL MISMO
+        // aeropuerto (dos caminos que llegan igual de rápido al mismo lugar), este desempate no
+        // discrimina entre ellos: la ocupación consultada es la del mismo aeropuerto para
+        // ambos, así que es un no-op ahí — pero en ese caso tampoco hace falta discriminar,
+        // porque ambos caminos ya son igualmente óptimos en tiempo para ese aeropuerto y la
+        // dominancia por aeropuerto se encarga de quedarse con uno solo.
+        Comparator<Label> ordering = Comparator.comparing(Label::time);
+        if (capacity != null) {
+            ordering = ordering.thenComparingDouble(label -> relativeStorageOccupancy(label.airport(), capacity));
+        }
+        PriorityQueue<Label> frontier = new PriorityQueue<>(ordering);
         frontier.add(new Label(origin, startTime, List.of()));
         Map<String, ZonedDateTime> bestArrival = new HashMap<>();
 
@@ -246,6 +283,15 @@ public class RouteGenerator {
         }
 
         return null;
+    }
+
+    /** Ratio ocupación/capacidad de almacén de un aeropuerto, para el desempate de Dijkstra. */
+    private static double relativeStorageOccupancy(Airport airport, CapacityContext capacity) {
+        int cap = airport.storageCapacity();
+        if (cap <= 0) {
+            return 0.0;
+        }
+        return capacity.storageOccupancy(airport) / (double) cap;
     }
 
     /** Mueve vuelos directos al final de la lista para explorar escalas primero. */
@@ -416,6 +462,20 @@ public class RouteGenerator {
             batch, sla, allowedFlights, maxAttempts, capacity, preferMultiHop);
     }
 
+    /**
+     * Elige un camino entre los cacheados que caben (factibles). Antes se elegía UNIFORME AL
+     * AZAR entre los factibles: la capacidad solo filtraba (caben/no caben) pero nunca guiaba
+     * la elección, así que ante varios caminos igualmente factibles el generador era indiferente
+     * entre uno que deja los vuelos/hubs casi llenos y otro que los deja casi vacíos — sesgo que
+     * se sumaba al de {@link #findEarliestArrivalPath} (que solo mira llegada más temprana) para
+     * concentrar tráfico siempre en los mismos hubs "rápidos".
+     *
+     * <p>Ahora, cuando hay {@link CapacityContext} (que es cuando esta elección importa: sin
+     * capacidad no hay ocupación que consultar), se puntúa cada camino factible por congestión
+     * (ver {@link #congestionScore}) y se prefiere el de MENOR score con probabilidad
+     * {@link #CONGESTION_LEAST_LOADED_PROBABILITY} — el resto de las veces se elige al azar
+     * entre todos los factibles, para no perder la diversidad de vecinos que necesita el GA/Tabú.
+     */
     private AssignedRoute pickCapacityFeasible(
             ShipmentBatch batch, List<List<Flight>> paths, CapacityContext capacity) {
         if (paths == null || paths.isEmpty()) {
@@ -430,12 +490,88 @@ public class RouteGenerator {
         if (feasible.isEmpty()) {
             return null;
         }
-        List<Flight> chosen = feasible.get(ThreadLocalRandom.current().nextInt(feasible.size()));
+
+        List<Flight> chosen;
+        if (capacity == null || feasible.size() == 1) {
+            // Sin contexto de capacidad no hay ocupación que consultar (comportamiento
+            // aleatorio de siempre); con un solo factible tampoco hay nada que decidir.
+            chosen = feasible.get(ThreadLocalRandom.current().nextInt(feasible.size()));
+        } else {
+            chosen = pickByCongestionScore(batch, feasible, capacity);
+        }
+
         try {
             return new AssignedRoute(batch, chosen);
         } catch (IllegalArgumentException ex) {
             return null;
         }
+    }
+
+    /**
+     * Elige el camino de menor congestión con probabilidad alta, o uno al azar entre todos
+     * los factibles el resto de las veces (diversidad para el GA/Tabú). Ver
+     * {@link #CONGESTION_LEAST_LOADED_PROBABILITY}.
+     */
+    private static List<Flight> pickByCongestionScore(
+            ShipmentBatch batch, List<List<Flight>> feasible, CapacityContext capacity) {
+        int qty = batch.quantity();
+        Airport destination = batch.destination();
+
+        List<Flight> leastLoaded = feasible.get(0);
+        double bestScore = congestionScore(leastLoaded, qty, destination, capacity);
+        for (int i = 1; i < feasible.size(); i++) {
+            List<Flight> candidate = feasible.get(i);
+            double score = congestionScore(candidate, qty, destination, capacity);
+            if (score < bestScore) {
+                bestScore = score;
+                leastLoaded = candidate;
+            }
+        }
+
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        if (random.nextDouble() < CONGESTION_LEAST_LOADED_PROBABILITY) {
+            return leastLoaded;
+        }
+        return feasible.get(random.nextInt(feasible.size()));
+    }
+
+    /**
+     * Score de congestión de UN camino: suma ponderada simple (0.5/0.5) de
+     * <ul>
+     *   <li>el PEOR (máximo) ratio de ocupación de vuelo tras sumar {@code qty}, entre todos
+     *       los vuelos del camino: {@code (flightLoad(vuelo) + qty) / vuelo.capacity()}</li>
+     *   <li>el PEOR (máximo) ratio de ocupación de almacén tras sumar {@code qty}, entre los
+     *       hubs INTERMEDIOS del camino (se excluye el destino final: su ocupación es la misma
+     *       para todo camino que termine ahí, así que no aporta señal para elegir ENTRE
+     *       caminos): {@code (storageOccupancy(hub) + qty) / hub.storageCapacity()}</li>
+     * </ul>
+     * Menor score = camino que deja vuelos y hubs relativamente más libres. Se usa el máximo
+     * (no el promedio) por tramo porque un solo vuelo/hub casi lleno en el camino ya es el
+     * cuello de botella real, aunque el resto del camino esté vacío.
+     */
+    private static double congestionScore(
+            List<Flight> path, int qty, Airport destination, CapacityContext capacity) {
+        double flightScore = 0.0;
+        double hubScore = 0.0;
+
+        for (Flight flight : path) {
+            int flightCap = flight.capacity();
+            if (flightCap > 0) {
+                double ratio = (capacity.flightLoad(flight) + qty) / (double) flightCap;
+                flightScore = Math.max(flightScore, ratio);
+            }
+
+            Airport hub = flight.destination();
+            if (!hub.equals(destination)) {
+                int hubCap = hub.storageCapacity();
+                if (hubCap > 0) {
+                    double ratio = (capacity.storageOccupancy(hub) + qty) / (double) hubCap;
+                    hubScore = Math.max(hubScore, ratio);
+                }
+            }
+        }
+
+        return CONGESTION_FLIGHT_WEIGHT * flightScore + CONGESTION_HUB_WEIGHT * hubScore;
     }
 
     private boolean isPathCapacityFeasible(

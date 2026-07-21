@@ -121,4 +121,123 @@ class SolutionEvaluatorGatsTest {
 
         assertEquals(0.0, evaluator.calculateUnusedFlightRewards(solution), 1e-9);
     }
+
+    // ==================== PENALIZACIÓN POR MALETA (Tarea A) ====================
+
+    @Test
+    void unassignedBagPenalty_splitsDoNotMaskGenuinelyUnassignedBags() {
+        // 200 maletas esperadas; los splits del MISMO lote lógico solo asignan 150 (dos rutas
+        // -S1/-S2 que en producción genera RouteGenerator). El contador por MALETA debe seguir
+        // viendo 50 maletas sin asignar, sin que el número de rutas (2) "cancele" el faltante
+        // como pasaba con la vieja métrica por LOTE (expectedBatchCount - routes.size()).
+        evaluator.setExpectedBagCount(200);
+        ZoneId zone = lima.zoneId();
+        ZonedDateTime ingress = ZonedDateTime.of(2026, 1, 1, 8, 0, 0, 0, zone);
+        Flight direct = flightPlan.getAllFlights().stream()
+            .filter(f -> f.flightId().equals("F5")).findFirst().orElseThrow();
+
+        Solution solution = new Solution();
+        solution.addRoute(new AssignedRoute(
+            new ShipmentBatch("B1-S1", "a", "c", lima, santiago, 100, ingress),
+            List.of(direct)));
+        solution.addRoute(new AssignedRoute(
+            new ShipmentBatch("B1-S2", "a", "c", lima, santiago, 50, ingress),
+            List.of(direct)));
+
+        double penalty = evaluator.calculateUnassignedBatchPenalties(solution);
+        assertEquals(50 * SolutionEvaluator.PENALTY_UNASSIGNED_PER_BAG, penalty, 1e-6,
+            "200 esperadas - 150 asignadas (100+50 por los splits) = 50 maletas sin asignar");
+    }
+
+    @Test
+    void unassignedBagPenalty_batchOfTwoHundredCostsTwoHundredTimesBatchOfOne() {
+        // Con la vieja penalización por lote, abandonar 1 maleta o 200 costaba lo mismo
+        // (50,000 pts fijos). Con la nueva penalización por maleta, el costo debe escalar
+        // linealmente con el tamaño real del lote abandonado.
+        Solution empty = new Solution();
+
+        evaluator.setExpectedBagCount(1);
+        double penaltyOneBag = evaluator.calculateUnassignedBatchPenalties(empty);
+
+        evaluator.setExpectedBagCount(200);
+        double penaltyTwoHundredBags = evaluator.calculateUnassignedBatchPenalties(empty);
+
+        assertEquals(SolutionEvaluator.PENALTY_UNASSIGNED_PER_BAG, penaltyOneBag, 1e-6);
+        assertEquals(200 * SolutionEvaluator.PENALTY_UNASSIGNED_PER_BAG, penaltyTwoHundredBags, 1e-6);
+        assertEquals(penaltyOneBag * 200, penaltyTwoHundredBags, 1e-6);
+    }
+
+    @Test
+    void unassignedBagPenalty_belowStorageOverflowPerBagCost() {
+        // Contrato del diseño: abandonar 1 maleta debe ser MÁS BARATO que desbordar un almacén
+        // en 1 maleta, para que ante el dilema el algoritmo prefiera dejarla sin asignar.
+        assertTrue(SolutionEvaluator.PENALTY_UNASSIGNED_PER_BAG < SolutionEvaluator.PENALTY_STORAGE_CAPACITY,
+            "5,000 pts/maleta sin asignar debe quedar por debajo de 15,000 pts/maleta de desborde");
+    }
+
+    @Test
+    void unassignedBatchFallback_stillUsedWhenBagCountNotConfigured() {
+        // Compatibilidad: llamadores que aún no migraron a setExpectedBagCount deben conservar
+        // el comportamiento histórico por lote.
+        evaluator.setExpectedBatchCount(3);
+        ZoneId zone = lima.zoneId();
+        ZonedDateTime ingress = ZonedDateTime.of(2026, 1, 1, 8, 0, 0, 0, zone);
+        Flight direct = flightPlan.getAllFlights().stream()
+            .filter(f -> f.flightId().equals("F5")).findFirst().orElseThrow();
+
+        Solution solution = new Solution();
+        solution.addRoute(new AssignedRoute(
+            new ShipmentBatch("B1", "a", "c", lima, santiago, 10, ingress),
+            List.of(direct)));
+
+        double penalty = evaluator.calculateUnassignedBatchPenalties(solution);
+        assertEquals(2 * SolutionEvaluator.PENALTY_UNASSIGNED_BATCH, penalty, 1e-6);
+    }
+
+    // ==================== TÉRMINO DE PICOS SOBRE EL UMBRAL (Tarea B) ====================
+
+    @Test
+    void storagePeakTerm_noExtraPenaltyBelowThreshold() {
+        // Pico al 79% (< 80%): solo debe aplicar el término convexo base, sin el término extra.
+        int capacity = lima.storageCapacity(); // 400
+        int peak = (int) Math.round(capacity * 0.79); // 316, ratio 0.79 < 0.80
+
+        double expectedBaseOnly = SolutionEvaluator.PENALTY_STORAGE_CONVEX_FACTOR
+            * (double) peak * peak / capacity;
+        double actual = evaluator.calculateStorageConvexPenaltyFor(lima, peak);
+
+        assertEquals(expectedBaseOnly, actual, 1e-6);
+    }
+
+    @Test
+    void storagePeakTerm_activatesAtFullCapacityWithExpectedFormula() {
+        // Pico al 100%: el término extra debe activarse con el valor exacto de la fórmula
+        // γ·(pico - 0.80·cap)²/cap, sumado al término convexo base β·pico²/cap.
+        int capacity = lima.storageCapacity(); // 400
+        int peak = capacity; // 100%
+
+        double baseTerm = SolutionEvaluator.PENALTY_STORAGE_CONVEX_FACTOR
+            * (double) peak * peak / capacity;
+        double over = peak - SolutionEvaluator.STORAGE_PEAK_THRESHOLD_RATIO * capacity;
+        double peakTerm = SolutionEvaluator.PENALTY_STORAGE_PEAK_FACTOR * over * over / capacity;
+
+        double actual = evaluator.calculateStorageConvexPenaltyFor(lima, peak);
+
+        assertTrue(peakTerm > 0.0, "El término extra debe ser positivo por encima del umbral");
+        assertEquals(baseTerm + peakTerm, actual, 1e-6);
+    }
+
+    @Test
+    void storagePeakTerm_exactlyAtThresholdAddsNoExtra() {
+        // Justo EN el umbral (80%): el excedente es 0, así que el término extra debe ser 0
+        // (frontera exclusiva: "peak > threshold", no ">=").
+        int capacity = lima.storageCapacity(); // 400
+        int peak = (int) Math.round(capacity * SolutionEvaluator.STORAGE_PEAK_THRESHOLD_RATIO); // 320
+
+        double baseTerm = SolutionEvaluator.PENALTY_STORAGE_CONVEX_FACTOR
+            * (double) peak * peak / capacity;
+        double actual = evaluator.calculateStorageConvexPenaltyFor(lima, peak);
+
+        assertEquals(baseTerm, actual, 1e-6);
+    }
 }

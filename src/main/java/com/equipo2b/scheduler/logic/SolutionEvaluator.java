@@ -22,14 +22,26 @@ import com.equipo2b.scheduler.model.AirportManager;
  *   <li><strong>Capacidad de almacén excedida:</strong> 15,000 puntos por cada maleta excedente en cualquier instante</li>
  *   <li><strong>Violación de SLA:</strong> 20,000 puntos por cada hora de retraso</li>
  *   <li><strong>Violación de tiempo de escala:</strong> 5,000 puntos por cada violación del mínimo de 10 minutos</li>
+ *   <li><strong>Maleta sin asignar:</strong> 5,000 puntos por cada maleta sin ruta (ver {@link #PENALTY_UNASSIGNED_PER_BAG});
+ *       {@link #PENALTY_UNASSIGNED_BATCH} (50,000 pts/lote) se conserva como fallback de compatibilidad</li>
  * </ul>
- * 
+ *
+ * <h2>Penalizaciones Blandas (desempate, órdenes de magnitud por debajo de las duras)</h2>
+ * <ul>
+ *   <li><strong>Carga convexa de vuelo:</strong> α·carga²/capacidad, ver {@link #PENALTY_LOAD_CONVEX_FACTOR}</li>
+ *   <li><strong>Pico convexo de almacén:</strong> β·pico²/capacidad en todo el rango, ver {@link #PENALTY_STORAGE_CONVEX_FACTOR}</li>
+ *   <li><strong>Pico de almacén SOBRE el umbral ámbar (80%):</strong> término adicional γ·(pico−0.80·cap)²/capacidad
+ *       que solo se activa por encima de {@link #STORAGE_PEAK_THRESHOLD_RATIO}, ver {@link #PENALTY_STORAGE_PEAK_FACTOR} —
+ *       sin este término, un pico al 60% y uno al 95% escalaban igual aunque el segundo esté en zona de riesgo</li>
+ *   <li><strong>Desbalance global de almacenes:</strong> varianza de ocupación relativa, ver {@link #PENALTY_GLOBAL_IMBALANCE_FACTOR}</li>
+ * </ul>
+ *
  * <h2>Premios (Optimización)</h2>
  * <ul>
  *   <li><strong>Holgura de tiempo:</strong> 100 puntos por cada hora de holgura respecto al SLA (máximo 500 puntos por ruta)</li>
  *   <li><strong>Vuelos no utilizados:</strong> 5 puntos por vuelo no usado (desactivado bajo saturación; ver {@link #REWARD_UNUSED_FLIGHT})</li>
  * </ul>
- * 
+ *
  * <h2>Justificación del Diseño</h2>
  * <p>Las penalizaciones son significativamente mayores que los premios para garantizar que:
  * <ol>
@@ -37,8 +49,12 @@ import com.equipo2b.scheduler.model.AirportManager;
  *   <li>Los algoritmos prioricen la validez sobre la optimización</li>
  *   <li>Las violaciones de SLA tengan el mayor impacto (20,000 puntos/hora)</li>
  *   <li>Los excesos de capacidad de almacén sean más costosos que los de vuelo (15,000 vs 10,000)</li>
+ *   <li>Abandonar maletas escale con el tamaño del lote (5,000 pts/maleta) en vez de costar
+ *       lo mismo para 1 maleta que para 200, y quede siempre por debajo del costo de desbordar
+ *       un almacén (15,000 pts/maleta) — ante el dilema, es más barato dejar una maleta sin
+ *       asignar (se reintenta) que desbordar un almacén (colapso operativo)</li>
  * </ol>
- * 
+ *
  * <p>Los premios incentivan:
  * <ol>
  *   <li>Rutas con holgura temporal (mayor robustez ante disrupciones)</li>
@@ -170,6 +186,35 @@ public class SolutionEvaluator {
     public static final double PENALTY_UNASSIGNED_BATCH = 50_000.0;
 
     /**
+     * Penalización por cada MALETA (no lote) que no pudo ser asignada a ninguna ruta.
+     *
+     * <p>Valor: 5,000 puntos por maleta sin asignar.
+     *
+     * <p><strong>Por qué reemplaza a {@link #PENALTY_UNASSIGNED_BATCH} como métrica principal:
+     * </strong> esa penalización se calcula como {@code expectedBatchCount - routes.size()}. Los
+     * splits de {@link RouteGenerator} (sufijo -S&lt;n&gt;) generan VARIAS rutas por lote
+     * original, así que cada split que sí encuentra ruta suma una unidad a
+     * {@code routes.size()} y CANCELA aritméticamente el castigo de un lote genuinamente sin
+     * ruta en otro punto de la solución — el fitness quedaba ciego a maletas abandonadas
+     * mientras el número de rutas cuadrara. Además, 50,000 puntos fijos por lote hacían
+     * indiferente abandonar un lote de 1 maleta o uno de 200: ambos costaban exactamente lo
+     * mismo.
+     *
+     * <p><strong>Calibración:</strong> con un promedio observado de ~10 maletas/lote, 5,000
+     * pts/maleta reproduce aproximadamente los 50,000 pts/lote históricos en el caso típico,
+     * pero ahora el costo escala con el tamaño real del lote (200 maletas sin asignar cuestan
+     * 200 veces lo que 1 maleta sin asignar, en vez de lo mismo). Se fija DELIBERADAMENTE por
+     * debajo de {@link #PENALTY_STORAGE_CAPACITY} (15,000 pts/maleta de desborde de almacén):
+     * ante el dilema "dejar 1 maleta sin asignar" vs. "desbordar un almacén en 1 maleta", el
+     * algoritmo debe preferir lo primero — una maleta sin asignar se reintenta en el siguiente
+     * ciclo, mientras que desbordar un almacén es un colapso operativo que el curso exige
+     * evitar siempre.
+     *
+     * @see #setExpectedBagCount(int)
+     */
+    public static final double PENALTY_UNASSIGNED_PER_BAG = 5_000.0;
+
+    /**
      * Micro-recompensa CONTINUA por hora de holgura, SIN tope, como desempate de mesetas.
      *
      * <p>El premio principal de holgura (100/h) se topa en 500 pts: por encima de 5 h de
@@ -217,6 +262,42 @@ public class SolutionEvaluator {
     public static final double PENALTY_STORAGE_CONVEX_FACTOR = 6.0;
 
     /**
+     * Umbral de ocupación de almacén (ratio pico/capacidad) a partir del cual se activa el
+     * término adicional {@link #PENALTY_STORAGE_PEAK_FACTOR} dentro de
+     * {@link #calculateStorageConvexPenaltyFor}.
+     *
+     * <p>Alineado DELIBERADAMENTE al umbral ámbar de la UI y a
+     * {@link CapacityContext#HUB_SOFT_LIMIT_RATIO} (ambos en 0.80): por debajo de ese punto un
+     * pico de ocupación es "normal" y ya lo captura {@link #PENALTY_STORAGE_CONVEX_FACTOR}; por
+     * encima es la zona que la operación quiere evitar activamente, y este término la hace
+     * costar más que un pico equivalente por debajo del umbral.
+     */
+    public static final double STORAGE_PEAK_THRESHOLD_RATIO = 0.80;
+
+    /**
+     * Costo marginal CONVEXO adicional, aplicado SOLO al excedente por encima de
+     * {@link #STORAGE_PEAK_THRESHOLD_RATIO}: γ · (pico − 0.80·capacidad)² / capacidad.
+     *
+     * <p><strong>Por qué hace falta además de {@link #PENALTY_STORAGE_CONVEX_FACTOR}:</strong>
+     * ese término castiga pico²/capacidad de forma UNIFORME en todo el rango 0–100%, así que un
+     * pico al 60% y uno al 95% reciben penalización proporcional a su magnitud pero ninguna
+     * señal distingue que 95% está en la zona de riesgo (ámbar) que hay que evitar y 60% no —
+     * el gradiente es el mismo a ambos lados del umbral. Este segundo término, activo solo por
+     * encima del umbral, hace esa distinción explícita: empuja con más fuerza a alejarse
+     * específicamente de la zona de peligro, no solo a "repartir un poco más".
+     *
+     * <p><strong>Calibración</strong> (cap = 420, mismo ejemplo que
+     * {@link #PENALTY_STORAGE_CONVEX_FACTOR}): al 100% (420) el excedente sobre el umbral es
+     * 420 − 0.80·420 = 84 → 60·84²/420 ≈ 1,008 pts extra. Al 110% (462) el excedente es 126 →
+     * 60·126²/420 ≈ 2,268 pts extra. Del mismo orden que los demás premios/penalizaciones
+     * "blandos" (cientos a pocos miles de puntos) — muy por debajo de las restricciones duras
+     * (10k-50k) y de {@link #PENALTY_SLA_VIOLATION} (20k/hora), así que solo inclina desempates
+     * entre soluciones de costo similar hacia evitar picos sobre el umbral, sin poder ganarle
+     * jamás a SLA ni a factibilidad.
+     */
+    public static final double PENALTY_STORAGE_PEAK_FACTOR = 60.0;
+
+    /**
      * Penalización por desbalance GLOBAL de ocupación de almacenes (varianza de ratios).
      *
      * <p>El término convexo por aeropuerto tocado no castiga "un hub al 90% y cinco al 10%"
@@ -242,6 +323,14 @@ public class SolutionEvaluator {
      * Usar setExpectedBatchCount() para configurar antes de la evaluación.
      */
     private volatile int expectedBatchCount = 0;
+
+    /**
+     * Cantidad esperada de MALETAS (no de lotes) a planificar en el ciclo — suma de
+     * {@code quantity()} de todos los lotes ORIGINALES, antes de cualquier split. Si > 0, tiene
+     * prioridad sobre {@link #expectedBatchCount} en {@link #calculateUnassignedBatchPenalties}
+     * (ver contrato en {@link #setExpectedBagCount(int)}).
+     */
+    private volatile int expectedBagCount = 0;
 
     /**
      * Ocupación de almacén YA EXISTENTE por aeropuerto al inicio de la ventana del ciclo
@@ -283,6 +372,25 @@ public class SolutionEvaluator {
      */
     public void setExpectedBatchCount(int count) {
         this.expectedBatchCount = count;
+    }
+
+    /**
+     * Establece la cantidad esperada de MALETAS (no de lotes) para penalizar maletas sin
+     * asignar con {@link #PENALTY_UNASSIGNED_PER_BAG}. Llamar antes de las evaluaciones en el
+     * loop de optimización, igual que {@link #setExpectedBatchCount}.
+     *
+     * <p><strong>Contrato:</strong> cuando {@code totalBags > 0}, esta vía tiene PRIORIDAD sobre
+     * {@link #setExpectedBatchCount} dentro de {@link #calculateUnassignedBatchPenalties} — es
+     * la métrica correcta porque no la enmascaran los splits de {@link RouteGenerator}. GA/Tabú
+     * deben llamar a este método (con el total de maletas de todos los lotes del ciclo) en vez
+     * de — o además de — {@link #setExpectedBatchCount}. Este último se conserva únicamente
+     * como fallback de compatibilidad para llamadores que todavía no fueron migrados.
+     *
+     * @param totalBags Cantidad total de maletas esperadas en el ciclo (0 = no penalizar por
+     *                   maleta; cae al fallback por lote si {@link #expectedBatchCount} > 0)
+     */
+    public void setExpectedBagCount(int totalBags) {
+        this.expectedBagCount = totalBags;
     }
 
     /**
@@ -446,17 +554,34 @@ public class SolutionEvaluator {
     }
 
     /**
-     * Costo convexo β·pico²/capacidad de UN aeropuerto dado su pico de ocupación — misma
-     * fórmula que el término convexo dentro de {@link #calculateStorageCapacityPenalties},
-     * extraída para reutilizar desde el tracking incremental (el pico histórico de un
-     * aeropuerto es un valor pequeño que se mantiene entre ciclos; recalcular esta fórmula
-     * sobre él cada ciclo es O(aeropuertos), no O(eventos históricos)).
+     * Costo convexo de UN aeropuerto dado su pico de ocupación — misma fórmula que el término
+     * convexo dentro de {@link #calculateStorageCapacityPenalties}, extraída para reutilizar
+     * desde el tracking incremental (el pico histórico de un aeropuerto es un valor pequeño que
+     * se mantiene entre ciclos; recalcular esta fórmula sobre él cada ciclo es O(aeropuertos),
+     * no O(eventos históricos)).
+     *
+     * <p>Suma dos términos: β·pico²/capacidad ({@link #PENALTY_STORAGE_CONVEX_FACTOR}, activo
+     * en todo el rango 0–100%) más, SOLO cuando el pico supera
+     * {@link #STORAGE_PEAK_THRESHOLD_RATIO}, γ·(pico − 0.80·capacidad)²/capacidad
+     * ({@link #PENALTY_STORAGE_PEAK_FACTOR}) — ver javadoc de esa constante para la aritmética
+     * de calibración.
+     *
+     * <p><strong>Nota de integración:</strong> {@link AccumulatedFitnessTracker} llama a este
+     * mismo método para su tracking incremental, así que hereda automáticamente ambos términos
+     * sin cambios en ese archivo — no existe otra copia de esta fórmula en el código base.
      */
     public double calculateStorageConvexPenaltyFor(com.equipo2b.scheduler.model.Airport airport, int peak) {
         int capacity = airport.storageCapacity();
         if (capacity > 0 && peak > 0) {
             double p = peak;
-            return PENALTY_STORAGE_CONVEX_FACTOR * (p * p) / capacity;
+            double penalty = PENALTY_STORAGE_CONVEX_FACTOR * (p * p) / capacity;
+
+            double threshold = STORAGE_PEAK_THRESHOLD_RATIO * capacity;
+            if (p > threshold) {
+                double over = p - threshold;
+                penalty += PENALTY_STORAGE_PEAK_FACTOR * (over * over) / capacity;
+            }
+            return penalty;
         }
         return 0.0;
     }
@@ -722,6 +847,10 @@ public class SolutionEvaluator {
      *   <li>Capacidad de almacén excedida: 15,000 puntos/maleta</li>
      *   <li>Violación de SLA: 20,000 puntos/hora</li>
      *   <li>Violación de tiempo de escala: 5,000 puntos/violación</li>
+     *   <li>Maleta sin asignar: 5,000 puntos/maleta ({@link #PENALTY_UNASSIGNED_PER_BAG}, fallback
+     *       por lote en {@link #PENALTY_UNASSIGNED_BATCH})</li>
+     *   <li>Pico de almacén sobre el umbral 80%: término blando adicional
+     *       ({@link #PENALTY_STORAGE_PEAK_FACTOR}), ver {@link #calculateStorageConvexPenaltyFor}</li>
      * </ul>
      * 
      * <p>Premios:
@@ -762,17 +891,31 @@ public class SolutionEvaluator {
     }
     
     /**
-     * Calcula penalizaciones por lotes no asignados a ninguna ruta.
-     * 
-     * <p>Aplica 50,000 puntos por cada lote que no tiene ruta en la solución.
-     * Solo se aplica si se configuró expectedBatchCount > 0.
-     * 
+     * Calcula penalizaciones por maletas (o, en fallback, lotes) no asignadas a ninguna ruta.
+     *
+     * <p><strong>Vía principal — por maleta:</strong> si se configuró
+     * {@link #setExpectedBagCount}, aplica {@link #PENALTY_UNASSIGNED_PER_BAG} por cada maleta
+     * de diferencia entre {@code expectedBagCount} y {@link
+     * com.equipo2b.scheduler.model.Solution#getTotalBags()}. Esta cuenta suma la cantidad real
+     * de maletas asignadas en TODAS las rutas de la solución (incluidos los splits, cada uno con
+     * su propia {@code quantity()}), así que un split no puede enmascarar maletas genuinamente
+     * sin ruta.
+     *
+     * <p><strong>Fallback — por lote:</strong> si no hay {@code expectedBagCount} configurado
+     * pero sí {@link #setExpectedBatchCount}, conserva el comportamiento antiguo (50,000 puntos
+     * por cada lote de diferencia entre {@code expectedBatchCount} y {@code routes.size()}) para
+     * compatibilidad con llamadores aún no migrados a la vía por maleta.
+     *
      * <p><strong>Validates: Requirement 9.8</strong>
-     * 
+     *
      * @param solution La solución a evaluar
-     * @return Penalización total por lotes no asignados
+     * @return Penalización total por maletas (o lotes) no asignados
      */
     public double calculateUnassignedBatchPenalties(com.equipo2b.scheduler.model.Solution solution) {
+        if (expectedBagCount > 0) {
+            int unassignedBags = Math.max(0, expectedBagCount - solution.getTotalBags());
+            return unassignedBags * PENALTY_UNASSIGNED_PER_BAG;
+        }
         if (expectedBatchCount <= 0) {
             return 0.0;
         }

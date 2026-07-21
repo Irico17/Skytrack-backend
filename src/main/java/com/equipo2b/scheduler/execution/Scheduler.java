@@ -46,7 +46,14 @@ public class Scheduler {
     private final FlightPlan flightPlan;
     private final boolean partialFillEnabled;
     private final RouteGenerator fillRouteGenerator;  // para sub-lotes multi-hop (puede ser null)
-    private static final int MIN_FILL_BAGS = 1;
+    // Tamaño mínimo de un sub-lote NUEVO (evita fragmentar en sub-lotes de 1-2 maletas, cuyo
+    // overhead de tracking/gestión es desproporcionado). Antes en 1: fragmentaba libremente.
+    // EXCEPCIÓN de último recurso (ver placeBagsInLeftover): si el remanente COMPLETO a
+    // reubicar ya es menor que este mínimo, se coloca igual relajando el mínimo a 1 — mejor
+    // ubicar 2 maletas que perderlas (la alternativa es que queden sin ruta este ciclo y
+    // dependan de que el próximo ciclo, vía carryoverBatches, les encuentre hueco por la vía
+    // normal de GA/Tabú, sin ninguna garantía de que lo consiga tampoco).
+    private static final int MIN_FILL_BAGS = 3;
 
     /**
      * PRIMER CICLO RÁPIDO (mismo principio que GA.firstCycleBudgetRatio, aplicado al
@@ -64,8 +71,12 @@ public class Scheduler {
     private final int K;          // Constante proporcionalidad
     private final int Sc;         // Salto consumo = Sa × K (minutos simulados)
     
-    // Solución actual del sistema
-    private Solution currentSolution;
+    // Solución actual del sistema. volatile: el hilo de storage de SimulationController
+    // (startStorageUpdateLoop) la lee en cada tick sin ninguna sincronización — sin volatile,
+    // ese hilo podría ver una referencia obsoleta (o, en el peor caso, un objeto a medio
+    // publicar) tras la reasignación al final de executePlanningCycle/updateSolution, que
+    // corre en el hilo del loop de ciclos.
+    private volatile Solution currentSolution;
 
     // Cola de reintento: lotes que NO obtuvieron ruta en el ciclo anterior y aún pueden
     // cumplir su SLA. Entran al siguiente ciclo ANTES que los lotes nuevos (prioridad).
@@ -297,12 +308,17 @@ public class Scheduler {
         //     ALGUNAS maletas de un envío, el envío se divide — las que caben se quedan y el
         //     resto se reubican en otros vuelos con espacio. Cubre TODOS los casos (no solo
         //     lotes sin ruta). Determinista, aditivo y solo actúa si hay exceso real.
+        // Rutas creadas/reemplazadas por el splitting (peel + sub-lotes nuevos, directo y
+        // multi-hop) — se llena dentro de applyCapacityAwareSplitting/placeBagsInLeftover.
+        // Ver validación en el paso 6: antes quedaban sin validar porque el splitting corre
+        // DESPUÉS de validator.validate(finalSolution).
+        List<AssignedRoute> splitTouchedRoutes = new ArrayList<>();
         if (partialFillEnabled && flightPlan != null) {
-            int splits = applyCapacityAwareSplitting(accumulatedSolution, batches, windowStart, windowEnd);
+            int splits = applyCapacityAwareSplitting(accumulatedSolution, batches, windowStart, windowEnd, splitTouchedRoutes);
             if (splits > 0) {
                 System.out.println("🧩 División por capacidad: " + splits + " sub-lotes ubicados (envíos divididos en vuelos distintos)");
             }
-            refreshFrenteCalienteAfterSplitting(accumulatedSolution, batches);
+            refreshFrenteCalienteAfterSplitting(accumulatedSolution, splitTouchedRoutes);
         }
 
         // 6. Validar SOLO las rutas nuevas de este ciclo (finalSolution), no la acumulada
@@ -318,6 +334,29 @@ public class Scheduler {
         } else {
             System.out.println("⚠ Rutas de este ciclo con violaciones:");
             System.out.println(validationReport.getSummary());
+        }
+
+        // 6c. Validar también las rutas TOCADAS por el splitting (5b): applyCapacityAwareSplitting
+        //     muta accumulatedSolution DESPUÉS de que finalSolution ya fue validada arriba, así
+        //     que sus rutas nuevas/reemplazadas (peel + sub-lotes "-S<n>") quedaban sin pasar
+        //     nunca por el validador. Alcance acotado a las rutas efectivamente tocadas este
+        //     ciclo (no toda accumulatedSolution — mismo criterio de costo que el punto 6):
+        //     detecta violaciones de SLA/escala de forma exacta (son intrínsecas a cada ruta) y
+        //     de capacidad cuando DOS sub-lotes tocados este ciclo comparten vuelo/almacén y se
+        //     pasan entre sí — un bug real en el bookkeeping de usedByFlight/hubCapacity se vería
+        //     aquí. No detecta un exceso que solo aparece al combinarse con una ruta de
+        //     frenteCaliente que NO fue tocada este ciclo (ya se contabilizó correctamente vía
+        //     usedByFlight/hubCapacity al construirse, así que no se re-verifica por completo).
+        if (!splitTouchedRoutes.isEmpty()) {
+            Solution splitCheckSolution = new Solution();
+            for (AssignedRoute route : splitTouchedRoutes) {
+                splitCheckSolution.addRoute(route);
+            }
+            ValidationReport splitValidationReport = validator.validate(splitCheckSolution);
+            if (!splitValidationReport.isValid()) {
+                System.out.println("⚠ Sub-rutas del splitting con violaciones:");
+                System.out.println(splitValidationReport.getSummary());
+            }
         }
 
         logQualityMetrics(batches, finalSolution, accumulatedSolution, validationReport);
@@ -380,6 +419,36 @@ public class Scheduler {
      * <p>Limitación conocida: la búsqueda de rutas parte del ingreso del lote, así que un
      * reintento podría elegir un vuelo que despega dentro de la ventana anterior (hasta Sc
      * minutos "en el pasado" del reloj de planificación). Con Sc=90min el efecto es menor.</p>
+     *
+     * <p><b>Contabilidad POR MALETAS (no por lote completo):</b> un lote puede haber colocado
+     * SOLO UNA PARTE vía sub-lotes ("-S&lt;n&gt;") — p. ej. B16-S1 con 30 de 100 maletas. Antes
+     * se usaba {@code isRouted} (todo/nada): bastaba con que existiera CUALQUIER "-S&lt;n&gt;"
+     * para dar el lote entero por enrutado, y las 70 maletas restantes jamás se
+     * replanificaban (evaporación silenciosa). Ahora se compara la cantidad REALMENTE enrutada
+     * (ver {@link #routedQuantity}) contra {@code batch.quantity()}, y solo el FALTANTE entra a
+     * SLA/factibilidad/carryover.</p>
+     *
+     * <p><b>Id del lote reducido</b> (ver {@link #freshCarryoverId}): cuelga de la misma base
+     * ORIGINAL (sin más que un {@code baseBatchId} de distancia, sin importar cuántos niveles de
+     * carryover lleve encadenados), pero NUNCA reutiliza literalmente un id que ya tenga ruta en
+     * {@code accumulated} — si la base ya tiene una ruta propia (p. ej. quedó una porción en el
+     * vuelo original tras un peel), usa el siguiente sufijo "-S&lt;n&gt;" libre bajo esa base en
+     * vez de la base "a secas". Esto es OBLIGATORIO: si se reutilizara el id de una ruta que YA
+     * existe en {@code accumulated} (p. ej. la base "B16" con 30 maletas ya colocadas), el
+     * algoritmo del próximo ciclo generaría una ruta NUEVA con ese mismo id para las maletas
+     * FALTANTES, y {@code accumulatedSolution.addRoute} (que reemplaza por batchId) la
+     * SOBRESCRIBIRÍA — perdiendo silenciosamente las 30 maletas ya colocadas. Con la base libre
+     * (caso común: lote nunca antes rebajado ni dividido) sí se conserva el id base tal cual —
+     * así {@code routedQuantity}/applyCapacityAwareSplitting siguen sumando correctamente y el
+     * comportamiento coincide con el de un reintento simple (ver SchedulerRetryTest).</p>
+     *
+     * <p><b>Unicidad de ids entre ciclos (por construcción):</b> TODOS los splits anidan bajo
+     * el id del lote fuente — la semilla del GA (splitPortion) y los remanentes del splitting
+     * (placeBagsInLeftover) acuñan {@code idFuente + "-S<n>"}, nunca aplanan a la base — y
+     * {@link #freshCarryoverId} solo entrega ids cuyo subárbol completo está libre en la
+     * solución acumulada. Como cada lote (original o de carryover) se procesa en UN solo ciclo
+     * y su subárbol nace vacío, los ids nuevos no pueden colisionar con rutas de ciclos
+     * anteriores, y {@link #routedQuantity} (suma recursiva del subárbol) los ve todos.</p>
      */
     private void registerUnroutedForRetry(List<ShipmentBatch> batches,
                                           Solution accumulated,
@@ -391,25 +460,36 @@ public class Scheduler {
         int newCarryover = 0;
         int newCarryoverBags = 0;
         int totalBags = 0;
+        int routedBags = 0;
         for (ShipmentBatch batch : batches) {
             totalBags += batch.quantity();
-            if (isRouted(accumulated, batch.batchId())) {
+            int routed = routedQuantity(accumulated, batch.batchId());
+            routedBags += routed;  // sin recortar a quantity(): si excede, el cuadre de abajo lo delata
+            int missing = batch.quantity() - routed;
+            if (missing <= 0) {
                 continue;
             }
             ZonedDateTime slaDeadline = batch.ingressTime().plus(batch.calculateSLA());
             if (!slaDeadline.isAfter(windowEnd)) {
                 expired++;
-                expiredBags += batch.quantity();
+                expiredBags += missing;
                 continue;
             }
             if (!tabuSearch.hasFeasiblePathIgnoringCapacity(batch)) {
                 structural++;
-                structuralBags += batch.quantity();
+                structuralBags += missing;
                 continue;
             }
-            carryoverBatches.add(batch);
+            // Lote reducido con el FALTANTE; id calculado por freshCarryoverId (ver javadoc del
+            // método: base "a secas" si está libre, si no el siguiente sufijo "-S<n>" libre bajo
+            // esa base — NUNCA reutiliza un id con ruta ya existente en accumulated).
+            String carryoverId = freshCarryoverId(accumulated, baseBatchId(batch.batchId()));
+            ShipmentBatch reduced = new ShipmentBatch(
+                carryoverId, batch.airportBatchId(), batch.clientId(),
+                batch.origin(), batch.destination(), missing, batch.ingressTime());
+            carryoverBatches.add(reduced);
             newCarryover++;
-            newCarryoverBags += batch.quantity();
+            newCarryoverBags += missing;
         }
 
         // Snapshot del ciclo para reportar el "último ciclo" si esto dispara un colapso (ver
@@ -426,6 +506,18 @@ public class Scheduler {
                 carryoverBatches.size(), expired, structural
             );
         }
+
+        // Cuadre por ciclo (red de seguridad): las maletas consumidas este ciclo deben repartirse
+        // EXACTAMENTE entre enrutadas, a reintento, con SLA vencido y estructurales — ninguna
+        // puede desaparecer ni duplicarse. routedBags se deja SIN recortar a quantity() por lote
+        // (ver arriba) precisamente para que un bug de doble conteo en routedQuantity/splitting
+        // se delate aquí como descuadre, en vez de quedar enmascarado.
+        int accountedBags = routedBags + newCarryoverBags + expiredBags + structuralBags;
+        System.out.printf(
+            "📒 Cuadre ciclo: %d maletas consumidas = %d enrutadas + %d a reintento + %d SLA vencido + %d estructurales%s%n",
+            totalBags, routedBags, newCarryoverBags, expiredBags, structuralBags,
+            accountedBags == totalBags ? "" : " ⚠ DESCUADRE (sumó " + accountedBags + ", esperado " + totalBags + ")"
+        );
     }
 
     private int lastCycleBatchesTotal;
@@ -446,43 +538,131 @@ public class Scheduler {
     public int getLastCycleSlaExpired() { return lastCycleSlaExpired; }
 
     /**
-     * True si el lote (completo o dividido en sub-lotes "-S&lt;n&gt;") tiene ruta en la
-     * solución acumulada. Antes esto se resolvía reconstruyendo un {@code Set} con TODAS las
-     * claves de la solución acumulada (O(rutas totales), miles tras varios días simulados)
-     * solo para chequear membresía de los ~100-150 lotes de ESTE ciclo. Cada lote de este
-     * ciclo solo puede tener rutas creadas en este mismo ciclo (un lote se procesa una sola
-     * vez, en el ciclo en que se consume), así que un puñado de accesos O(1) al mapa basta —
-     * mismo resultado, sin recorrer el historial acumulado.
+     * Maletas REALMENTE enrutadas de un lote en la solución acumulada: la cantidad de la ruta
+     * con el id del lote (si existe) más las de TODO su subárbol de sub-lotes anidados
+     * ("id-S1", "id-S1-S1", "id-S2", ...). Reemplaza al antiguo {@code isRouted} (todo/nada):
+     * un split parcial (p. ej. B16-S1 con 30 de 100 maletas) antes se consideraba "enrutado"
+     * completo — ver javadoc de {@link #registerUnroutedForRetry}.
+     *
+     * <p><b>Por qué recursivo y tolerante a huecos:</b> los splits ANIDAN bajo el id fuente
+     * (semilla GA y remanentes del splitting — ver splitPortion/placeBagsInLeftover), así que
+     * las porciones de un lote pueden vivir a más de un nivel de profundidad ("B1-S2" partido
+     * en "B1-S2-S1"+"B1-S2-S2", y su cola otra vez en "B1-S2-S2-S1"). Además un sub-lote
+     * puede DESAPARECER dejando un hueco en la numeración (peel que cae bajo MIN_FILL_BAGS →
+     * removeRoute) — cortar el escaneo en el primer hueco perdería de vista a sus hermanos
+     * mayores. Se tolera una racha corta de índices completamente vacíos (sin ruta propia ni
+     * hijos) antes de cortar; los sufijos se acuñan secuencialmente, así que huecos más largos
+     * no ocurren en la práctica — y si ocurrieran, el cuadre del ciclo los delataría como
+     * descuadre. El escaneo sigue acotado al subárbol del lote (nunca recorre la solución
+     * acumulada) y la profundidad real es la cantidad de generaciones de split (pequeña).</p>
      */
-    private static boolean isRouted(Solution accumulated, String batchId) {
-        if (accumulated.getRoute(batchId) != null) {
-            return true;
+    private static final int SUBTREE_SCAN_GAP_TOLERANCE = 3;
+    private static final int SUBTREE_SCAN_MAX_DEPTH = 5;
+
+    private static int routedQuantity(Solution accumulated, String batchId) {
+        return subtreeRoutedQuantity(accumulated, batchId, 0);
+    }
+
+    private static int subtreeRoutedQuantity(Solution accumulated, String id, int depth) {
+        int total = 0;
+        AssignedRoute own = accumulated.getRoute(id);
+        if (own != null) {
+            total += own.getBatch().quantity();
         }
-        for (int i = 1; accumulated.getRoute(batchId + "-S" + i) != null; i++) {
-            return true;
+        if (depth >= SUBTREE_SCAN_MAX_DEPTH) {
+            return total;
         }
-        return false;
+        int emptyStreak = 0;
+        for (int i = 1; emptyStreak < SUBTREE_SCAN_GAP_TOLERANCE; i++) {
+            String childId = id + "-S" + i;
+            // Pre-chequeo barato antes de recursar: un índice cuenta como "vacío" solo si no
+            // tiene ruta propia NI un primer hijo (un nodo absorbido puede conservar hijos).
+            if (accumulated.getRoute(childId) == null && accumulated.getRoute(childId + "-S1") == null) {
+                emptyStreak++;
+                continue;
+            }
+            emptyStreak = 0;
+            total += subtreeRoutedQuantity(accumulated, childId, depth + 1);
+        }
+        return total;
+    }
+
+    /**
+     * Id seguro para el lote de carryover reducido de {@code baseId} (ya sin sufijos, ver
+     * {@link #baseBatchId}): la base "a secas" SOLO si la familia completa está vacía (ni la
+     * base ni "-S1" tienen ruta todavía — lote nunca antes dividido ni rebajado, el caso común:
+     * mismo id que usaría un reintento simple, sin sub-lotes de por medio); si no, el siguiente
+     * sufijo "-S&lt;n&gt;" libre bajo esa base.
+     *
+     * <p>Dos peligros distintos si se devolviera un id ya ocupado, ambos reales:</p>
+     * <ul>
+     *   <li><b>Sobrescritura</b>: el algoritmo del próximo ciclo crea una ruta NUEVA con
+     *       exactamente el id del {@link ShipmentBatch} que se le pasa (no sabe nada de "colgar
+     *       de una base"), y {@code accumulatedSolution.addRoute} reemplaza por batchId —
+     *       reutilizar el id de una ruta YA existente (p. ej. la porción que quedó en el vuelo
+     *       original tras un peel) la sobrescribiría en silencio, perdiendo sus maletas.</li>
+     *   <li><b>Contaminación cruzada de ciclos en {@link #routedQuantity}</b>: si se reutilizara
+     *       la base "a secas" mientras YA existe un sub-lote hermano ("B16-S1") de un ciclo
+     *       ANTERIOR, {@code routedQuantity(accumulated, "B16")} en el ciclo SIGUIENTE sumaría
+     *       ese hermano viejo (ajeno a este lote de carryover) junto con lo que se rutee este
+     *       ciclo — pudiendo superar el {@code quantity()} del lote de carryover y hacer que se
+     *       lo dé por "totalmente resuelto" ANTES de que sus propias maletas realmente lo estén
+     *       (bug simétrico al que corrige la tarea A: en vez de evaporar maletas, deja de
+     *       reintentar unas que en realidad siguen sin ruta). Exigir que TODA la familia (base +
+     *       "-S1") esté vacía antes de reusar la base "a secas" evita este cruce por
+     *       construcción: cualquier id que devuelve esta función es, desde ese momento en
+     *       adelante, de uso EXCLUSIVO de este lote de carryover.</li>
+     * </ul>
+     *
+     * <p><b>Slot libre = subárbol COMPLETO vacío</b>: como los splits anidan bajo el id fuente
+     * (splitPortion de la semilla GA y placeBagsInLeftover — "B1-S2" partido genera
+     * "B1-S2-S1"), un slot "B1-S&lt;n&gt;" cuyo id no tiene ruta propia puede aún tener HIJOS
+     * de un ciclo anterior (el nodo fue absorbido pero sus porciones anidadas viven). Reusar
+     * ese slot haría que los splits futuros del nuevo carryover re-acuñaran ids de esos hijos
+     * viejos (sobrescritura) y que {@code routedQuantity} sumara maletas ajenas. Por eso el
+     * escaneo exige que ni el id ni sus primeros hijos existan, con la misma tolerancia a
+     * huecos que {@code subtreeRoutedQuantity} — cualquier anomalía más profunda la delataría
+     * el cuadre del ciclo.</p>
+     */
+    private static String freshCarryoverId(Solution accumulated, String baseId) {
+        if (isSubtreeSlotFree(accumulated, baseId)) {
+            return baseId;
+        }
+        int idx = 1;
+        while (!isSubtreeSlotFree(accumulated, baseId + "-S" + idx)) {
+            idx++;
+        }
+        return baseId + "-S" + idx;
+    }
+
+    /** True si el id no tiene ruta propia ni hijos "-S&lt;i&gt;" (tolerante a huecos cortos). */
+    private static boolean isSubtreeSlotFree(Solution accumulated, String id) {
+        if (accumulated.getRoute(id) != null) {
+            return false;
+        }
+        for (int i = 1; i <= SUBTREE_SCAN_GAP_TOLERANCE; i++) {
+            if (accumulated.getRoute(id + "-S" + i) != null
+                    || accumulated.getRoute(id + "-S" + i + "-S1") != null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
      * Re-sincroniza {@link #frenteCaliente} después de que applyCapacityAwareSplitting corrió:
      * splitting puede haber reemplazado (peel) o vaciado por completo cualquier entrada
-     * existente, y puede haber creado sub-lotes nuevos ("-S&lt;n&gt;"). Ambos casos se
-     * resuelven con accesos O(1) a {@code accumulated} — nunca recorriendo la solución
-     * completa — porque el universo de ids afectados es acotado.
-     *
-     * <p><b>Ojo con qué bases se re-escanean</b>: solo las de entradas efectivamente TOCADAS
-     * este ciclo (peel o absorción) más los lotes de este ciclo — NUNCA las de entradas que
-     * siguen intactas en frenteCaliente. Escanear una base intacta redescubriría un sub-lote
-     * hermano que ya fue promovido y sacado de frenteCaliente en un ciclo anterior — como
-     * {@code accumulated.getRoutes()} nunca olvida nada, "ausente de frenteCaliente" no
-     * distingue "nunca visto" de "ya promovido", y volver a agregarlo lo contaría dos veces
-     * cuando se promueva otra vez (bug real, encontrado con el test de invariante: un sub-lote
-     * se sumaba dos veces al fitness).</p>
+     * existente, y puede haber creado sub-lotes nuevos ("-S&lt;n&gt;"). Los reemplazos/
+     * absorciones se detectan comparando por identidad contra {@code accumulated}; los
+     * sub-lotes nuevos llegan por la lista EXPLÍCITA {@code splitTouchedRoutes} que el propio
+     * splitting reporta — sin re-escanear familias de ids. (El escaneo por familias que había
+     * antes aplanaba a la base y podía redescubrir un sub-lote hermano ya promovido y sacado
+     * de frenteCaliente en un ciclo anterior — como {@code accumulated.getRoutes()} nunca
+     * olvida nada, "ausente de frenteCaliente" no distingue "nunca visto" de "ya promovido",
+     * y volver a agregarlo lo contaba dos veces al fitness al re-promoverlo; con la lista
+     * explícita ese modo de fallo no existe por construcción.)</p>
      */
-    private void refreshFrenteCalienteAfterSplitting(Solution accumulated, List<ShipmentBatch> cycleBatches) {
-        Set<String> baseIdsToCheck = new HashSet<>();
-
+    private void refreshFrenteCalienteAfterSplitting(Solution accumulated, List<AssignedRoute> splitTouchedRoutes) {
         Iterator<Map.Entry<String, AssignedRoute>> it = frenteCaliente.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<String, AssignedRoute> entry = it.next();
@@ -492,36 +672,39 @@ public class Scheduler {
                 // splitting absorbió esta ruta por completo en otros vuelos: sus eventos de
                 // almacén pendientes (encolados cuando se creó, vía trackPendingEvents) ya no
                 // corresponden a nada — hay que retirarlos, no quedan huérfanos para siempre.
-                baseIdsToCheck.add(baseBatchId(entry.getKey()));
                 fitnessTracker.replacePendingEvents(previous, null);
                 it.remove();
             } else if (current != previous) {
                 // splitting la reemplazó (peel) por una de menor cantidad: sus eventos
                 // pendientes tenían la cantidad ORIGINAL — hay que cambiarlos por los de la
                 // versión reducida, o el fitness contaría maletas que ya no están ahí.
-                baseIdsToCheck.add(baseBatchId(entry.getKey()));
                 fitnessTracker.replacePendingEvents(previous, current);
                 entry.setValue(current);
             }
-            // else: intacta este ciclo — NO se agrega su base (ver javadoc).
-        }
-        for (ShipmentBatch batch : cycleBatches) {
-            baseIdsToCheck.add(batch.batchId());
+            // else: intacta este ciclo.
         }
 
-        for (String baseId : baseIdsToCheck) {
-            for (int i = 1; ; i++) {
-                String subId = baseId + "-S" + i;
-                AssignedRoute sub = accumulated.getRoute(subId);
-                if (sub == null) {
-                    break;
-                }
-                if (frenteCaliente.putIfAbsent(subId, sub) == null) {
-                    // Recién descubierto: sus eventos de almacén todavía no estaban en la
-                    // cola pendiente del tracker (a diferencia de las rutas de finalSolution,
-                    // que ya se encolaron en la acumulación) — hay que agregarlos ahora.
-                    fitnessTracker.trackPendingEvents(List.of(sub));
-                }
+        // Sub-lotes NUEVOS: directamente desde las rutas que el splitting reportó haber tocado
+        // (peel reducido + sub-lotes directos y multi-hop) — nada de re-escanear familias de
+        // ids en accumulated. El escaneo anterior aplanaba a la base y podía redescubrir un
+        // sub-lote hermano ya PROMOVIDO en un ciclo anterior (accumulated nunca olvida) y
+        // contarlo dos veces al re-promoverlo; con la lista explícita ese caso no existe.
+        // Siempre se toma la versión VIGENTE en accumulated (no la instancia reportada, que
+        // pudo quedar obsoleta dentro del mismo pase), y un id ya presente con la misma
+        // instancia (p. ej. el peel que el bucle de arriba ya sincronizó) se deja como está.
+        for (AssignedRoute touched : splitTouchedRoutes) {
+            String id = touched.getBatch().batchId();
+            AssignedRoute current = accumulated.getRoute(id);
+            if (current == null) {
+                continue;  // creada y luego absorbida dentro del mismo pase: nunca se trackeó
+            }
+            AssignedRoute previous = frenteCaliente.get(id);
+            if (previous == null) {
+                frenteCaliente.put(id, current);
+                fitnessTracker.trackPendingEvents(List.of(current));
+            } else if (previous != current) {
+                fitnessTracker.replacePendingEvents(previous, current);
+                frenteCaliente.put(id, current);
             }
         }
     }
@@ -602,10 +785,16 @@ public class Scheduler {
      * <p>Es determinista, aditivo y solo actúa si hay exceso real, por lo que no degrada la
      * calidad (de hecho elimina penalizaciones por capacidad) ni el rendimiento.</p>
      *
+     * @param touchedRoutes salida: se agregan aquí todas las rutas creadas o reemplazadas por
+     *                       este método (peel del vuelo sobre-capacidad + sub-lotes nuevos,
+     *                       directo y multi-hop) — usado por el llamador para validarlas (ver
+     *                       paso 6c de executePlanningCycle), ya que corren DESPUÉS de que
+     *                       finalSolution ya pasó por el validador.
      * @return número de sub-lotes (divisiones) generados
      */
     private int applyCapacityAwareSplitting(Solution solution, List<ShipmentBatch> cycleBatches,
-                                            ZonedDateTime windowStart, ZonedDateTime windowEnd) {
+                                            ZonedDateTime windowStart, ZonedDateTime windowEnd,
+                                            List<AssignedRoute> touchedRoutes) {
         // 1. Capacidad usada por vuelo + índices (vuelo→capacidad, vuelo→lotes que lo usan).
         //    SOLO vuelos "vivos" — sin recorrer la solución acumulada completa: un vuelo que ya
         //    salió jamás puede volver a estar sobre-capacidad (su carga quedó fija cuando
@@ -650,25 +839,37 @@ public class Scheduler {
             }
         }
 
-        // Contador de sufijos -S por lote base, sembrado con los sub-lotes YA existentes para
-        // garantizar IDs únicos (addRoute reemplaza por batchId → un choque perdería maletas).
-        // Acotado a los base-ids que podrían necesitar un sub-lote NUEVO este ciclo: los de
-        // frenteCaliente (únicas rutas peelables) y los de los lotes de este ciclo — el mismo
-        // universo acotado que usa refreshFrenteCalienteAfterSplitting para descubrir splits.
+        // Contador de sufijos -S por id FUENTE (no por base aplanada): los sub-lotes nuevos
+        // ANIDAN bajo el id del lote/ruta del que salen ("B1-S2" pelado genera "B1-S2-S<n>"),
+        // igual que splitPortion en la semilla GA — así los ids nuevos viven en el subárbol
+        // exclusivo de su fuente (no pueden chocar con sub-lotes de otros ciclos) y
+        // routedQuantity, acotado a ese subárbol, los suma todos. Sembrado con el índice
+        // máximo YA usado bajo cada fuente (tolerante a huecos cortos, igual que
+        // subtreeRoutedQuantity: un peel que cayó bajo MIN_FILL_BAGS deja huecos), para
+        // garantizar unicidad (addRoute reemplaza por batchId → un choque perdería maletas).
+        // Acotado a las fuentes que podrían necesitar un sub-lote NUEVO este ciclo: las rutas
+        // de frenteCaliente (únicas peelables) y los lotes de este ciclo.
         Map<String, Integer> splitCounter = new HashMap<>();
-        Set<String> splitCounterBases = new HashSet<>();
+        Set<String> splitSources = new HashSet<>();
         for (AssignedRoute route : frenteCaliente.values()) {
-            splitCounterBases.add(baseBatchId(route.getBatch().batchId()));
+            splitSources.add(route.getBatch().batchId());
         }
         for (ShipmentBatch batch : cycleBatches) {
-            splitCounterBases.add(batch.batchId());
+            splitSources.add(batch.batchId());
         }
-        for (String base : splitCounterBases) {
+        for (String source : splitSources) {
             int maxIdx = 0;
-            for (int i = 1; solution.getRoute(base + "-S" + i) != null; i++) {
+            int emptyStreak = 0;
+            for (int i = 1; emptyStreak < SUBTREE_SCAN_GAP_TOLERANCE; i++) {
+                String childId = source + "-S" + i;
+                if (solution.getRoute(childId) == null && solution.getRoute(childId + "-S1") == null) {
+                    emptyStreak++;
+                    continue;
+                }
+                emptyStreak = 0;
                 maxIdx = i;
             }
-            splitCounter.put(base, maxIdx);
+            splitCounter.put(source, maxIdx);
         }
 
         // 2. Despegar el exceso de los vuelos sobre-capacidad → remanentes a reubicar.
@@ -707,12 +908,17 @@ public class Scheduler {
                 int peel = Math.min(overflow, b.quantity());
                 if (peel <= 0) continue;
                 int newQty = b.quantity() - peel;
-                // Reducir la ruta en TODOS sus tramos (libera capacidad también en escalas).
-                for (Flight g : r.getFlights()) {
-                    usedByFlight.merge(g.flightId(), -peel, Integer::sum);
-                }
                 hubCapacity.removeRoute(r);
-                if (newQty >= MIN_FILL_BAGS) {
+                // Si la porción que quedaría en el vuelo original (newQty) no alcanza el mínimo
+                // de sub-lote, se descarta la ruta ENTERA (no solo el peel) — por eso el
+                // remanente que se manda a reubicar debe ser b.quantity() completo en ese caso,
+                // no solo `peel`: dejar solo `peel` perdería en silencio las newQty maletas que
+                // se suponía quedaban en el vuelo original pero ya no tienen ruta. Con
+                // MIN_FILL_BAGS=1 esto nunca ocurría (newQty<1 solo si newQty==0, es decir
+                // peel==b.quantity()), pero al subir el mínimo (tarea E) sí puede pasar con
+                // newQty=1 o 2.
+                boolean keepReducedRoute = newQty >= MIN_FILL_BAGS;
+                if (keepReducedRoute) {
                     try {
                         ShipmentBatch reduced = new ShipmentBatch(
                             b.batchId(), b.airportBatchId(), b.clientId(),
@@ -720,29 +926,48 @@ public class Scheduler {
                         AssignedRoute reducedRoute = new AssignedRoute(reduced, r.getFlights());
                         solution.addRoute(reducedRoute); // reemplaza por batchId
                         hubCapacity.applyRoute(reducedRoute);
+                        touchedRoutes.add(reducedRoute);
                     } catch (Exception e) {
                         solution.removeRoute(b.batchId());
+                        keepReducedRoute = false;
                     }
                 } else {
                     solution.removeRoute(b.batchId());
                 }
-                remainders.add(new RemainderLot(b, baseBatchId(b.batchId()), peel));
+                // Liberar de usedByFlight lo que REALMENTE deja de ocupar el vuelo: si se
+                // conserva la porción reducida, solo `peel` (newQty sigue viajando ahí); si la
+                // ruta se descarta ENTERA (newQty<MIN_FILL_BAGS o falló la construcción), hay
+                // que liberar b.quantity() completo — quedarse solo con `peel` subestimaría la
+                // ocupación real restante del vuelo, permitiendo sobre-reservarlo con otro
+                // remanente más adelante en este mismo ciclo (mismo caso nuevo que el comentario
+                // de arriba: con MIN_FILL_BAGS=1 esta rama solo se daba con newQty==0, donde
+                // peel ya era b.quantity() completo y ambos coincidían).
+                int flightRelease = keepReducedRoute ? peel : b.quantity();
+                for (Flight g : r.getFlights()) {
+                    usedByFlight.merge(g.flightId(), -flightRelease, Integer::sum);
+                }
+                // El remanente ANIDA bajo el id de la ruta pelada (no bajo la base aplanada):
+                // sus sub-lotes se acuñan como b.batchId()+"-S<n>", dentro del subárbol que
+                // routedQuantity/el cuadre del ciclo ya vigilan para este lote.
+                remainders.add(new RemainderLot(b, b.batchId(), keepReducedRoute ? peel : b.quantity()));
                 overflow -= peel;
             }
         }
 
-        // 3. Añadir los lotes que NUNCA tuvieron ruta como remanentes (división de extremo a extremo).
+        // 3. Añadir los lotes que NUNCA tuvieron ruta como remanentes (división de extremo a
+        //    extremo). Igual que en el peel: anidan bajo su PROPIO id (un carryover "B1-S2"
+        //    genera "B1-S2-S<n>", nunca "B1-S<n>" — ese nivel pertenece a otras porciones).
         for (ShipmentBatch batch : cycleBatches) {
             if (hadRoute.contains(batch.batchId())) continue;
             if (solution.getRoute(batch.batchId()) != null) continue;
-            remainders.add(new RemainderLot(batch, baseBatchId(batch.batchId()), batch.quantity()));
+            remainders.add(new RemainderLot(batch, batch.batchId(), batch.quantity()));
         }
 
         // 4. Reubicar cada remanente en el espacio libre (directo y, si hace falta, con escalas).
         int splitsGenerated = 0;
         for (RemainderLot rem : remainders) {
             splitsGenerated += placeBagsInLeftover(
-                solution, usedByFlight, hubCapacity, splitCounter, rem, windowStart, windowEnd);
+                solution, usedByFlight, hubCapacity, splitCounter, rem, windowStart, windowEnd, touchedRoutes);
         }
         return splitsGenerated;
     }
@@ -751,13 +976,23 @@ public class Scheduler {
      * Coloca {@code rem.quantity()} maletas en el espacio libre de vuelos directos y, para el
      * remanente, en una ruta con escalas. Divide en tantos sub-lotes como vuelos haga falta.
      *
+     * <p>Mínimo de sub-lote (ver {@link #MIN_FILL_BAGS}): con EXCEPCIÓN de último recurso — si
+     * el remanente COMPLETO ({@code rem.quantity()}, evaluado una sola vez al entrar, no
+     * {@code remaining} que va bajando) ya es menor que el mínimo normal, se usa un mínimo
+     * efectivo de 1 en todo este remanente. Así un remanente de 2 maletas se coloca igual en
+     * vez de perderse, pero un remanente grande (p. ej. 10) que termina con una cola de 2 tras
+     * varias colocaciones de >=3 sigue respetando el mínimo normal para esa cola — la cola no
+     * se pierde, pasa a carryover el próximo ciclo por la vía normal (ver registerUnroutedForRetry).
+     *
      * @return número de sub-lotes creados para este remanente
      */
     private int placeBagsInLeftover(Solution solution, Map<String, Integer> usedByFlight,
                                     CapacityContext hubCapacity, Map<String, Integer> splitCounter, RemainderLot rem,
-                                    ZonedDateTime windowStart, ZonedDateTime windowEnd) {
+                                    ZonedDateTime windowStart, ZonedDateTime windowEnd,
+                                    List<AssignedRoute> touchedRoutes) {
         int remaining = rem.quantity();
-        if (remaining < MIN_FILL_BAGS) return 0;
+        int effectiveMin = rem.quantity() < MIN_FILL_BAGS ? 1 : MIN_FILL_BAGS;
+        if (remaining < effectiveMin) return 0;
         ShipmentBatch t = rem.template();
         int placed = 0;
 
@@ -782,20 +1017,20 @@ public class Scheduler {
             .toList();
 
         for (Flight f : directFlights) {
-            if (remaining < MIN_FILL_BAGS) break;
+            if (remaining < effectiveMin) break;
             int leftover = f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0);
-            if (leftover < MIN_FILL_BAGS) continue;
+            if (leftover < effectiveMin) continue;
             // Capacidad DURA de almacén en destino — nunca se relaja (mismo criterio que
             // CapacityContext.hasHubCapacity en RouteGenerator): sin esto, un remanente podía
             // reubicarse en un vuelo directo con espacio de sobra pero cuyo destino ya no
             // tiene almacén libre, empujándolo sobre el 100%.
             int hubResidual = t.destination().storageCapacity() - hubCapacity.storageOccupancy(t.destination());
-            if (hubResidual < MIN_FILL_BAGS) continue;
+            if (hubResidual < effectiveMin) continue;
             int originResidual = hubCapacity.storageResidual(t.origin());
-            if (originResidual < MIN_FILL_BAGS) continue;
+            if (originResidual < effectiveMin) continue;
             int take = Math.min(Math.min(leftover, remaining), Math.min(hubResidual, originResidual));
-            int idx = splitCounter.merge(rem.baseId(), 1, Integer::sum);
-            String subId = rem.baseId() + "-S" + idx;
+            int idx = splitCounter.merge(rem.sourceId(), 1, Integer::sum);
+            String subId = rem.sourceId() + "-S" + idx;
             try {
                 ShipmentBatch subLot = new ShipmentBatch(
                     subId, t.airportBatchId() + "-S" + idx, t.clientId(),
@@ -804,20 +1039,21 @@ public class Scheduler {
                 solution.addRoute(subRoute);
                 usedByFlight.merge(f.flightId(), take, Integer::sum);
                 hubCapacity.applyRoute(subRoute);
+                touchedRoutes.add(subRoute);
                 remaining -= take;
                 placed++;
             } catch (Exception e) {
-                splitCounter.merge(rem.baseId(), -1, Integer::sum); // revertir índice no usado
+                splitCounter.merge(rem.sourceId(), -1, Integer::sum); // revertir índice no usado
             }
         }
 
         // Multi-hop para el remanente: ruta con escalas verificando capacidad en TODOS los tramos
         // (vuelo Y almacén — hubCapacity va al generador, así que la búsqueda misma ya descarta
         // hubs sin espacio real; ver RouteGenerator.generateFeasibleRoute).
-        if (remaining >= MIN_FILL_BAGS && fillRouteGenerator != null) {
+        if (remaining >= effectiveMin && fillRouteGenerator != null) {
             try {
-                int idx = splitCounter.merge(rem.baseId(), 1, Integer::sum);
-                String subId = rem.baseId() + "-S" + idx;
+                int idx = splitCounter.merge(rem.sourceId(), 1, Integer::sum);
+                String subId = rem.sourceId() + "-S" + idx;
                 ShipmentBatch probe = new ShipmentBatch(
                     subId, t.airportBatchId() + "-S" + idx, t.clientId(),
                     t.origin(), t.destination(), remaining, t.ingressTime());
@@ -832,7 +1068,7 @@ public class Scheduler {
                     for (Flight f : probeRoute.getFlights()) {
                         take = Math.min(take, f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0));
                     }
-                    if (take >= MIN_FILL_BAGS) {
+                    if (take >= effectiveMin) {
                         AssignedRoute route = take == remaining ? probeRoute : new AssignedRoute(
                             new ShipmentBatch(subId, t.airportBatchId() + "-S" + idx, t.clientId(),
                                 t.origin(), t.destination(), take, t.ingressTime()),
@@ -842,13 +1078,14 @@ public class Scheduler {
                             usedByFlight.merge(f.flightId(), take, Integer::sum);
                         }
                         hubCapacity.applyRoute(route);
+                        touchedRoutes.add(route);
                         remaining -= take;
                         placed++;
                     } else {
-                        splitCounter.merge(rem.baseId(), -1, Integer::sum);
+                        splitCounter.merge(rem.sourceId(), -1, Integer::sum);
                     }
                 } else {
-                    splitCounter.merge(rem.baseId(), -1, Integer::sum);
+                    splitCounter.merge(rem.sourceId(), -1, Integer::sum);
                 }
             } catch (Exception ignored) {
                 // Sin ruta multi-hop factible → el remanente queda sin ubicar este ciclo.
@@ -857,8 +1094,10 @@ public class Scheduler {
         return placed;
     }
 
-    /** Remanente de maletas a reubicar; {@code template} aporta origen/destino/cliente/ingreso. */
-    private record RemainderLot(ShipmentBatch template, String baseId, int quantity) {}
+    /** Remanente de maletas a reubicar; {@code template} aporta origen/destino/cliente/ingreso.
+     * {@code sourceId} es el id del lote/ruta del que salió el remanente — sus sub-lotes se
+     * acuñan anidados bajo él ({@code sourceId + "-S<n>"}), nunca bajo la base aplanada. */
+    private record RemainderLot(ShipmentBatch template, String sourceId, int quantity) {}
 
     /** Quita los sufijos "-S&lt;n&gt;" finales para obtener el id base del lote. */
     private static String baseBatchId(String id) {

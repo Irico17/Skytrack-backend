@@ -66,9 +66,13 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     @Override
     public Solution optimize(List<ShipmentBatch> batches) {
-        // Configurar evaluador con cantidad esperada de lotes
+        // Configurar evaluador con cantidad esperada de lotes y de MALETAS (Tarea I) —
+        // mismo criterio que GeneticAlgorithm.optimize(): total de maletas de la lista
+        // ORIGINAL de este ciclo (modo TABU_PURE construye la solución inicial desde cero,
+        // sin splits previos, así que aquí no aplica la distinción original/efectiva de GA).
         evaluator.setExpectedBatchCount(batches.size());
-        
+        evaluator.setExpectedBagCount(batches.stream().mapToInt(ShipmentBatch::quantity).sum());
+
         // Generar solución inicial con rutas factibles
         Solution currentSolution = generateInitialSolution(batches);
         currentSolution.setFitness(evaluator.evaluate(currentSolution));
@@ -154,6 +158,17 @@ public class TabuSearch implements OptimizationAlgorithm {
      * @return Mejor solución encontrada dentro del presupuesto
      */
     public Solution refine(Solution initialSolution, long budgetMillis) {
+        // Tarea H — coherencia con el GA: fija el término de no-asignados (lotes y MALETAS
+        // esperados) a partir de LA MISMA solución que se va a refinar, no de un valor externo.
+        // Los movimientos de este refinamiento (REGENERATE, CONGESTION_RELIEF,
+        // STORAGE_CONGESTION_RELIEF, MULTI_REGENERATE) siempre regeneran la ruta de un lote
+        // que YA está en la solución — ninguno elimina una ruta sin reemplazarla — así que
+        // batches = rutas de initialSolution es un conteo estable durante todo refine(): el
+        // término de no-asignados queda CONSTANTE y la escala del fitness es coherente con la
+        // que usó el GA para construir initialSolution.
+        evaluator.setExpectedBatchCount(initialSolution.getRoutes().size());
+        evaluator.setExpectedBagCount(initialSolution.getTotalBags());
+
         Solution currentSolution = new Solution(initialSolution);
         if (!currentSolution.isEvaluated()) {
             currentSolution.setFitness(evaluator.evaluate(currentSolution));
@@ -422,39 +437,57 @@ public class TabuSearch implements OptimizationAlgorithm {
     }
     
     /**
-     * CONGESTION_RELIEF (vuelos): Encuentra el vuelo más utilizado, elige un batch
+     * CONGESTION_RELIEF (vuelos): Encuentra el vuelo más CARGADO (Tarea G), elige un batch
      * de ese vuelo y lo regenera para aliviar congestión.
+     *
+     * <p>ANTES: "más utilizado" se medía por NÚMERO de lotes en el vuelo
+     * ({@code flightToBatchIds.size()}) — un vuelo con 2 lotes de 200 maletas cada uno
+     * quedaba invisible frente a uno con 5 lotes de 5 maletas, aunque el primero esté mucho
+     * más cerca de su capacidad real. AHORA: se acumulan las MALETAS reales por vuelo y se
+     * elige el de mayor ratio maletas/capacidad — la métrica que de verdad importa para
+     * descongestionar (análoga a la que ya usa {@link #generateStorageCongestionReliefMove}
+     * para almacenes).</p>
      */
     private Move generateCongestionReliefMove(Solution current) {
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());
         if (batchIds.isEmpty()) {
             return new Move(new Solution(current), "");
         }
-        
+
+        Map<String, Integer> flightBagLoad = new HashMap<>();
+        Map<String, Flight> flightById = new HashMap<>();
         Map<String, List<String>> flightToBatchIds = new HashMap<>();
         for (Map.Entry<String, AssignedRoute> entry : current.getRoutes().entrySet()) {
+            int qty = entry.getValue().getBatch().quantity();
             for (Flight flight : entry.getValue().getFlights()) {
+                flightBagLoad.merge(flight.flightId(), qty, Integer::sum);
+                flightById.putIfAbsent(flight.flightId(), flight);
                 flightToBatchIds.computeIfAbsent(flight.flightId(), k -> new ArrayList<>())
                     .add(entry.getKey());
             }
         }
-        
-        String mostUsedFlightId = null;
-        int maxUsage = 0;
-        for (Map.Entry<String, List<String>> entry : flightToBatchIds.entrySet()) {
-            if (entry.getValue().size() > maxUsage) {
-                maxUsage = entry.getValue().size();
-                mostUsedFlightId = entry.getKey();
+
+        String mostLoadedFlightId = null;
+        double worstRatio = -1.0;
+        for (Map.Entry<String, Integer> entry : flightBagLoad.entrySet()) {
+            Flight flight = flightById.get(entry.getKey());
+            if (flight.capacity() <= 0) {
+                continue;
+            }
+            double ratio = (double) entry.getValue() / flight.capacity();
+            if (ratio > worstRatio) {
+                worstRatio = ratio;
+                mostLoadedFlightId = entry.getKey();
             }
         }
-        
-        if (mostUsedFlightId == null) {
+
+        if (mostLoadedFlightId == null) {
             return generateRegenerateMoveFromSolution(current);
         }
-        
-        List<String> candidates = flightToBatchIds.get(mostUsedFlightId);
+
+        List<String> candidates = flightToBatchIds.get(mostLoadedFlightId);
         String targetBatchId = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
-        
+
         Solution neighbor = new Solution(current);
         ShipmentBatch batch = current.getRoute(targetBatchId).getBatch();
         CapacityContext capacity = capacityWithoutBatch(current, targetBatchId);
@@ -469,6 +502,11 @@ public class TabuSearch implements OptimizationAlgorithm {
      * STORAGE_CONGESTION_RELIEF: identifica el aeropuerto con mayor ocupación estimada
      * (baseline + rutas), elige un lote que lo usa como hub intermedio (o origen) y
      * regenera preferiendo multi-hop para desalojar carga hacia hubs alternativos.
+     *
+     * <p>Sanity-check de Tarea G: este método YA acumula {@code route.getBatch().quantity()}
+     * (maletas reales, no número de lotes) por aeropuerto — ver {@code occupancy.merge(hub,
+     * qty, ...)} abajo — así que no tiene el mismo defecto que tenía
+     * {@link #generateCongestionReliefMove}. Se deja sin cambios.</p>
      */
     private Move generateStorageCongestionReliefMove(Solution current) {
         List<String> batchIds = new ArrayList<>(current.getRoutes().keySet());

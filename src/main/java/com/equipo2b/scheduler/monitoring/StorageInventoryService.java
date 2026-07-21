@@ -10,11 +10,10 @@ import com.equipo2b.scheduler.model.StorageEventType;
 
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Calcula inventario actual de maletas por aeropuerto para un instante simulado.
@@ -49,32 +48,34 @@ public class StorageInventoryService {
             return inventory;
         }
 
-        Set<String> routedBatchIds = applyRoutedStorageEvents(solution, currentTime, inventory);
-        applyUnroutedOriginInventory(knownBatches, currentTime, routedBatchIds, inventory);
+        Map<String, Integer> routedBagsByBase = applyRoutedStorageEvents(solution, currentTime, inventory);
+        applyUnroutedOriginInventory(knownBatches, currentTime, routedBagsByBase, inventory);
 
         return inventory;
     }
 
-    private Set<String> applyRoutedStorageEvents(
+    private Map<String, Integer> applyRoutedStorageEvents(
             Solution solution,
             ZonedDateTime currentTime,
             Map<Airport, Integer> inventory) {
-        Set<String> routedBatchIds = new HashSet<>();
+        Map<String, Integer> routedBagsByBase = new HashMap<>();
         if (solution == null || solution.getRoutes().isEmpty()) {
-            return routedBatchIds;
+            return routedBagsByBase;
         }
 
-        // Id BASE (sin sufijo "-S<n>"): un lote dividido por applyCapacityAwareSplitting solo
-        // existe en la solución bajo sus sub-lotes ("B16-S1", "B16-S2"), nunca bajo su id
-        // original ("B16"). Guardar el id exacto de cada ruta hacía que applyUnroutedOriginInventory
-        // (más abajo) NUNCA reconociera a "B16" como ya-enrutado — y le sumaba su cantidad
-        // ORIGINAL completa de nuevo en el origen, ENCIMA de lo que sus sub-lotes ya aportaban
-        // por sus propios eventos de almacén. Con splitting poco frecuente pasaba casi
-        // desapercibido; al volverse la capacidad de almacén una restricción dura (más lotes
-        // necesitan dividirse para caber), este doble conteo se volvió sistémico y creciente en
-        // toda la red — exactamente el patrón de sobrecarga generalizada reportado en producción.
+        // Id BASE (sin sufijo "-S<n>") → maletas REALMENTE enrutadas bajo esa base. Un lote
+        // dividido por applyCapacityAwareSplitting solo existe en la solución bajo sus
+        // sub-lotes ("B16-S1" con 30, "B16-S2" con 20), nunca bajo su id original completo
+        // ("B16" con 100) — antes solo se guardaba el id BASE como "ya-enrutado" (todo/nada, un
+        // Set), así que un split PARCIAL (30+20=50 de 100) hacía que applyUnroutedOriginInventory
+        // (más abajo) tratara las 50 maletas restantes como si NUNCA hubieran existido: no
+        // aparecían en el origen (el id base ya estaba en el set) ni en ningún otro almacén (sus
+        // sub-lotes no creados no generan StorageEvent) — se evaporaban del inventario. Ahora se
+        // suma la cantidad real por base, y applyUnroutedOriginInventory agrega solo el
+        // FALTANTE (batch.quantity() - enrutadas) en vez de saltar el lote entero.
         for (AssignedRoute route : solution.getRoutes().values()) {
-            routedBatchIds.add(baseBatchId(route.getBatch().batchId()));
+            routedBagsByBase.merge(
+                baseBatchId(route.getBatch().batchId()), route.getBatch().quantity(), Integer::sum);
         }
 
         List<StorageEvent> events = getSortedEvents(solution);
@@ -90,24 +91,37 @@ public class StorageInventoryService {
             inventory.put(event.airport(), Math.max(0, next));
         }
 
-        return routedBatchIds;
+        return routedBagsByBase;
     }
 
+    /**
+     * Suma en el almacén de origen el FALTANTE de cada lote conocido: {@code batch.quantity()}
+     * menos lo que ya está enrutado (bajo su id base o cualquier sub-lote "-S&lt;n&gt;"), nunca
+     * el lote completo cuando solo una parte quedó sin ruta. Las maletas YA enrutadas no se
+     * cuentan aquí — ya aportan al inventario por sus propios {@link StorageEvent} (ver
+     * {@link #applyRoutedStorageEvents}); sumar también su cantidad completa aquí las
+     * contaría dos veces.
+     */
     private void applyUnroutedOriginInventory(
             List<ShipmentBatch> knownBatches,
             ZonedDateTime currentTime,
-            Set<String> routedBatchIds,
+            Map<String, Integer> routedBagsByBase,
             Map<Airport, Integer> inventory) {
         if (knownBatches == null || knownBatches.isEmpty()) {
             return;
         }
 
         for (ShipmentBatch batch : knownBatches) {
-            if (batch == null || routedBatchIds.contains(batch.batchId()) || batch.ingressTime().isAfter(currentTime)) {
+            if (batch == null || batch.ingressTime().isAfter(currentTime)) {
+                continue;
+            }
+            int routed = routedBagsByBase.getOrDefault(batch.batchId(), 0);
+            int missing = batch.quantity() - routed;
+            if (missing <= 0) {
                 continue;
             }
             Airport origin = batch.origin();
-            int next = inventory.getOrDefault(origin, 0) + batch.quantity();
+            int next = inventory.getOrDefault(origin, 0) + missing;
             inventory.put(origin, Math.max(0, next));
         }
     }
