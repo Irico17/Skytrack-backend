@@ -475,7 +475,7 @@ public class Scheduler {
                 expiredBags += missing;
                 continue;
             }
-            if (!tabuSearch.hasFeasiblePathIgnoringCapacity(batch)) {
+            if (!hasStructuralPathCached(batch)) {
                 structural++;
                 structuralBags += missing;
                 continue;
@@ -518,6 +518,34 @@ public class Scheduler {
             totalBags, routedBags, newCarryoverBags, expiredBags, structuralBags,
             accountedBags == totalBags ? "" : " ⚠ DESCUADRE (sumó " + accountedBags + ", esperado " + totalBags + ")"
         );
+    }
+
+    /**
+     * Cache de {@link TabuSearch#hasFeasiblePathIgnoringCapacity} por (origen, destino,
+     * ingreso). El resultado SOLO depende del plan de vuelos (estático entre ciclos) y de esos
+     * tres datos — un lote de reintento conserva su ingressTime original, así que bajo
+     * sobrecarga (backlog de cientos de lotes re-clasificados CADA ciclo) este chequeo repetía
+     * el mismo Dijkstra completo una y otra vez para claves idénticas: era uno de los
+     * responsables de que el ciclo excediera Ta por minutos en fechas densas. Se invalida en
+     * {@link #updateSolution} (replanificación de emergencia = hubo cancelación de vuelo, lo
+     * único que puede cambiar la respuesta) y se acota en tamaño por si acaso.
+     */
+    private final Map<String, Boolean> structuralFeasibilityCache = new HashMap<>();
+    private static final int MAX_STRUCTURAL_CACHE_ENTRIES = 20_000;
+
+    private boolean hasStructuralPathCached(ShipmentBatch batch) {
+        String key = batch.origin().id() + ">" + batch.destination().id()
+            + "@" + batch.ingressTime().toEpochSecond();
+        Boolean cached = structuralFeasibilityCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        if (structuralFeasibilityCache.size() >= MAX_STRUCTURAL_CACHE_ENTRIES) {
+            structuralFeasibilityCache.clear();
+        }
+        boolean feasible = tabuSearch.hasFeasiblePathIgnoringCapacity(batch);
+        structuralFeasibilityCache.put(key, feasible);
+        return feasible;
     }
 
     private int lastCycleBatchesTotal;
@@ -957,20 +985,47 @@ public class Scheduler {
         // 3. Añadir los lotes que NUNCA tuvieron ruta como remanentes (división de extremo a
         //    extremo). Igual que en el peel: anidan bajo su PROPIO id (un carryover "B1-S2"
         //    genera "B1-S2-S<n>", nunca "B1-S<n>" — ese nivel pertenece a otras porciones).
+        //    TRIAJE bajo sobrecarga: con backlog grande (fechas densas, medido feb-2028:
+        //    600+ lotes sin ruta por ciclo), intentar reubicar TODOS explotaba el tiempo del
+        //    ciclo muy por encima de Ta (155-168s vs 45s de cadencia) — cada remanente paga un
+        //    escaneo de vuelos directos y potencialmente una búsqueda multi-hop completa. Se
+        //    procesan los más URGENTES por vencimiento de SLA (los demás no se pierden: pasan a
+        //    carryover por la vía normal de registerUnroutedForRetry y reintentan el próximo
+        //    ciclo). Los remanentes de peel (paso 2) NO se recortan: son pocos y sus maletas
+        //    acaban de perder la ruta que ya tenían — reubicarlos es prioridad absoluta.
+        List<RemainderLot> unroutedRemainders = new ArrayList<>();
         for (ShipmentBatch batch : cycleBatches) {
             if (hadRoute.contains(batch.batchId())) continue;
             if (solution.getRoute(batch.batchId()) != null) continue;
-            remainders.add(new RemainderLot(batch, batch.batchId(), batch.quantity()));
+            unroutedRemainders.add(new RemainderLot(batch, batch.batchId(), batch.quantity()));
         }
+        if (unroutedRemainders.size() > MAX_UNROUTED_REMAINDERS_PER_CYCLE) {
+            unroutedRemainders.sort(Comparator.comparing(
+                rem -> rem.template().ingressTime().plus(rem.template().calculateSLA())));
+            unroutedRemainders = unroutedRemainders.subList(0, MAX_UNROUTED_REMAINDERS_PER_CYCLE);
+        }
+        remainders.addAll(unroutedRemainders);
 
-        // 4. Reubicar cada remanente en el espacio libre (directo y, si hace falta, con escalas).
+        // 4. Reubicar cada remanente en el espacio libre (directo y, si hace falta, con
+        //    escalas). Presupuesto de búsquedas multi-hop POR CICLO (no por remanente): la
+        //    colocación directa es barata (vuelos indexados de la ventana), pero cada sonda
+        //    multi-hop es una búsqueda de camino completa — bajo backlog, cientos de sondas
+        //    por ciclo eran el otro gran responsable del exceso sobre Ta.
         int splitsGenerated = 0;
+        int[] multiHopProbeBudget = { MAX_MULTIHOP_PROBES_PER_CYCLE };
         for (RemainderLot rem : remainders) {
             splitsGenerated += placeBagsInLeftover(
-                solution, usedByFlight, hubCapacity, splitCounter, rem, windowStart, windowEnd, touchedRoutes);
+                solution, usedByFlight, hubCapacity, splitCounter, rem, windowStart, windowEnd,
+                touchedRoutes, multiHopProbeBudget);
         }
         return splitsGenerated;
     }
+
+    /** Máximo de lotes sin ruta que el splitting intenta reubicar por ciclo (los más urgentes). */
+    private static final int MAX_UNROUTED_REMAINDERS_PER_CYCLE = 150;
+
+    /** Máximo de búsquedas multi-hop del splitting por ciclo (las directas no se limitan). */
+    private static final int MAX_MULTIHOP_PROBES_PER_CYCLE = 40;
 
     /**
      * Coloca {@code rem.quantity()} maletas en el espacio libre de vuelos directos y, para el
@@ -989,7 +1044,7 @@ public class Scheduler {
     private int placeBagsInLeftover(Solution solution, Map<String, Integer> usedByFlight,
                                     CapacityContext hubCapacity, Map<String, Integer> splitCounter, RemainderLot rem,
                                     ZonedDateTime windowStart, ZonedDateTime windowEnd,
-                                    List<AssignedRoute> touchedRoutes) {
+                                    List<AssignedRoute> touchedRoutes, int[] multiHopProbeBudget) {
         int remaining = rem.quantity();
         int effectiveMin = rem.quantity() < MIN_FILL_BAGS ? 1 : MIN_FILL_BAGS;
         if (remaining < effectiveMin) return 0;
@@ -1049,8 +1104,10 @@ public class Scheduler {
 
         // Multi-hop para el remanente: ruta con escalas verificando capacidad en TODOS los tramos
         // (vuelo Y almacén — hubCapacity va al generador, así que la búsqueda misma ya descarta
-        // hubs sin espacio real; ver RouteGenerator.generateFeasibleRoute).
-        if (remaining >= effectiveMin && fillRouteGenerator != null) {
+        // hubs sin espacio real; ver RouteGenerator.generateFeasibleRoute). Consume del
+        // presupuesto POR CICLO de sondas multi-hop (ver applyCapacityAwareSplitting, paso 4).
+        if (remaining >= effectiveMin && fillRouteGenerator != null && multiHopProbeBudget[0] > 0) {
+            multiHopProbeBudget[0]--;
             try {
                 int idx = splitCounter.merge(rem.sourceId(), 1, Integer::sum);
                 String subId = rem.sourceId() + "-S" + idx;
@@ -1285,6 +1342,9 @@ public class Scheduler {
         fitnessTracker.reset();
         frenteCaliente.clear();
         frenteCaliente.putAll(newSolution.getRoutes());
+        // La replanificación de emergencia implica cancelación de vuelo: lo único que puede
+        // cambiar la respuesta de "¿existe camino por horario?" — invalidar el cache.
+        structuralFeasibilityCache.clear();
         // Sus eventos de almacén también deben entrar a la cola pendiente del tracker —
         // igual que se hace para las rutas nuevas de un ciclo normal — o quedarían
         // invisibles para siempre en currentFitness/advanceStorageWatermark.

@@ -124,7 +124,25 @@ public class RouteGenerator {
             }
 
             if (randomize && random != null) {
-                Collections.shuffle(availableFlights, random);
+                if (capacity != null && batchQuantity > 0) {
+                    // Con contexto de capacidad: en vez de shuffle puro, explorar primero los
+                    // vuelos MENOS congestionados (ratio de carga del vuelo + ocupación del hub
+                    // de llegada) con jitter aleatorio para conservar la diversidad que el
+                    // GA/Tabú necesitan. Así hasta los individuos "aleatorios" nacen sesgados
+                    // hacia el balanceo, en lugar de depender de que el fitness los corrija
+                    // después — el shuffle puro trataba igual un vuelo al 95% que uno al 5%.
+                    // Las claves se PRECOMPUTAN (una por vuelo) antes de ordenar: un comparator
+                    // con aleatoriedad interna sería inconsistente entre comparaciones y viola
+                    // el contrato de sort (TimSort puede lanzar IllegalArgumentException).
+                    Map<Flight, Double> explorationKey = new HashMap<>();
+                    for (Flight f : availableFlights) {
+                        explorationKey.put(f,
+                            explorationCongestionKey(f, batchQuantity, destination, capacity, random));
+                    }
+                    availableFlights.sort(Comparator.comparingDouble(explorationKey::get));
+                } else {
+                    Collections.shuffle(availableFlights, random);
+                }
                 if (preferMultiHop && node.path.isEmpty() && random.nextDouble() < DEFER_DIRECT_PROBABILITY) {
                     deferDirectFlights(availableFlights, destination);
                 }
@@ -292,6 +310,30 @@ public class RouteGenerator {
             return 0.0;
         }
         return capacity.storageOccupancy(airport) / (double) cap;
+    }
+
+    /** Amplitud del jitter aleatorio en el orden de exploración del BFS (ver findPath). */
+    private static final double EXPLORATION_JITTER = 0.35;
+
+    /**
+     * Clave de orden de exploración de UN vuelo en el BFS aleatorizado: ratio de carga del
+     * vuelo tras sumar el lote + ocupación relativa del almacén de llegada (salvo que sea el
+     * destino final, cuya ocupación es igual para todo camino que termine ahí), más un jitter
+     * uniforme en [0, {@link #EXPLORATION_JITTER}) que conserva la diversidad — dos vuelos con
+     * ~35 puntos porcentuales de diferencia de congestión aún pueden intercambiar orden, pero
+     * uno al 95% ya casi nunca se explora antes que uno al 5%. Menor = se explora antes.
+     */
+    private static double explorationCongestionKey(
+            Flight flight, int quantity, Airport destination, CapacityContext capacity, Random random) {
+        double flightRatio = flight.capacity() > 0
+            ? (capacity.flightLoad(flight) + quantity) / (double) flight.capacity()
+            : 0.0;
+        double hubRatio = flight.destination().equals(destination)
+            ? 0.0
+            : relativeStorageOccupancy(flight.destination(), capacity);
+        return CONGESTION_FLIGHT_WEIGHT * flightRatio
+            + CONGESTION_HUB_WEIGHT * hubRatio
+            + random.nextDouble() * EXPLORATION_JITTER;
     }
 
     /** Mueve vuelos directos al final de la lista para explorar escalas primero. */
