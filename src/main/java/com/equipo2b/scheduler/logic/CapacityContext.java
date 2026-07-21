@@ -17,8 +17,14 @@ import java.util.Objects;
  * cuando está disponible.</p>
  */
 public final class CapacityContext {
-    /** Filtrar hubs cuando la ocupación relativa alcanza este umbral. */
-    public static final double HUB_SOFT_LIMIT_RATIO = 0.92;
+    /**
+     * Filtrar hubs (durante construcción de rutas) cuando la ocupación relativa alcanza este
+     * umbral. Antes en 0.92 — demasiado tarde: los picos transitorios observados vienen de un
+     * lote grande llegando justo cuando el hub YA estaba casi lleno, así que un margen tan
+     * ajustado deja poco colchón para desviar tráfico antes de que se complique. Bajado a 0.80
+     * para que el algoritmo empiece a evitar el hub con más anticipación.
+     */
+    public static final double HUB_SOFT_LIMIT_RATIO = 0.80;
 
     private final Map<String, Integer> flightLoad;
     private final Map<Airport, Integer> storageOccupancy;
