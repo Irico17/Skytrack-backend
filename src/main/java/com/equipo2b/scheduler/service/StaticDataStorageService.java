@@ -43,8 +43,18 @@ public class StaticDataStorageService {
     /** Nº de líneas por archivo que se parsean para validar formato (el resto solo se cuenta). */
     private static final int VALIDATION_SAMPLE_SIZE = 200;
 
-    /** Máximo de archivos de envíos por lote en upload por sesión. */
-    public static final int MAX_SHIPMENTS_PER_BATCH = 5;
+    /**
+     * Máximo de archivos de envíos por lote en upload por sesión.
+     *
+     * <p>Antes en 5: con el dataset histórico original (~13 MB/archivo promedio), un lote de
+     * 5 pesaba ~65 MB — trivial. Con el dataset del profesor (archivos individuales de hasta
+     * ~270 MB), un lote de 5 podía superar 1 GB — por encima de los 512 MB que aceptan nginx
+     * (VM y compose) y Spring, reproduciendo exactamente el 413 que el batching por sesión
+     * fue diseñado para evitar. Bajado a 1: cada request lleva como máximo un archivo, muy
+     * por debajo del límite incluso en el peor caso individual, y más resiliente ante cortes
+     * de red (un archivo grande que falla no obliga a reintentar los otros 4 del lote).</p>
+     */
+    public static final int MAX_SHIPMENTS_PER_BATCH = 1;
 
     private final AirportUploader airportUploader = new AirportUploader();
     private final FlightPlanUploader flightUploader = new FlightPlanUploader();
