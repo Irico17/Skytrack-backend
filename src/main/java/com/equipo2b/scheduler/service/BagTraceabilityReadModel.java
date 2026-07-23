@@ -115,12 +115,61 @@ final class BagTraceabilityReadModel {
         }
         if (knownBatches != null) {
             for (ShipmentBatch batch : knownBatches) {
-                if (batch != null) {
-                    batches.putIfAbsent(batch.batchId(), batch);
+                if (batch == null || batches.containsKey(batch.batchId())) {
+                    continue;
                 }
+                // El lote registrado NUNCA se muta cuando la semilla del GA lo divide (admisión
+                // de origen / findMaxRoutableQuantity): esas porciones nacen con ids ANIDADOS
+                // nuevos ("UI-xxx-S1-S1", "UI-xxx-S1-S2-S1", ...) vía RouteGenerator/
+                // GeneticAlgorithm.splitPortion, nunca reemplazando la clave original. Sin este
+                // descuento, un lote de 500 partido en 340+90 seguía apareciendo aquí con sus
+                // 500 originales COMPLETAS — 930 "maletas" visibles para 500 reales, y el envío
+                // se veía "sin ruta" en el inspector aunque el 86% ya viajaba. Mismo criterio de
+                // subárbol tolerante a huecos que Scheduler.routedQuantity (huérfano aquí de esa
+                // clase: se reimplementa localmente porque este read-model no tiene acceso a
+                // Solution ni a los métodos privados del Scheduler).
+                int alreadyRouted = subtreeRoutedQuantity(routeByBatch, batch.batchId(), 0);
+                int remaining = batch.quantity() - alreadyRouted;
+                if (remaining <= 0) {
+                    continue;  // todo el lote ya vive bajo sub-lotes con ruta: no hay nada pendiente
+                }
+                ShipmentBatch effective = remaining == batch.quantity()
+                    ? batch
+                    : new ShipmentBatch(batch.batchId(), batch.airportBatchId(), batch.clientId(),
+                        batch.origin(), batch.destination(), remaining, batch.ingressTime());
+                batches.put(batch.batchId(), effective);
             }
         }
         return batches;
+    }
+
+    /** Sufijos "-S&lt;n&gt;" tolerados vacíos antes de cortar el escaneo (mismo criterio que
+     * {@code Scheduler.SUBTREE_SCAN_GAP_TOLERANCE}: un peel descartado deja huecos). */
+    private static final int SUBTREE_SCAN_GAP_TOLERANCE = 3;
+    private static final int SUBTREE_SCAN_MAX_DEPTH = 5;
+
+    /** Maletas ya routeadas bajo el subárbol de {@code id} (id propio + descendientes -S&lt;n&gt;
+     * anidados), replicando {@code Scheduler.subtreeRoutedQuantity} contra {@code routeByBatch}. */
+    private static int subtreeRoutedQuantity(Map<String, AssignedRoute> routeByBatch, String id, int depth) {
+        int total = 0;
+        AssignedRoute own = routeByBatch.get(id);
+        if (own != null) {
+            total += own.getBatch().quantity();
+        }
+        if (depth >= SUBTREE_SCAN_MAX_DEPTH) {
+            return total;
+        }
+        int emptyStreak = 0;
+        for (int i = 1; emptyStreak < SUBTREE_SCAN_GAP_TOLERANCE; i++) {
+            String childId = id + "-S" + i;
+            if (!routeByBatch.containsKey(childId) && !routeByBatch.containsKey(childId + "-S1")) {
+                emptyStreak++;
+                continue;
+            }
+            emptyStreak = 0;
+            total += subtreeRoutedQuantity(routeByBatch, childId, depth + 1);
+        }
+        return total;
     }
 
     private static BagTraceabilityDTO.BagItemDTO toItem(
