@@ -249,17 +249,17 @@ public class SolutionEvaluator {
      * nadie exceda su capacidad (por eso existen las rutas con escalas). La penalización
      * dura de almacén solo castiga el DESBORDE; entre 0% y 100% el algoritmo era
      * indiferente y concentraba tránsito en los mismos hubs. Igual que el término convexo
-     * de vuelos: con β=6, concentrar 420 maletas en un almacén de 420 (100%) cuesta
-     * β·420²/420 = 2,520 pts; repartirlas 210/210 entre dos hubs (50% cada uno) ≈ 1,260 pts
-     * → el GA/Tabú prefiere repartir, con un empuje más fuerte que antes (β=2 → 840 vs 420)
-     * para que además ayude a suavizar los picos transitorios de un solo hub, no solo el
-     * desbalance en régimen permanente.</p>
+     * de vuelos: con β=8, concentrar 420 maletas en un almacén de 420 (100%) cuesta
+     * β·420²/420 = 3,360 pts; repartirlas 210/210 entre dos hubs (50% cada uno) ≈ 1,680 pts
+     * → el GA/Tabú prefiere repartir. Escalado 2→6→8 en sucesivas calibraciones para
+     * suavizar también los picos transitorios de un solo hub, no solo el desbalance en
+     * régimen permanente.</p>
      *
      * <p>Sigue muy por debajo de las restricciones duras (10k-50k) y de PENALTY_SLA_VIOLATION
      * (20k/hora) — nunca puede ganarle a SLA ni a factibilidad, solo desempata más fuerte
      * entre rutas de costo similar.</p>
      */
-    public static final double PENALTY_STORAGE_CONVEX_FACTOR = 6.0;
+    public static final double PENALTY_STORAGE_CONVEX_FACTOR = 8.0;
 
     /**
      * Umbral de ocupación de almacén (ratio pico/capacidad) a partir del cual se activa el
@@ -287,15 +287,21 @@ public class SolutionEvaluator {
      * específicamente de la zona de peligro, no solo a "repartir un poco más".
      *
      * <p><strong>Calibración</strong> (cap = 420, mismo ejemplo que
-     * {@link #PENALTY_STORAGE_CONVEX_FACTOR}): al 100% (420) el excedente sobre el umbral es
-     * 420 − 0.80·420 = 84 → 60·84²/420 ≈ 1,008 pts extra. Al 110% (462) el excedente es 126 →
-     * 60·126²/420 ≈ 2,268 pts extra. Del mismo orden que los demás premios/penalizaciones
-     * "blandos" (cientos a pocos miles de puntos) — muy por debajo de las restricciones duras
-     * (10k-50k) y de {@link #PENALTY_SLA_VIOLATION} (20k/hora), así que solo inclina desempates
-     * entre soluciones de costo similar hacia evitar picos sobre el umbral, sin poder ganarle
-     * jamás a SLA ni a factibilidad.
+     * {@link #PENALTY_STORAGE_CONVEX_FACTOR}). Subido de 60 a 150 por pedido operativo
+     * ("penalizar más los picos"): al 100% (420) el excedente sobre el umbral es
+     * 420 − 0.80·420 = 84 → 150·84²/420 ≈ 2,520 pts extra (antes ≈1,008). Al 110% (462) el
+     * excedente es 126 → 150·126²/420 ≈ 5,670 pts extra (antes ≈2,268).
+     *
+     * <p><strong>Margen de seguridad verificado</strong>: lo que importa no es el valor
+     * absoluto sino el COSTO MARGINAL de una maleta más frente a la alternativa de no
+     * asignarla ({@link #PENALTY_UNASSIGNED_PER_BAG} = 5,000/maleta). En el peor caso (almacén
+     * ya al 100%), sumar una maleta cuesta 150·(85²−84²)/420 ≈ 60 pts por este término más
+     * 8·(421²−420²)/420 ≈ 16 pts del convexo base ≈ 76 pts — unas 65 veces más barato que
+     * abandonarla. Es decir: el término empuja fuerte a REPARTIR entre almacenes, pero nunca
+     * puede volver preferible dejar maletas sin ruta, ni ganarle a SLA (20k/hora) o al
+     * desborde duro (15k/maleta).
      */
-    public static final double PENALTY_STORAGE_PEAK_FACTOR = 60.0;
+    public static final double PENALTY_STORAGE_PEAK_FACTOR = 150.0;
 
     /**
      * Penalización por desbalance GLOBAL de ocupación de almacenes (varianza de ratios).
@@ -305,12 +311,51 @@ public class SolutionEvaluator {
      * de la red (ocupación = max(pico del ciclo, baseline)) y penaliza la varianza de
      * ratios ocupación/capacidad → incentiva rutas multi-hop que usen hubs subutilizados.
      *
-     * <p>Escala: con N≈30 aeropuertos y varianza 0.05 → ~540 pts; lejos de las restricciones
-     * duras (10k–50k), pero del orden de las demás penalizaciones/premios "blandos" (cientos
-     * de puntos) para que sí incline el desempate entre rutas de costo similar hacia hubs
-     * subutilizados. No puede superar factibilidad/SLA.
+     * <p>Escala: subido de 360 a 700 por pedido operativo ("penalizar más el desnivel entre
+     * almacenes"). Con N≈30 aeropuertos y varianza 0.05 → ~1,050 pts (antes ~540); con la red
+     * bien repartida (varianza ≈0.01) el término casi desaparece (~210 pts), que es
+     * exactamente el comportamiento buscado: cuesta poco estar equilibrado y bastante estar
+     * desnivelado. Sigue lejos de las restricciones duras (10k–50k) y de
+     * {@link #PENALTY_SLA_VIOLATION}, así que inclina desempates hacia hubs subutilizados sin
+     * poder superar factibilidad ni SLA.
      */
-    public static final double PENALTY_GLOBAL_IMBALANCE_FACTOR = 360.0;
+    public static final double PENALTY_GLOBAL_IMBALANCE_FACTOR = 700.0;
+
+    /**
+     * Penalización por SOBRECARGA RELATIVA: δ · Σ (ratio − mediana)² sobre los almacenes que
+     * están POR ENCIMA del nivel típico de la red. Complementa a
+     * {@link #PENALTY_GLOBAL_IMBALANCE_FACTOR}.
+     *
+     * <p><strong>Objetivo operativo</strong>: que la red se mantenga toda alrededor de su nivel
+     * típico (si la mayoría anda al 50-60%, que todos ronden ahí) y que NINGUNO se dispare a
+     * 80-90-100%. No penaliza estar cargado — penaliza estar cargado <em>de más que el resto</em>.
+     *
+     * <p><strong>Por qué la referencia es la MEDIANA y no el promedio</strong>: el promedio lo
+     * arrastran hacia arriba los propios almacenes disparados, y el efecto es perverso. Con 20
+     * almacenes, 18 al 55%: si DOS se van al 95%, el promedio sube a 59% y la distancia del peor
+     * al promedio es 0.36; si se va UNO solo, el promedio es 57% y la distancia es 0.38. Es
+     * decir, medido contra el promedio, <em>dos</em> almacenes saturados penalizaban MENOS que
+     * uno. La mediana no se mueve por unos pocos extremos (sigue en 0.55 en ambos casos), así
+     * que dos outliers cuestan exactamente el doble que uno — que es lo correcto.
+     *
+     * <p><strong>Por qué la suma es por almacén y no solo el peor</strong>: mirar únicamente el
+     * máximo hace invisible al segundo y tercer almacén saturados. Sumando el exceso de cada uno,
+     * cada hub que se dispara aporta su propio costo.
+     *
+     * <p><strong>Calibración</strong> (δ=4,000, cuadrático sobre excesos en [0,1]):
+     * <ul>
+     *   <li>Red pareja (todos ≈55%): exceso 0 → <b>0 pts</b>.</li>
+     *   <li>18 al 55% + 1 al 95%: (0.40)²·4,000 ≈ <b>640 pts</b>.</li>
+     *   <li>18 al 55% + 2 al 95%: 2·(0.40)²·4,000 ≈ <b>1,280 pts</b> (el doble, como debe ser).</li>
+     *   <li>1 al 70% + resto al 15%: (0.55)²·4,000 ≈ <b>1,210 pts</b>.</li>
+     *   <li>Desnivel leve (uno al 25%, resto al 20%): ≈<b>10 pts</b>, despreciable.</li>
+     * </ul>
+     *
+     * <p><strong>Margen de seguridad</strong>: el costo marginal de una maleta más en el peor
+     * almacén es 2·exceso/capacidad·δ ≈ 10 pts — unas 500 veces menor que
+     * {@link #PENALTY_UNASSIGNED_PER_BAG}. Empuja a repartir, nunca a dejar maletas sin ruta.
+     */
+    public static final double PENALTY_STORAGE_SPREAD_FACTOR = 4_000.0;
     
     // ==================== Dependencias ====================
     
@@ -587,8 +632,34 @@ public class SolutionEvaluator {
     }
 
     /**
-     * Varianza de ocupación relativa entre todos los aeropuertos de la red.
-     * Premia soluciones que repartan carga (multi-hop hacia hubs libres).
+     * Desbalance de ocupación entre los almacenes de la red. Suma DOS términos complementarios:
+     *
+     * <ol>
+     *   <li><b>Varianza</b> ({@link #PENALTY_GLOBAL_IMBALANCE_FACTOR}): dispersión general de
+     *       los ratios ocupación/capacidad. Captura el desorden global de la red.</li>
+     *   <li><b>Sobrecarga relativa</b> ({@link #PENALTY_STORAGE_SPREAD_FACTOR}): suma del
+     *       exceso al cuadrado de CADA almacén por encima de la MEDIANA de la red.</li>
+     * </ol>
+     *
+     * <p><strong>Por qué la varianza sola no bastaba</strong> (caso reportado en operación: un
+     * almacén al 70% mientras la mayoría está al 15%): la varianza de ratios vive en un rango
+     * numérico muy chico. Con 1 almacén al 70% y 29 al 15%, la suma de desviaciones cuadráticas
+     * es ≈0.292 → apenas ≈205 pts con el factor de varianza, MENOS que los ≈1,646 pts que ya
+     * aporta el término convexo de ese mismo almacén; y como 70% está por debajo de
+     * {@link #STORAGE_PEAK_THRESHOLD_RATIO} (0.80), el término de picos ni siquiera se activa.
+     * Resultado: un desnivel evidente a simple vista era casi invisible para el fitness.
+     *
+     * <p>El término de sobrecarga relativa ataca exactamente ese patrón: mide cuánto sobresale
+     * cada almacén sobre la MEDIANA de la red (el nivel "típico"), no sobre el promedio. En ese
+     * caso el exceso del hub es 0.70 − 0.15 = 0.55 → 0.55²·4,000 ≈ 1,210 pts, del orden del
+     * término convexo y ahora sí decisivo. Ver {@link #PENALTY_STORAGE_SPREAD_FACTOR} para por
+     * qué la mediana (y no el promedio) es la referencia correcta, y para la tabla de
+     * calibración completa.
+     *
+     * <p><strong>Margen de seguridad</strong>: el gradiente por maleta movida del hub más
+     * cargado a uno libre es ≈10 pts (2·exceso/capacidad·factor), comparable al término convexo
+     * y ~500 veces menor que {@link #PENALTY_UNASSIGNED_PER_BAG} — empuja a REPARTIR, nunca a
+     * dejar maletas sin ruta ni a incumplir SLA.
      */
     double calculateGlobalStorageImbalancePenalty(
             java.util.Map<com.equipo2b.scheduler.model.Airport, Integer> peakOccupancy,
@@ -626,7 +697,28 @@ public class SolutionEvaluator {
         }
         variance /= ratios.size();
 
-        return PENALTY_GLOBAL_IMBALANCE_FACTOR * variance * ratios.size();
+        double penalty = PENALTY_GLOBAL_IMBALANCE_FACTOR * variance * ratios.size();
+
+        // Exceso de CADA almacén sobre el nivel TÍPICO de la red (ver javadoc). La referencia
+        // es la MEDIANA, no el promedio: el promedio lo arrastran hacia arriba los propios
+        // almacenes disparados, así que con 2-3 outliers la distancia al promedio se encoge y
+        // el desnivel se auto-oculta. La mediana no se mueve por unos pocos valores extremos.
+        java.util.List<Double> sorted = new java.util.ArrayList<>(ratios);
+        java.util.Collections.sort(sorted);
+        int n = sorted.size();
+        double median = (n % 2 == 0)
+            ? (sorted.get(n / 2 - 1) + sorted.get(n / 2)) / 2.0
+            : sorted.get(n / 2);
+
+        double overloadSpread = 0.0;
+        for (double r : ratios) {
+            double over = r - median;
+            if (over > 0) {
+                overloadSpread += over * over;  // cada almacén sobrecargado suma lo suyo
+            }
+        }
+        penalty += PENALTY_STORAGE_SPREAD_FACTOR * overloadSpread;
+        return penalty;
     }
     
     /**
