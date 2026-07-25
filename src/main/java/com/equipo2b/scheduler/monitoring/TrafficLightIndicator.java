@@ -93,16 +93,42 @@ public class TrafficLightIndicator {
      * **Validates: Requirements 32.3, 32.4, 32.5, 32.6**
      */
     public TrafficLightReport generateReport(Solution solution, CapacityMonitor monitor) {
+        return generateReport(solution, monitor, null);
+    }
+
+    /**
+     * Igual que {@link #generateReport(Solution, CapacityMonitor)} pero con la ocupación de
+     * almacenes YA calculada por el llamador.
+     *
+     * <p><strong>Por qué existe:</strong> el cálculo interno
+     * ({@link CapacityMonitor#calculateStorageOccupancy}) NO es la ocupación actual de la red:
+     * reproduce todos los eventos de la solución —pasados y futuros— y se queda con el
+     * <em>máximo</em> de cada aeropuerto, promediando además solo los aeropuertos que aparecen
+     * en algún evento (los que no tienen tráfico ni siquiera cuentan como 0%). Con la red al
+     * 31% real (máximo 60%, ningún almacén sobre 80%) ese número daba 70% y pintaba el
+     * semáforo de ámbar, contradiciendo a la lista de almacenes del panel, que muestra el
+     * inventario en el instante simulado sobre los 30 aeropuertos. Son dos magnitudes
+     * distintas con la misma etiqueta.</p>
+     *
+     * @param currentStorageOccupancy ocupación media ACTUAL (0-1) sobre todos los almacenes,
+     *                                o {@code null} para caer al cálculo por picos de siempre
+     */
+    public TrafficLightReport generateReport(
+            Solution solution, CapacityMonitor monitor, Double currentStorageOccupancy) {
         // Calcular ocupación de vuelos
         double flightOccupancy = monitor.calculateAverageFlightOccupancy(solution);
-        
-        // Calcular ocupación promedio de almacenes
-        Map<Airport, Double> storageOccupancy = monitor.calculateStorageOccupancy(solution);
-        double avgStorageOccupancy = storageOccupancy.values().stream()
-            .mapToDouble(Double::doubleValue)
-            .average()
-            .orElse(0.0);
-        
+
+        double avgStorageOccupancy;
+        if (currentStorageOccupancy != null) {
+            avgStorageOccupancy = Math.min(1.0, Math.max(0.0, currentStorageOccupancy));
+        } else {
+            Map<Airport, Double> storageOccupancy = monitor.calculateStorageOccupancy(solution);
+            avgStorageOccupancy = storageOccupancy.values().stream()
+                .mapToDouble(Double::doubleValue)
+                .average()
+                .orElse(0.0);
+        }
+
         // Calcular tasa de cumplimiento de SLA
         long totalRoutes = solution.getRoutes().size();
         long routesMeetingSLA = solution.getRoutes().values().stream()

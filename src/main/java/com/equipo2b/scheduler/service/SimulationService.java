@@ -350,7 +350,8 @@ public class SimulationService implements SimulationController.SimulationListene
         if (currentCapacityMonitor != null) {
             Solution sol = getCurrentSolution();
             if (sol != null && !sol.getRoutes().isEmpty()) {
-                trafficReport = trafficLight.generateReport(sol, currentCapacityMonitor);
+                trafficReport = trafficLight.generateReport(sol, currentCapacityMonitor,
+                    currentStorageOccupancyRatio(sol, status.simulatedTime()));
             }
         }
 
@@ -425,7 +426,8 @@ public class SimulationService implements SimulationController.SimulationListene
         Solution sol = getCurrentSolution();
         if (sol == null || sol.getRoutes().isEmpty()) return SemaphoreDTO.unknown();
 
-        TrafficLightReport report = trafficLight.generateReport(sol, currentCapacityMonitor);
+        TrafficLightReport report = trafficLight.generateReport(sol, currentCapacityMonitor,
+            currentStorageOccupancyRatio(sol, activeController.getStatus().simulatedTime()));
         return new SemaphoreDTO(
             report.flightColor().name(),
             report.storageColor().name(),
@@ -479,7 +481,8 @@ public class SimulationService implements SimulationController.SimulationListene
         // Calcular semáforos
         SemaphoreDTO semaphores = SemaphoreDTO.unknown();
         if (currentCapacityMonitor != null && !solution.getRoutes().isEmpty()) {
-            TrafficLightReport report = trafficLight.generateReport(solution, currentCapacityMonitor);
+            TrafficLightReport report = trafficLight.generateReport(solution, currentCapacityMonitor,
+                currentStorageOccupancyRatio(solution, status.simulatedTime()));
             semaphores = new SemaphoreDTO(
                 report.flightColor().name(),
                 report.storageColor().name(),
@@ -854,6 +857,44 @@ public class SimulationService implements SimulationController.SimulationListene
             .toList();
     }
 
+    /**
+     * Ocupación media ACTUAL de la red de almacenes (0-1), sobre TODOS los aeropuertos.
+     *
+     * <p>Es la misma magnitud que promedia la lista de almacenes del panel: inventario en el
+     * instante simulado dividido por capacidad, incluyendo los almacenes vacíos. El semáforo
+     * global usaba en su lugar el pico proyectado de los aeropuertos con tráfico, que con la
+     * red al 31% real daba 70% y la pintaba de ámbar.</p>
+     *
+     * @return null si aún no hay datos suficientes (se cae al cálculo anterior)
+     */
+    private Double currentStorageOccupancyRatio(Solution solution, ZonedDateTime simulatedTime) {
+        if (currentAirportManager == null || currentStorageInventoryService == null || simulatedTime == null) {
+            return null;
+        }
+        List<CycleUpdateDTO.AirportCapacityDTO> capacities = buildAirportCapacities(solution, simulatedTime);
+        if (capacities.isEmpty()) {
+            return null;
+        }
+        double sum = 0.0;
+        int counted = 0;
+        for (CycleUpdateDTO.AirportCapacityDTO capacity : capacities) {
+            if (capacity.maxCapacity() <= 0) continue;
+            sum += Math.min(1.0, (double) capacity.currentBags() / capacity.maxCapacity());
+            counted++;
+        }
+        return counted > 0 ? sum / counted : null;
+    }
+
+    /** Semáforo de un almacén con los MISMOS cortes que el indicador global de la simulación. */
+    private String semaphoreFor(double ratio) {
+        TrafficLightIndicator indicator = trafficLight != null ? trafficLight : new TrafficLightIndicator();
+        return switch (indicator.evaluate(Math.min(1.0, Math.max(0.0, ratio)))) {
+            case RED -> "RED";
+            case AMBER -> "AMBER";
+            case GREEN -> "GREEN";
+        };
+    }
+
     private List<OperationalStateDTO.WarehouseItemDTO> buildWarehouses(Solution solution, ZonedDateTime simulatedTime) {
         List<CycleUpdateDTO.AirportCapacityDTO> capacities = buildAirportCapacities(solution, simulatedTime);
         Map<String, CycleUpdateDTO.AirportCapacityDTO> byAirport = new HashMap<>();
@@ -868,7 +909,11 @@ public class SimulationService implements SimulationController.SimulationListene
                 CycleUpdateDTO.AirportCapacityDTO capacity = byAirport.get(airport.id());
                 int currentBags = capacity != null ? capacity.currentBags() : 0;
                 double ratio = capacity != null ? capacity.occupancyRatio() : 0.0;
-                String semaphore = ratio >= 0.9 ? "RED" : ratio >= 0.7 ? "AMBER" : "GREEN";
+                // Se delega en el MISMO indicador que produce el semáforo global (verde <=50%,
+                // ámbar <=80%, rojo >80%). Antes este DTO aplicaba 70/90 por su cuenta, así que
+                // la lista de almacenes del panel podía pintar de verde un aeropuerto que el
+                // indicador global ya daba por ámbar, con el mismo dato.
+                String semaphore = semaphoreFor(ratio);
                 return new OperationalStateDTO.WarehouseItemDTO(
                     airport.id(),
                     airport.city(),
