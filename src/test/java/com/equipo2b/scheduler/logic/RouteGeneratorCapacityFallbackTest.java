@@ -73,8 +73,10 @@ class RouteGeneratorCapacityFallbackTest {
 
     @Test
     void hubNearSoftLimitButRoomLeft_relaxesOnlySoftThreshold() {
-        // Hub al 95% (por encima del umbral suave 80%) pero con residual duro para el lote.
-        // Soft predictivo (used+qty) también bloquea en el primer intento; Nivel 2 relaja soft.
+        // Hub al 95% (por encima del umbral suave 80%) pero con residual DURO para el lote.
+        // El nivel 1 (estricto) lo rechaza por soft; el nivel 2 lo acepta porque el espacio
+        // existe de verdad. Rechazarlo no evitaría ocupar almacén: las maletas se quedarían
+        // igualmente en el almacén de ORIGEN, pero además sin ruta.
         AirportManager airports = new AirportManager(List.of(origin, hub, dest));
         FlightPlan flightPlan = new FlightPlan(List.of(leg1, leg2)); // solo vía hub
         RouteGenerator generator = new RouteGenerator(flightPlan, airports);

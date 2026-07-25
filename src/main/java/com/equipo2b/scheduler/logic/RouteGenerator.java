@@ -43,6 +43,13 @@ public class RouteGenerator {
     // 5 tramos es el máximo que el SLA permite en la práctica.
     private static final int MAX_HOPS = 5;
 
+    /**
+     * Holgura de llegada (ε-Pareto): entre caminos que llegan ≤ earliest + ε y cumplen SLA,
+     * preferir el de menor congestión de hubs/vuelos. Lexicográfico: tiempo primero (banda ε),
+     * luego balance de recurso. Genérico para cualquier hub saturado.
+     */
+    private static final Duration ARRIVAL_SLACK_EPSILON = Duration.ofHours(2);
+
     /** Probabilidad de posponer vuelos directos cuando se pide explorar multi-hop. */
     private static final double DEFER_DIRECT_PROBABILITY = 0.55;
 
@@ -170,16 +177,23 @@ public class RouteGenerator {
                     if (!capacity.hasFlightCapacity(flight, batchQuantity)) {
                         continue;
                     }
+                    // Origen: estancia [now, primer despegue) — mismo criterio que pathFitsWarehouseHard.
+                    if (node.path.isEmpty()
+                            && !capacity.hasHubCapacity(
+                                origin, batchQuantity, startTime, flight.departureTime())) {
+                        continue;
+                    }
                     Airport hub = flight.destination();
                     boolean isFinalDestination = hub.equals(destination);
-                    // Origen ya ocupa espacio; hubs intermedios y destino final necesitan residual.
-                    // Intermedios: filtrar duro + soft-limit. Destino: solo residual duro.
+                    ZonedDateTime holdUntil = isFinalDestination
+                        ? flight.arrivalTime().plus(CapacityContext.FINAL_PICKUP_WINDOW)
+                        : minTime(flight.arrivalTime().plus(CapacityContext.PROVISIONAL_HUB_HOLD), deadline);
                     if (!isFinalDestination) {
-                        if (!capacity.hasHubCapacity(hub, batchQuantity)
-                                || capacity.isHubNearLimit(hub, batchQuantity)) {
+                        if (!capacity.hasHubCapacity(hub, batchQuantity, flight.arrivalTime(), holdUntil)
+                                || capacity.isHubNearLimit(hub, batchQuantity, flight.arrivalTime(), holdUntil)) {
                             continue;
                         }
-                    } else if (!capacity.hasHubCapacity(hub, batchQuantity)) {
+                    } else if (!capacity.hasHubCapacity(hub, batchQuantity, flight.arrivalTime(), holdUntil)) {
                         continue;
                     }
                 }
@@ -228,21 +242,55 @@ public class RouteGenerator {
     private List<Flight> findEarliestArrivalPath(Airport origin, Airport destination,
                                                  ZonedDateTime startTime, Duration sla,
                                                  int batchQuantity, CapacityContext capacity) {
+        List<Flight> earliest = findMinArrivalPath(
+            origin, destination, startTime, sla, batchQuantity, capacity);
+        if (earliest == null || earliest.isEmpty() || capacity == null || batchQuantity <= 0) {
+            return earliest;
+        }
+        // ε-Pareto solo si el camino earliest ya toca un hub en zona soft — evita 2× Dijkstra
+        // en cada lote (congelaba ciclos densos / Ta).
+        if (!earliestPathStressesHubs(earliest, destination, batchQuantity, capacity)) {
+            return earliest;
+        }
+        ZonedDateTime bestArrival = earliest.get(earliest.size() - 1).arrivalTime();
+        ZonedDateTime slaDeadline = startTime.plus(sla);
+        ZonedDateTime slackCap = bestArrival.plus(ARRIVAL_SLACK_EPSILON);
+        ZonedDateTime arrivalLimit = slackCap.isBefore(slaDeadline) ? slackCap : slaDeadline;
+        List<Flight> balanced = findMinCongestionPath(
+            origin, destination, startTime, sla, batchQuantity, capacity, arrivalLimit);
+        if (balanced == null || balanced.isEmpty()) {
+            return earliest;
+        }
+        return balanced;
+    }
+
+    private static boolean earliestPathStressesHubs(
+            List<Flight> path, Airport destination, int qty, CapacityContext capacity) {
+        for (int i = 0; i < path.size() - 1; i++) {
+            Flight flight = path.get(i);
+            Airport hub = flight.destination();
+            if (hub.equals(destination)) {
+                continue;
+            }
+            // Soft por INTERVALO de layover (no pico global): dispara ε solo si esa escala
+            // concreta ya está caliente en su ventana real.
+            if (capacity.isHubNearLimit(hub, qty, flight.arrivalTime(), path.get(i + 1).departureTime())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Dijkstra por llegada más temprana (objetivo primario de SLA operativo).
+     */
+    private List<Flight> findMinArrivalPath(Airport origin, Airport destination,
+                                            ZonedDateTime startTime, Duration sla,
+                                            int batchQuantity, CapacityContext capacity) {
         ZonedDateTime deadline = startTime.plus(sla);
 
         record Label(Airport airport, ZonedDateTime time, List<Flight> path) {}
 
-        // Desempate SECUNDARIO a igualdad EXACTA de hora de llegada: entre labels con el mismo
-        // tiempo, se expande primero el de aeropuerto relativamente MENOS ocupado. No toca el
-        // criterio principal (llegada más temprana sigue siendo el piso de calidad del SLA,
-        // inquebrantable) — solo decide el ORDEN de expansión en el raro caso de un empate
-        // exacto de timestamp entre dos aeropuertos DISTINTOS, empujando a explorar antes las
-        // ramas que pasan por hubs más libres. Si el empate es entre dos labels DEL MISMO
-        // aeropuerto (dos caminos que llegan igual de rápido al mismo lugar), este desempate no
-        // discrimina entre ellos: la ocupación consultada es la del mismo aeropuerto para
-        // ambos, así que es un no-op ahí — pero en ese caso tampoco hace falta discriminar,
-        // porque ambos caminos ya son igualmente óptimos en tiempo para ese aeropuerto y la
-        // dominancia por aeropuerto se encarga de quedarse con uno solo.
         Comparator<Label> ordering = Comparator.comparing(Label::time);
         if (capacity != null) {
             ordering = ordering.thenComparingDouble(label -> relativeStorageOccupancy(label.airport(), capacity));
@@ -259,7 +307,7 @@ public class RouteGenerator {
             }
             ZonedDateTime known = bestArrival.get(label.airport().id());
             if (known != null && !label.time().isBefore(known)) {
-                continue;  // dominada: ya alcanzamos este aeropuerto más temprano
+                continue;
             }
             bestArrival.put(label.airport().id(), label.time());
 
@@ -278,20 +326,18 @@ public class RouteGenerator {
                     if (!capacity.hasFlightCapacity(flight, batchQuantity)) {
                         continue;
                     }
-                    Airport hub = flight.destination();
-                    boolean isFinalDestination = hub.equals(destination);
-                    if (!isFinalDestination) {
-                        if (!capacity.hasHubCapacity(hub, batchQuantity)
-                                || capacity.isHubNearLimit(hub, batchQuantity)) {
-                            continue;
-                        }
-                    } else if (!capacity.hasHubCapacity(hub, batchQuantity)) {
+                    if (label.path().isEmpty()
+                            && !capacity.hasHubCapacity(
+                                origin, batchQuantity, startTime, flight.departureTime())) {
+                        continue;
+                    }
+                    if (!edgeHubCapacityOk(flight, destination, batchQuantity, capacity, deadline)) {
                         continue;
                     }
                 }
                 ZonedDateTime prevArrival = bestArrival.get(flight.destination().id());
                 if (prevArrival != null && !flight.arrivalTime().isBefore(prevArrival)) {
-                    continue;  // poda temprana: llegaríamos igual o más tarde que lo ya logrado
+                    continue;
                 }
                 List<Flight> newPath = new ArrayList<>(label.path().size() + 1);
                 newPath.addAll(label.path());
@@ -301,6 +347,152 @@ public class RouteGenerator {
         }
 
         return null;
+    }
+
+    /**
+     * Entre caminos con llegada ≤ {@code arrivalLimit}, minimiza congestión (hubs+vuelos).
+     * Desempate: llegada más temprana.
+     *
+     * <p><b>Es una heurística, no una búsqueda exhaustiva.</b> La poda de dominancia mira
+     * SOLO la congestión ({@code bestCongestion} por aeropuerto), no el par (congestión,
+     * tiempo). Un camino con algo más de congestión pero que llega mucho antes puede quedar
+     * descartado aunque fuera el único que alcanza el destino dentro del límite. Una búsqueda
+     * correcta necesitaría etiquetas de Pareto (frente por aeropuerto), bastante más caras.
+     *
+     * <p>Es aceptable porque el llamador la usa como ALTERNATIVA opcional: si devuelve
+     * {@code null} se conserva el camino de llegada más temprana, así que un fallo de esta
+     * poda nunca deja al lote sin ruta — solo pierde una oportunidad de balanceo.</p>
+     */
+    private List<Flight> findMinCongestionPath(
+            Airport origin,
+            Airport destination,
+            ZonedDateTime startTime,
+            Duration sla,
+            int batchQuantity,
+            CapacityContext capacity,
+            ZonedDateTime arrivalLimit) {
+        ZonedDateTime deadline = startTime.plus(sla);
+
+        record Label(Airport airport, ZonedDateTime time, List<Flight> path, double congestion) {}
+
+        Comparator<Label> ordering = Comparator
+            .comparingDouble(Label::congestion)
+            .thenComparing(Label::time);
+        PriorityQueue<Label> frontier = new PriorityQueue<>(ordering);
+        frontier.add(new Label(origin, startTime, List.of(), 0.0));
+        Map<String, Double> bestCongestion = new HashMap<>();
+
+        List<Flight> bestPath = null;
+        double bestScore = Double.POSITIVE_INFINITY;
+        ZonedDateTime bestArr = null;
+
+        while (!frontier.isEmpty()) {
+            Label label = frontier.poll();
+
+            if (label.airport().equals(destination)) {
+                if (label.time().isAfter(arrivalLimit)) {
+                    continue;
+                }
+                if (label.congestion < bestScore
+                        || (label.congestion == bestScore
+                            && (bestArr == null || label.time().isBefore(bestArr)))) {
+                    bestScore = label.congestion;
+                    bestArr = label.time();
+                    bestPath = new ArrayList<>(label.path());
+                }
+                continue;
+            }
+
+            String key = label.airport().id();
+            Double known = bestCongestion.get(key);
+            if (known != null && label.congestion > known + 1e-9) {
+                continue;
+            }
+            bestCongestion.put(key, label.congestion);
+
+            if (label.path().size() >= MAX_HOPS) {
+                continue;
+            }
+
+            for (Flight flight : flightPlan.getFlightsFromAirport(label.airport(), label.time(), deadline)) {
+                if (Duration.between(label.time(), flight.departureTime()).toMinutes() < 10) {
+                    continue;
+                }
+                if (!flight.arrivalTime().isBefore(deadline)) {
+                    continue;
+                }
+                // Solo se poda por arrivalLimit en el DESTINO final: llegar "tarde" a una
+                // escala intermedia no descalifica el camino (puede seguir alcanzando el
+                // destino dentro de la banda ε), así que ahí no se poda.
+                if (flight.destination().equals(destination)
+                        && flight.arrivalTime().isAfter(arrivalLimit)) {
+                    continue;
+                }
+                if (capacity != null && batchQuantity > 0) {
+                    if (!capacity.hasFlightCapacity(flight, batchQuantity)) {
+                        continue;
+                    }
+                    if (label.path().isEmpty()
+                            && !capacity.hasHubCapacity(
+                                origin, batchQuantity, startTime, flight.departureTime())) {
+                        continue;
+                    }
+                    if (!edgeHubCapacityOk(flight, destination, batchQuantity, capacity, deadline)) {
+                        continue;
+                    }
+                }
+
+                double edgeScore = edgeCongestionScore(flight, batchQuantity, destination, capacity);
+                double nextCongestion = Math.max(label.congestion, edgeScore);
+                List<Flight> newPath = new ArrayList<>(label.path().size() + 1);
+                newPath.addAll(label.path());
+                newPath.add(flight);
+                frontier.add(new Label(
+                    flight.destination(), flight.arrivalTime(), newPath, nextCongestion));
+            }
+        }
+
+        return bestPath;
+    }
+
+    private static boolean edgeHubCapacityOk(
+            Flight flight,
+            Airport destination,
+            int batchQuantity,
+            CapacityContext capacity,
+            ZonedDateTime deadline) {
+        Airport hub = flight.destination();
+        boolean isFinalDestination = hub.equals(destination);
+        ZonedDateTime holdUntil = isFinalDestination
+            ? flight.arrivalTime().plus(CapacityContext.FINAL_PICKUP_WINDOW)
+            : minTime(flight.arrivalTime().plus(CapacityContext.PROVISIONAL_HUB_HOLD), deadline);
+        if (!isFinalDestination) {
+            return capacity.hasHubCapacity(hub, batchQuantity, flight.arrivalTime(), holdUntil)
+                && !capacity.isHubNearLimit(hub, batchQuantity, flight.arrivalTime(), holdUntil);
+        }
+        return capacity.hasHubCapacity(hub, batchQuantity, flight.arrivalTime(), holdUntil);
+    }
+
+    private static double edgeCongestionScore(
+            Flight flight, int qty, Airport destination, CapacityContext capacity) {
+        double flightScore = 0.0;
+        int flightCap = flight.capacity();
+        if (flightCap > 0) {
+            flightScore = (capacity.flightLoad(flight) + qty) / (double) flightCap;
+        }
+        double hubScore = 0.0;
+        Airport hub = flight.destination();
+        if (!hub.equals(destination)) {
+            int hubCap = hub.storageCapacity();
+            if (hubCap > 0) {
+                hubScore = (capacity.storageOccupancy(hub) + qty) / (double) hubCap;
+            }
+        }
+        return CONGESTION_FLIGHT_WEIGHT * flightScore + CONGESTION_HUB_WEIGHT * hubScore;
+    }
+
+    private static ZonedDateTime minTime(ZonedDateTime a, ZonedDateTime b) {
+        return a.isBefore(b) ? a : b;
     }
 
     /** Ratio ocupación/capacidad de almacén de un aeropuerto, para el desempate de Dijkstra. */
@@ -393,16 +585,19 @@ public class RouteGenerator {
         Objects.requireNonNull(batch, "Batch cannot be null");
         Duration sla = batch.calculateSLA();
 
-        AssignedRoute filtered = earliestPathRoute(batch, sla, capacity);
-        if (filtered != null) {
-            return filtered;
+        // Nivel 1: respetando el umbral SUAVE (prefiere hubs holgados y reparte carga).
+        AssignedRoute strict = earliestPathRoute(batch, sla, capacity);
+        if (strict != null || capacity == null) {
+            return strict;
         }
-        if (capacity == null) {
-            return null;
-        }
-        // FALLBACK NIVEL 2: relajar solo el umbral suave de hubs. Capacidad DURA de almacén
-        // y de VUELO se mantienen — el sobrebookeo (antiguo nivel 3) se sustituye por split
-        // parcial en la semilla GA / applyCapacityAwareSplitting, no aquí.
+        // NIVEL 2 (último recurso): relajar SOLO el suave; la capacidad DURA de almacén
+        // sigue intacta, así que nunca se pasa del 100%.
+        //
+        // Sin este nivel bastaba con que un hub entrara en la banda 80–100% para que NINGÚN
+        // lote pudiera cruzarlo: findMaxRoutableQuantity sondea con 1 maleta y también
+        // fallaba, así que ni siquiera el split parcial servía y el lote entero caía a
+        // reintento. El efecto neto no era "menos carga en el hub" sino backlog creciente
+        // acumulado en los almacenes de ORIGEN, que también tienen capacidad.
         return earliestPathRoute(batch, sla, capacity.withHubSoftLimitRelaxed());
     }
 
@@ -418,6 +613,12 @@ public class RouteGenerator {
             );
 
             if (flightPath == null || flightPath.isEmpty()) {
+                return null;
+            }
+            // Aceptación final: el Dijkstra puede haber usado hold provisional ≠ layover real.
+            if (capacity != null
+                    && !capacity.pathFitsHardWithSoft(
+                        batch, flightPath, batch.quantity(), batch.destination())) {
                 return null;
             }
 
@@ -488,15 +689,11 @@ public class RouteGenerator {
                 }
             }
 
-            // FALLBACK NIVEL 2 sobre paths cacheados: solo relajar soft de hubs.
-            // No sobrebookear vuelos desde el cache (el split parcial lo hace la semilla).
-            if (capacity != null) {
-                AssignedRoute softOnly = pickCapacityFeasible(
-                    batch, candidates, capacity.withHubSoftLimitRelaxed());
-                if (softOnly != null) {
-                    return softOnly;
-                }
-            }
+            // Llegar aquí significa que ya fallaron los dos niveles: ni los caminos cacheados
+            // caben bajo el umbral suave, ni la búsqueda fresca encontró uno (ni siquiera con
+            // el suave relajado — ver generateFeasibleRouteUncached, que agota ambos niveles
+            // manteniendo intacta la capacidad DURA). El lote queda sin ruta este ciclo y pasa
+            // a reintento.
             return null;
         }
 
@@ -621,23 +818,7 @@ public class RouteGenerator {
         if (capacity == null) {
             return true;
         }
-        int qty = batch.quantity();
-        Airport destination = batch.destination();
-        for (Flight flight : path) {
-            if (!capacity.hasFlightCapacity(flight, qty)) {
-                return false;
-            }
-            Airport hub = flight.destination();
-            boolean isFinal = hub.equals(destination);
-            if (!isFinal) {
-                if (!capacity.hasHubCapacity(hub, qty) || capacity.isHubNearLimit(hub, qty)) {
-                    return false;
-                }
-            } else if (!capacity.hasHubCapacity(hub, qty)) {
-                return false;
-            }
-        }
-        return true;
+        return capacity.pathFitsHardWithSoft(batch, path, batch.quantity(), batch.destination());
     }
 
     private static List<List<Flight>> mergeUniquePaths(
@@ -660,10 +841,23 @@ public class RouteGenerator {
     }
 
     /**
-     * Busca una ruta factible con hasta 3 niveles de relajación de capacidad, NINGUNO de
-     * los cuales relaja jamás {@link CapacityContext#hasHubCapacity} — así un almacén nunca
-     * se desborda por esta vía, a costa de que el lote pueda quedar sin ruta este ciclo (va
-     * a reintento) si de verdad no existe ningún camino que respete su capacidad.
+     * Busca una ruta factible en dos niveles, NINGUNO de los cuales relaja jamás la capacidad
+     * DURA de almacén ({@link CapacityContext#hasHubCapacity}) — un almacén nunca se desborda
+     * por esta vía.
+     *
+     * <ol>
+     *   <li><b>Estricto</b>: respeta también el umbral SUAVE (80%), así que prefiere hubs
+     *       holgados y reparte carga.</li>
+     *   <li><b>Soft relajado</b> (último recurso): usa la banda 80–100% que sí existe, pero
+     *       nunca supera el 100%.</li>
+     * </ol>
+     *
+     * <p><b>Por qué el nivel 2 tiene que existir:</b> rechazar el lote NO evita ocupar
+     * almacén — las maletas se quedan físicamente en el almacén de ORIGEN (y sin ruta, sin
+     * fecha de salida). Sin este nivel, cuando los hubs entran en la banda 80–100% el
+     * planificador deja de emitir rutas y el desborde simplemente se traslada a los orígenes,
+     * que además acumulan backlog ciclo tras ciclo. Usar capacidad real disponible mientras
+     * el tope duro del 100% siga garantizado es estrictamente mejor que no transportar.</p>
      */
     private AssignedRoute generateFeasibleRouteUncached(
             ShipmentBatch batch,
@@ -678,18 +872,12 @@ public class RouteGenerator {
             return strict;
         }
 
+        // NIVEL 2: relajar SOLO el umbral suave. La capacidad dura de almacén y de vuelo
+        // siguen intactas (el sobrebookeo de vuelo lo resuelve el split parcial, no esto).
         int relaxedAttempts = Math.max(2, maxAttempts / 2);
-
-        // FALLBACK NIVEL 2: relajar solo el umbral suave de proximidad a hubs.
-        AssignedRoute relaxedSoft = tryGenerateRoute(
-            batch, sla, allowedFlights, relaxedAttempts, capacity.withHubSoftLimitRelaxed(), preferMultiHop);
-        if (relaxedSoft != null) {
-            return relaxedSoft;
-        }
-
-        // Ya no hay Nivel 3 (flight-relax): sobrebookear aquí concentraba carga y delegaba
-        // el desastre a applyCapacityAwareSplitting. Sin ruta → split parcial en semilla o retry.
-        return null;
+        return tryGenerateRoute(
+            batch, sla, allowedFlights, relaxedAttempts,
+            capacity.withHubSoftLimitRelaxed(), preferMultiHop);
     }
 
     private AssignedRoute tryGenerateRoute(

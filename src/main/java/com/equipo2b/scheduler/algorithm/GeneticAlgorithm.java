@@ -6,6 +6,7 @@ import com.equipo2b.scheduler.logic.SolutionEvaluator;
 import com.equipo2b.scheduler.model.*;
 
 import java.time.Duration;
+import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
@@ -55,8 +56,15 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
      */
     private double firstCycleBudgetRatio = 1.0;
     private boolean firstOptimizeDone = false;
-    /** Línea base de almacén del ciclo (para CapacityContext en construcción de rutas). */
+    /** Línea base escalar (opcional; preferir committedRoutes en timeline). */
     private volatile Map<Airport, Integer> storageBaseline = Map.of();
+    /** Rutas de ciclos previos: ATP time-phased real (llegadas futuras visibles). */
+    private volatile List<AssignedRoute> committedRoutes = List.of();
+    /**
+     * Timeline ATP de rutas comprometidas, reconstruida solo al cambiar baseline/rutas.
+     * Evita {@code fromSolution(committed)} en cada individuo/vecino (pico de RSS en VM 2 GB).
+     */
+    private volatile CapacityContext committedCapacityCache = CapacityContext.empty();
     
     /**
      * Constructor que inicializa el algoritmo genético con dependencias.
@@ -77,6 +85,26 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         this.airportManager = airportManager;
         this.routeGenerator = new RouteGenerator(flightPlan, airportManager);
         this.evaluator = new SolutionEvaluator(flightPlan, airportManager);
+    }
+
+    /** Capacidad de construcción: copia del cache ATP comprometido (+ baseline). */
+    private CapacityContext planningCapacity() {
+        return committedCapacityCache.copy();
+    }
+
+    /** Igual que {@link #planningCapacity()} más las rutas del individuo/ciclo actual. */
+    private CapacityContext planningCapacityWith(Collection<AssignedRoute> cycleRoutes) {
+        CapacityContext ctx = planningCapacity();
+        if (cycleRoutes != null) {
+            for (AssignedRoute route : cycleRoutes) {
+                ctx.applyRoute(route);
+            }
+        }
+        return ctx;
+    }
+
+    private void rebuildCommittedCapacityCache() {
+        committedCapacityCache = CapacityContext.fromSolution(committedRoutes, storageBaseline);
     }
     
     /**
@@ -121,7 +149,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 if (System.currentTimeMillis() >= constructionDeadline) {
                     return solution;
                 }
-                CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
+                CapacityContext capacity = planningCapacity();
 
                 // Shufflear lotes por individuo para generar diversidad genética
                 List<ShipmentBatch> shuffledBatches = new ArrayList<>(batches);
@@ -231,7 +259,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                     b -> b.ingressTime().toEpochSecond() / REGRET_BLOCK_WINDOW.toSeconds())
                 .thenComparing(Comparator.comparingInt(ShipmentBatch::quantity).reversed())
                 .thenComparing(ShipmentBatch::calculateSLA));
-        CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
+        CapacityContext capacity = planningCapacity();
 
         ArrayDeque<ShipmentBatch> queue = new ArrayDeque<>(orderedBatches);
         Map<String, Integer> nextSplitSuffix = new HashMap<>();
@@ -249,7 +277,13 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             }
 
             ShipmentBatch batch = queue.poll();
-            int originResidual = capacity.storageResidual(batch.origin());
+            // Residual del ORIGEN acotado a la ventana en que el lote realmente estará ahí
+            // ([ingreso, ingreso+SLA): más tarde ya habría incumplido). Con el residual
+            // GLOBAL, un origen que se satura en cualquier instante del horizonte
+            // comprometido daba 0 y marcaba unroutable todo lote nuevo — pero rechazarlo no
+            // libera nada: las maletas se quedan igual en ese almacén, solo que sin ruta.
+            int originResidual = capacity.storageResidual(
+                batch.origin(), batch.ingressTime(), batch.ingressTime().plus(batch.calculateSLA()));
             if (originResidual <= 0) {
                 unroutable++;
                 effectiveBatches.add(batch);
@@ -330,10 +364,21 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
 
         // Cuello de botella: mínimo residual entre almacén de origen, cada tramo de vuelo y
         // cada hub tocado (escalas intermedias y destino) a lo largo del camino del probe.
-        int bottleneck = capacity.storageResidual(batch.origin());
-        for (Flight flight : probeRoute.getFlights()) {
+        // Los residuales de almacén se miden en la ventana EXACTA de estancia de este camino
+        // (ya conocemos los horarios del probe), no sobre el pico global del horizonte: si no,
+        // un hub que se satura en otro momento del día reducía el cuello a 0 y el lote se
+        // partía en trozos mínimos o se descartaba sin motivo real.
+        List<Flight> probeFlights = probeRoute.getFlights();
+        int bottleneck = capacity.storageResidual(
+            batch.origin(), batch.ingressTime(), probeFlights.get(0).departureTime());
+        for (int i = 0; i < probeFlights.size(); i++) {
+            Flight flight = probeFlights.get(i);
             bottleneck = Math.min(bottleneck, capacity.flightResidual(flight));
-            bottleneck = Math.min(bottleneck, capacity.storageResidual(flight.destination()));
+            ZonedDateTime until = (i < probeFlights.size() - 1)
+                ? probeFlights.get(i + 1).departureTime()
+                : flight.arrivalTime().plus(CapacityContext.FINAL_PICKUP_WINDOW);
+            bottleneck = Math.min(bottleneck,
+                capacity.storageResidual(flight.destination(), flight.arrivalTime(), until));
         }
         int candidate = Math.min(bottleneck, batch.quantity() - 1);
 
@@ -347,20 +392,9 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
         return candidate >= 1 ? candidate : -1;
     }
 
-    /** Capacidad DURA (vuelo + almacén) para colocar {@code quantity} a lo largo de {@code route}. */
+    /** Capacidad DURA time-phased (vuelo + almacén) para colocar {@code quantity} en la ruta. */
     private boolean fitsAlongRoute(AssignedRoute route, int quantity, CapacityContext capacity) {
-        if (!capacity.hasHubCapacity(route.getBatch().origin(), quantity)) {
-            return false;
-        }
-        for (Flight flight : route.getFlights()) {
-            if (!capacity.hasFlightCapacity(flight, quantity)) {
-                return false;
-            }
-            if (!capacity.hasHubCapacity(flight.destination(), quantity)) {
-                return false;
-            }
-        }
-        return true;
+        return capacity.pathFitsHard(route.getBatch(), route.getFlights(), quantity);
     }
 
     /**
@@ -461,8 +495,61 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
                 child.addRoute(new AssignedRoute(route2));
             }
         }
-        
+
+        // NO se repara aquí a propósito. Dos padres ≤100% pueden mezclarse en un hijo que
+        // apila el mismo hub, pero repararlo en cada cruce era caro y contraproducente:
+        //  - Coste: la reparación reconstruye un contexto time-phased por hijo (población ×
+        //    generaciones = cientos de copias del timeline comprometido por corrida).
+        //  - Invariante: descartar rutas dentro del cruce rompe la premisa de que crossover y
+        //    mutación nunca REDUCEN el transporte, en la que se apoya el invariante de
+        //    initializePopulation/optimize (comparación por maletas contra la semilla).
+        // El desborde ya está penalizado con fuerza en el fitness (15,000/maleta), y la
+        // garantía dura la dan la reparación del mejor final (runEvolution) y la puerta de
+        // Scheduler.stripHardStorageOverflow antes de publicar. Buscar con penalización y
+        // reparar al final es más barato y no degrada la exploración.
         return child;
+    }
+
+    /**
+     * Rechaza rutas del hijo que violarían capacidad dura de almacén/vuelo dado el baseline.
+     * Orden: primero rutas que tocan hubs relativamente más libres (empaqueta más sin overflow).
+     */
+    private Solution repairHardStorageCapacity(Solution solution) {
+        if (solution == null || solution.getRoutes().isEmpty()) {
+            return solution != null ? solution : new Solution();
+        }
+        CapacityContext capacity = planningCapacity();
+        List<AssignedRoute> routes = new ArrayList<>(solution.getRoutes().values());
+        routes.sort(Comparator.comparingDouble(route -> routeHubPressure(route, capacity)));
+
+        Solution repaired = new Solution();
+        for (AssignedRoute route : routes) {
+            int qty = route.getBatch().quantity();
+            if (!fitsAlongRoute(route, qty, capacity)) {
+                continue;
+            }
+            repaired.addRoute(route);
+            capacity.applyRoute(route);
+        }
+        return repaired;
+    }
+
+    /** Presión relativa: mayor ocupación en hubs tocados → se intenta más tarde (o se descarta). */
+    private static double routeHubPressure(AssignedRoute route, CapacityContext capacity) {
+        double worst = 0.0;
+        List<Airport> hubs = new ArrayList<>();
+        hubs.add(route.getBatch().origin());
+        for (Flight flight : route.getFlights()) {
+            hubs.add(flight.destination());
+        }
+        for (Airport hub : hubs) {
+            int cap = hub.storageCapacity();
+            if (cap <= 0) {
+                continue;
+            }
+            worst = Math.max(worst, capacity.storageOccupancy(hub) / (double) cap);
+        }
+        return worst;
     }
     
     /**
@@ -493,8 +580,7 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
     private void mutate(Solution solution, List<ShipmentBatch> batches) {
         ThreadLocalRandom random = ThreadLocalRandom.current();
         int mutationCount = random.nextInt(1, Math.min(4, batches.size() + 1));
-        CapacityContext capacity = CapacityContext.fromSolution(
-            solution.getRoutes().values(), storageBaseline);
+        CapacityContext capacity = planningCapacityWith(solution.getRoutes().values());
 
         for (int m = 0; m < mutationCount; m++) {
             ShipmentBatch batch = batches.get(random.nextInt(batches.size()));
@@ -504,7 +590,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             // sin asignar en la semilla) no debe forzarse si ni siquiera cabe en el almacén de
             // origen; intentarlo solo produce búsquedas fallidas repetidas. Si YA tenía ruta,
             // removerla libera su propio espacio de origen, así que no aplica este chequeo.
-            if (existing == null && capacity.storageResidual(batch.origin()) < batch.quantity()) {
+            if (existing == null && capacity.storageResidual(
+                    batch.origin(),
+                    batch.ingressTime(),
+                    batch.ingressTime().plus(batch.calculateSLA())) < batch.quantity()) {
                 continue;
             }
 
@@ -739,7 +828,10 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             // Crear nueva generación
             List<Solution> nextGeneration = new ArrayList<>();
 
-            // Elitismo: preservar mejores soluciones
+            // Elitismo: preservar los mejores TAL CUAL. Repararlos aquí los degradaba
+            // generación a generación (cada pasada puede descartar alguna ruta más), que es
+            // justo lo contrario de lo que el elitismo debe garantizar. La reparación se
+            // aplica una sola vez, al mejor final de la corrida.
             int effectiveEliteCount = Math.min(eliteCount, Math.max(1, effectivePopulationSize / 8));
             for (int i = 0; i < effectiveEliteCount && i < population.size(); i++) {
                 nextGeneration.add(new Solution(population.get(i)));
@@ -761,19 +853,39 @@ public class GeneticAlgorithm implements OptimizationAlgorithm {
             population = nextGeneration;
         }
 
-        // Evaluar población final y retornar mejor
+        // Evaluar población final y retornar mejor (reparada: nunca publicar desborde duro)
         evaluatePopulation(population, effectivePopulationSize);
         population.sort(Comparator.comparingDouble(Solution::getFitness));
-        return new EvolutionResult(population.get(0), gensExecuted);
+        return new EvolutionResult(repairHardStorageCapacity(population.get(0)), gensExecuted);
     }
     
     /**
      * Propaga la ocupación de almacén preexistente (rutas de ciclos previos) al evaluador
      * y a la construcción capacity-aware de rutas de este ciclo.
      */
+    /** Solo baseline de construcción en CapacityContext. El fitness usa {@link #setEvaluatorStorageBaseline}. */
     public void setStorageBaseline(Map<Airport, Integer> baseline) {
         this.storageBaseline = baseline != null ? baseline : Map.of();
-        this.evaluator.setStorageBaseline(this.storageBaseline);
+        rebuildCommittedCapacityCache();
+    }
+
+    /**
+     * Rutas ya publicadas de ciclos previos: se cargan en la timeline time-phased para que
+     * ARRIVALs futuros (maletas en vuelo) reserven hub/capacidad real.
+     */
+    public void setCommittedRoutes(Collection<AssignedRoute> routes) {
+        this.committedRoutes = (routes == null || routes.isEmpty())
+            ? List.of()
+            : List.copyOf(new ArrayList<>(routes));
+        rebuildCommittedCapacityCache();
+    }
+
+    /**
+     * Solo el evaluador (fitness): pico ATP escalar para penalizar desbalance, sin usarlo
+     * como piso duro en {@link CapacityContext}.
+     */
+    public void setEvaluatorStorageBaseline(Map<Airport, Integer> baseline) {
+        this.evaluator.setStorageBaseline(baseline != null ? baseline : Map.of());
     }
 
     /**

@@ -585,16 +585,21 @@ public class SimulationController {
                 ZonedDateTime cyclePlanningTime = planningCursor;
                 ZonedDateTime cycleHorizon = cyclePlanningTime.plusMinutes(scenario.getSc());
                 
-                // 0b. Línea base de almacenes: ocupación REAL de cada aeropuerto al inicio de
-                //     la ventana, según las rutas YA planificadas en ciclos anteriores. Sin
-                //     esto, el GA/Tabú evaluaba cada ciclo en el vacío (un hub casi lleno por
-                //     rutas previas parecía vacío) y seguía concentrando carga hasta el
-                //     colapso. Con la base, el desborde duro y el balanceo convexo del
-                //     evaluador ven la ocupación absoluta.
-                if (cycleNumber > 1 && inventoryService != null && currentSolution != null
-                        && !currentSolution.getRoutes().isEmpty()) {
-                    scheduler.setStorageBaseline(inventoryService.calculateCurrentBags(
-                        currentSolution, cyclePlanningTime, currentBatches));
+                // 0b. ATP time-phased = rutas ya publicadas en timeline (committed).
+                //     Baseline escalar = solo unrouted en origen (maletas en suelo sin ruta).
+                //     Evaluador: pico ATP para penalizar desbalance en fitness (no es piso duro).
+                Solution baselineSolution = currentSolution != null ? currentSolution : new Solution();
+                scheduler.setCommittedRoutes(baselineSolution.getRoutes().values());
+                if (inventoryService != null) {
+                    scheduler.setStorageBaseline(
+                        inventoryService.calculateUnroutedOriginOccupancy(
+                            baselineSolution, cyclePlanningTime, currentBatches));
+                    scheduler.setEvaluatorStorageBaseline(
+                        inventoryService.calculatePlanningOccupancy(
+                            baselineSolution, cyclePlanningTime, null, currentBatches));
+                } else {
+                    scheduler.setStorageBaseline(Map.of());
+                    scheduler.setEvaluatorStorageBaseline(Map.of());
                 }
 
                 // 0c. Aviso de warm-up al frontend: confirma que los datos de envíos ya
@@ -1124,37 +1129,39 @@ public class SimulationController {
                 // mide el costo real de la semilla y decide con eso cuántos individuos
                 // caben; el Tabú recibe todo el Ta restante como presupuesto dinámico.
                 // populationSize/maxIterations son TOPES — quien gobierna es el deadline.
-                gaConfig.setInt("populationSize", 16);
+                gaConfig.setInt("populationSize", 12);
                 gaConfig.setInt("generations", 40);
                 gaConfig.setDouble("mutationRate", 0.15);
                 gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
-                gaConfig.setInt("routeSearchAttempts", 4);
+                gaConfig.setInt("routeSearchAttempts", 3);
                 gaConfig.setInt("routeCachedVariants", 2);
-                gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
+                // Ciclo 1 (warm-up web): timeline time-phased + 10k+ lotes; presupuesto
+                // corto para no cruzar MemoryMax/OOM en la VM de 2 GB.
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.20);
                 // Tope holgado: medido que 400 iteraciones terminan ANTES del presupuesto
                 // dinámico; quien debe cortar es el deadline, no el contador.
                 tabuConfig.setInt("maxIterations", 2_000);
                 tabuConfig.setInt("tabuTenure", 8);
                 tabuConfig.setInt("neighborhoodSize", 4);
-                tabuConfig.setInt("routeSearchAttempts", 4);
+                tabuConfig.setInt("routeSearchAttempts", 3);
                 tabuConfig.setInt("routeCachedVariants", 2);
                 break;
 
             case COLLAPSE_SIMULATION:
                 // Misma calibración anytime que PERIOD (2 CPU / 2 GB).
-                gaConfig.setInt("populationSize", 16);
+                gaConfig.setInt("populationSize", 12);
                 gaConfig.setInt("generations", 40);
                 gaConfig.setDouble("mutationRate", 0.15);
                 gaConfig.setInt("stagnationLimit", 6);
                 gaConfig.setBoolean("parallelEnabled", false);
-                gaConfig.setInt("routeSearchAttempts", 4);
+                gaConfig.setInt("routeSearchAttempts", 3);
                 gaConfig.setInt("routeCachedVariants", 2);
-                gaConfig.setDouble("firstCycleBudgetRatio", 0.30);
+                gaConfig.setDouble("firstCycleBudgetRatio", 0.20);
                 tabuConfig.setInt("maxIterations", 2_000);
                 tabuConfig.setInt("tabuTenure", 8);
                 tabuConfig.setInt("neighborhoodSize", 4);
-                tabuConfig.setInt("routeSearchAttempts", 4);
+                tabuConfig.setInt("routeSearchAttempts", 3);
                 tabuConfig.setInt("routeCachedVariants", 2);
                 break;
         }

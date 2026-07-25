@@ -219,9 +219,11 @@ public class Scheduler {
         }
         
         // 3. Ejecutar algoritmo primario con pedidos consumidos.
-        //    La línea base de almacenes (carga de ciclos previos) se aplica SOLO durante
-        //    la optimización de la ventana nueva: los candidatos del ciclo se evalúan
-        //    contra la ocupación absoluta real de cada almacén.
+        //    ATP time-phased = rutas ya publicadas en timeline (committed). Baseline escalar
+        //    vacío en CapacityContext; el evaluador recibe pico ATP por setEvaluatorStorageBaseline.
+        //    Solo las rutas AÚN VIVAS: ver activeRoutesSince (poda de historia).
+        List<AssignedRoute> committedActive = activeRoutesSince(currentSolution.getRoutes().values(), windowStart);
+        applyCommittedRoutes(committedActive);
         applyStorageBaseline(pendingStorageBaseline);
         // Red vacía = primer ciclo real (warm start). Se calcula ANTES de optimizar
         // porque currentSolution se reemplaza más abajo con la acumulada de este ciclo.
@@ -274,9 +276,22 @@ public class Scheduler {
             }
         }
 
-        // Retirar la línea base ANTES de evaluar la solución ACUMULADA: la acumulada ya
-        // contiene las rutas de ciclos previos — mantener la base contaría su carga 2 veces.
+        // Puerta dura ANTES de acumular: desborde de almacén = inviabilidad (mismo rango
+        // de importancia que violar factibilidad de tiempo en construcción). Mejor dejar
+        // maletas sin ruta este ciclo que publicar >100%.
+        int beforeGate = finalSolution.getRoutes().size();
+        finalSolution = stripHardStorageOverflow(
+            finalSolution, committedActive, pendingStorageBaseline);
+        int stripped = beforeGate - finalSolution.getRoutes().size();
+        if (stripped > 0) {
+            System.out.println("⛔ Capacidad dura: " + stripped
+                + " ruta(s) del ciclo descartadas para no superar 100% de almacén");
+        }
+
+        // Retirar committed/baseline ANTES de evaluar la solución ACUMULADA.
+        applyCommittedRoutes(List.of());
         applyStorageBaseline(null);
+        setEvaluatorStorageBaseline(Map.of());
         
         // 5. ACUMULAR rutas nuevas a la solución existente (PLANIFICACIÓN INCREMENTAL)
         Solution accumulatedSolution = new Solution(currentSolution);
@@ -319,6 +334,13 @@ public class Scheduler {
                 System.out.println("🧩 División por capacidad: " + splits + " sub-lotes ubicados (envíos divididos en vuelos distintos)");
             }
             refreshFrenteCalienteAfterSplitting(accumulatedSolution, splitTouchedRoutes);
+            // Segunda puerta dura: el splitting puede añadir hops DESPUÉS del strip previo.
+            int removedAfterSplit = enforceHardStorageAfterSplit(
+                accumulatedSolution, splitTouchedRoutes, finalSolution, windowStart);
+            if (removedAfterSplit > 0) {
+                System.out.println("⛔ Capacidad dura post-split: " + removedAfterSplit
+                    + " ruta(s) tocadas descartadas para no superar 100% de almacén");
+            }
         }
 
         // 6. Validar SOLO las rutas nuevas de este ciclo (finalSolution), no la acumulada
@@ -858,12 +880,15 @@ public class Scheduler {
         // placeBagsInLeftover la usa para no reubicar maletas en un almacén sin espacio real:
         // a diferencia de la capacidad de vuelo, la de almacén no tiene corrección posterior.
         Set<String> hadRoute = new HashSet<>();
-        CapacityContext hubCapacity = CapacityContext.fromBaseline(pendingStorageBaseline);
+        // ATP time-phased: la solución acumulada VIVA en timeline (no solo baseline escalar
+        // + rutas del ciclo). Así el peel/rehome ve layovers futuros de ciclos previos.
+        CapacityContext hubCapacity = CapacityContext.fromSolution(
+            activeRoutesSince(solution.getRoutes().values(), windowStart),
+            pendingStorageBaseline != null ? pendingStorageBaseline : Map.of());
         for (ShipmentBatch batch : cycleBatches) {
             AssignedRoute existingRoute = solution.getRoute(batch.batchId());
             if (existingRoute != null) {
                 hadRoute.add(batch.batchId());
-                hubCapacity.applyRoute(existingRoute);
             }
         }
 
@@ -1075,13 +1100,20 @@ public class Scheduler {
             if (remaining < effectiveMin) break;
             int leftover = f.capacity() - usedByFlight.getOrDefault(f.flightId(), 0);
             if (leftover < effectiveMin) continue;
-            // Capacidad DURA de almacén en destino — nunca se relaja (mismo criterio que
+            // Capacidad DURA de almacén — nunca se relaja (mismo criterio que
             // CapacityContext.hasHubCapacity en RouteGenerator): sin esto, un remanente podía
             // reubicarse en un vuelo directo con espacio de sobra pero cuyo destino ya no
             // tiene almacén libre, empujándolo sobre el 100%.
-            int hubResidual = t.destination().storageCapacity() - hubCapacity.storageOccupancy(t.destination());
+            // Medido en la VENTANA REAL de estancia de este sub-lote (origen hasta que
+            // despega; destino desde que aterriza hasta el recojo), no sobre el pico global
+            // del horizonte: este es el último recurso para colocar maletas, y usar el pico
+            // global descartaba vuelos con hueco real solo porque el almacén se satura en
+            // otro momento del día.
+            int hubResidual = hubCapacity.storageResidual(
+                t.destination(), f.arrivalTime(), f.arrivalTime().plus(CapacityContext.FINAL_PICKUP_WINDOW));
             if (hubResidual < effectiveMin) continue;
-            int originResidual = hubCapacity.storageResidual(t.origin());
+            int originResidual = hubCapacity.storageResidual(
+                t.origin(), t.ingressTime(), f.departureTime());
             if (originResidual < effectiveMin) continue;
             int take = Math.min(Math.min(leftover, remaining), Math.min(hubResidual, originResidual));
             int idx = splitCounter.merge(rem.sourceId(), 1, Integer::sum);
@@ -1287,22 +1319,212 @@ public class Scheduler {
      * anteriores) para el PRÓXIMO ciclo. Se aplica a los evaluadores de GA/Tabú solo
      * mientras se optimiza la ventana nueva, y se retira antes de re-evaluar la solución
      * ACUMULADA (que ya contiene esas rutas — mantenerla contaría la carga dos veces).
+     *
+     * <p>Para construcción dura preferir {@link #setCommittedRoutes}: timeline time-phased.
+     * Este mapa escalar queda para compatibilidad / piso puntual (p.ej. vacío).</p>
      */
     public void setStorageBaseline(Map<Airport, Integer> baseline) {
         this.pendingStorageBaseline = baseline;
     }
 
-    private Map<Airport, Integer> pendingStorageBaseline;
+    /**
+     * Pico ATP escalar solo para el fitness (desbalance / convexo). No se usa como piso
+     * duro en {@link CapacityContext} de construcción.
+     */
+    public void setEvaluatorStorageBaseline(Map<Airport, Integer> baseline) {
+        Map<Airport, Integer> safe = baseline != null ? baseline : Map.of();
+        evaluator.setStorageBaseline(safe);
+        if (primaryAlgorithm instanceof GeneticAlgorithm ga) {
+            ga.setEvaluatorStorageBaseline(safe);
+        } else if (primaryAlgorithm instanceof TabuSearch tabuPrimary) {
+            tabuPrimary.setEvaluatorStorageBaseline(safe);
+        }
+        tabuSearch.setEvaluatorStorageBaseline(safe);
+    }
 
-    /** Aplica (o retira, con null) la línea base en TODOS los evaluadores involucrados. */
+    /**
+     * Rutas ya publicadas: ATP time-phased (ARRIVAL futuro reserva hub en su intervalo).
+     */
+    public void setCommittedRoutes(Collection<AssignedRoute> routes) {
+        this.pendingCommittedRoutes = routes == null
+            ? List.of()
+            : List.copyOf(new ArrayList<>(routes));
+    }
+
+    private Map<Airport, Integer> pendingStorageBaseline;
+    private List<AssignedRoute> pendingCommittedRoutes = List.of();
+
+    /**
+     * Rutas todavía RELEVANTES para la capacidad futura: las que aún ocupan (o van a ocupar)
+     * algún almacén en o después de {@code since}. Una ruta cuyas maletas ya fueron recogidas
+     * no reserva nada hacia adelante.
+     *
+     * <p><b>Por qué es imprescindible:</b> la timeline time-phased indexa cada estancia por
+     * timestamp, y los ingresos de lotes tienen granularidad de minuto, así que cada ciclo
+     * añade ~1 marca temporal NUEVA por lote. Alimentarla con la solución ACUMULADA completa
+     * hace que crezca sin techo (tras 130 ciclos son 100k+ rutas y cientos de miles de
+     * entradas en TreeMaps) — y ese coste se paga en CADA copia del contexto, es decir por
+     * individuo del GA y por vecino del Tabú. Podando, la timeline queda acotada al horizonte
+     * vivo (como mucho SLA=48h por delante), que es lo único que puede influir en decisiones
+     * futuras. Sin esto el consumo de memoria y el tiempo por ciclo crecen con la duración de
+     * la simulación, no con el trabajo real de cada ciclo.</p>
+     */
+    private static List<AssignedRoute> activeRoutesSince(
+            Collection<AssignedRoute> routes, ZonedDateTime since) {
+        if (routes == null || routes.isEmpty()) {
+            return List.of();
+        }
+        if (since == null) {
+            return List.copyOf(new ArrayList<>(routes));
+        }
+        List<AssignedRoute> active = new ArrayList<>();
+        for (AssignedRoute route : routes) {
+            // getDeliveredTime = última liberación de almacén de la ruta (llegada + recojo).
+            if (!route.getDeliveredTime().isBefore(since)) {
+                active.add(route);
+            }
+        }
+        return active;
+    }
+
+    /**
+     * Descarta rutas del ciclo que, sumadas a la timeline comprometida, superarían el 100%
+     * duro de algún almacén. Preferencia: conservar rutas que tocan hubs más libres.
+     */
+    private Solution stripHardStorageOverflow(
+            Solution cycleSolution,
+            Collection<AssignedRoute> committed,
+            Map<Airport, Integer> baseline) {
+        if (cycleSolution == null || cycleSolution.getRoutes().isEmpty()) {
+            return cycleSolution != null ? cycleSolution : new Solution();
+        }
+        CapacityContext capacity = CapacityContext.fromSolution(
+            committed, baseline != null ? baseline : Map.of());
+        List<AssignedRoute> routes = new ArrayList<>(cycleSolution.getRoutes().values());
+        routes.sort(Comparator.comparingDouble(route -> {
+            double worst = 0.0;
+            int occ = capacity.storageOccupancy(route.getBatch().origin());
+            int cap = route.getBatch().origin().storageCapacity();
+            if (cap > 0) {
+                worst = Math.max(worst, occ / (double) cap);
+            }
+            for (Flight flight : route.getFlights()) {
+                Airport hub = flight.destination();
+                int hCap = hub.storageCapacity();
+                if (hCap > 0) {
+                    worst = Math.max(worst, capacity.storageOccupancy(hub) / (double) hCap);
+                }
+            }
+            return worst;
+        }));
+
+        Solution kept = new Solution();
+        for (AssignedRoute route : routes) {
+            int qty = route.getBatch().quantity();
+            // Solo almacén: el overbook de VUELO es intencional hasta applyCapacityAwareSplitting.
+            if (!capacity.pathFitsWarehouseHard(route.getBatch(), route.getFlights(), qty)) {
+                continue;
+            }
+            kept.addRoute(route);
+            capacity.applyRoute(route);
+        }
+        // Solo re-evaluar si la original venía evaluada (comparar el fitness contra 0.0 era
+        // un proxy erróneo: un fitness legítimamente 0 dejaba `kept` sin evaluar y con el
+        // Double.MAX_VALUE por defecto).
+        if (cycleSolution.isEvaluated()) {
+            kept.setFitness(evaluator.evaluate(kept));
+        }
+        return kept;
+    }
+
+    /**
+     * Tras el splitting: vuelve a aplicar la puerta dura sobre rutas tocadas este ciclo,
+     * con el resto de la solución acumulada ya en la timeline.
+     */
+    private int enforceHardStorageAfterSplit(
+            Solution accumulated,
+            List<AssignedRoute> splitTouched,
+            Solution cycleSolution,
+            ZonedDateTime windowStart) {
+        Set<String> touchedIds = new HashSet<>();
+        if (cycleSolution != null) {
+            for (AssignedRoute route : cycleSolution.getRoutes().values()) {
+                touchedIds.add(route.getBatch().batchId());
+            }
+        }
+        if (splitTouched != null) {
+            for (AssignedRoute route : splitTouched) {
+                touchedIds.add(route.getBatch().batchId());
+            }
+        }
+        if (touchedIds.isEmpty()) {
+            return 0;
+        }
+
+        List<AssignedRoute> frozen = new ArrayList<>();
+        List<AssignedRoute> candidates = new ArrayList<>();
+        for (AssignedRoute route : accumulated.getRoutes().values()) {
+            if (touchedIds.contains(route.getBatch().batchId())) {
+                candidates.add(route);
+            } else {
+                frozen.add(route);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return 0;
+        }
+
+        CapacityContext capacity = CapacityContext.fromSolution(
+            activeRoutesSince(frozen, windowStart), Map.of());
+        candidates.sort(Comparator.comparingDouble(route -> {
+            double worst = 0.0;
+            for (Flight flight : route.getFlights()) {
+                Airport hub = flight.destination();
+                int hCap = hub.storageCapacity();
+                if (hCap > 0) {
+                    worst = Math.max(worst, capacity.storageOccupancy(hub) / (double) hCap);
+                }
+            }
+            return worst;
+        }));
+
+        int removed = 0;
+        for (AssignedRoute route : candidates) {
+            int qty = route.getBatch().quantity();
+            if (!capacity.pathFitsWarehouseHard(route.getBatch(), route.getFlights(), qty)) {
+                // Retirar eventos pendientes: si no, quedan fantasma en el fitness acumulado.
+                fitnessTracker.replacePendingEvents(route, null);
+                accumulated.removeRoute(route.getBatch().batchId());
+                frenteCaliente.remove(route.getBatch().batchId());
+                if (cycleSolution != null) {
+                    cycleSolution.removeRoute(route.getBatch().batchId());
+                }
+                removed++;
+                continue;
+            }
+            capacity.applyRoute(route);
+        }
+        return removed;
+    }
+
+    /** Aplica (o retira, con null) la línea base escalar en algoritmos (CapacityContext). */
     private void applyStorageBaseline(Map<Airport, Integer> baseline) {
-        evaluator.setStorageBaseline(baseline);
         if (primaryAlgorithm instanceof GeneticAlgorithm ga) {
             ga.setStorageBaseline(baseline);
         } else if (primaryAlgorithm instanceof TabuSearch tabuPrimary) {
             tabuPrimary.setStorageBaseline(baseline);
         }
         tabuSearch.setStorageBaseline(baseline);
+    }
+
+    private void applyCommittedRoutes(Collection<AssignedRoute> routes) {
+        Collection<AssignedRoute> safe = routes != null ? routes : List.of();
+        if (primaryAlgorithm instanceof GeneticAlgorithm ga) {
+            ga.setCommittedRoutes(safe);
+        } else if (primaryAlgorithm instanceof TabuSearch tabuPrimary) {
+            tabuPrimary.setCommittedRoutes(safe);
+        }
+        tabuSearch.setCommittedRoutes(safe);
     }
 
     /**

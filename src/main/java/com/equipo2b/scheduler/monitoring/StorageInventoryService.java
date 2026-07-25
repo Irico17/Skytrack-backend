@@ -54,6 +54,72 @@ public class StorageInventoryService {
         return inventory;
     }
 
+    /**
+     * Solo maletas SIN ruta aún sentadas en origen (faltante por base). Es el piso correcto
+     * para construcción: no incluye routed (eso va en la timeline) ni picos ATP futuros.
+     */
+    public Map<Airport, Integer> calculateUnroutedOriginOccupancy(
+            Solution solution,
+            ZonedDateTime currentTime,
+            List<ShipmentBatch> knownBatches) {
+        Map<String, Integer> routedBagsByBase = new HashMap<>();
+        if (solution != null && !solution.getRoutes().isEmpty()) {
+            for (AssignedRoute route : solution.getRoutes().values()) {
+                routedBagsByBase.merge(
+                    baseBatchId(route.getBatch().batchId()),
+                    route.getBatch().quantity(),
+                    Integer::sum);
+            }
+        }
+        Map<Airport, Integer> inventory = new HashMap<>();
+        applyUnroutedOriginInventory(knownBatches, currentTime, routedBagsByBase, inventory);
+        return inventory;
+    }
+
+    /**
+     * Ocupación de planificación (ATP / scheduled receipts): inventario en suelo en
+     * {@code now} más el pico proyectado al reaplicar eventos de rutas YA comprometidas
+     * con timestamp después de {@code now}.
+     *
+     * <p>Sin esto, las maletas en vuelo hacia un hub (ARRIVAL futuro) son invisibles al
+     * residual del ciclo: el planificador ve "hub vacío" y vuelve a concentrar hops ahí
+     * hasta el desborde live (&gt;100%).</p>
+     *
+     * <p>{@code horizon} null = reservar <strong>todas</strong> las llegadas/salidas futuras
+     * comprometidas (no solo Sc). Truncar a Sc dejaba llegar inbound intercontinental
+     * "después de la ventana" sin reserva → picos 130%+ en hubs como UMMS.</p>
+     */
+    public Map<Airport, Integer> calculatePlanningOccupancy(
+            Solution solution,
+            ZonedDateTime now,
+            ZonedDateTime horizon,
+            List<ShipmentBatch> knownBatches) {
+        Map<Airport, Integer> current = calculateCurrentBags(solution, now, knownBatches);
+        if (now == null || solution == null || solution.getRoutes().isEmpty()) {
+            return current;
+        }
+
+        Map<Airport, Integer> running = new HashMap<>(current);
+        Map<Airport, Integer> peak = new LinkedHashMap<>(current);
+
+        List<StorageEvent> events = getSortedEvents(solution);
+        for (StorageEvent event : events) {
+            if (!event.timestamp().isAfter(now)) {
+                continue;
+            }
+            if (horizon != null && event.timestamp().isAfter(horizon)) {
+                break;
+            }
+            int delta = event.type() == StorageEventType.ARRIVAL
+                ? event.quantity()
+                : -event.quantity();
+            int next = Math.max(0, running.getOrDefault(event.airport(), 0) + delta);
+            running.put(event.airport(), next);
+            peak.merge(event.airport(), next, Math::max);
+        }
+        return peak;
+    }
+
     private Map<String, Integer> applyRoutedStorageEvents(
             Solution solution,
             ZonedDateTime currentTime,

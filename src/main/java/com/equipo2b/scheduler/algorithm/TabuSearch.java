@@ -35,6 +35,9 @@ public class TabuSearch implements OptimizationAlgorithm {
     private int routeCachedVariants = 4;
     private long maxTimeMillis = 0;  // 0 = sin límite; >0 = deadline duro (parte del presupuesto Ta)
     private volatile Map<Airport, Integer> storageBaseline = Map.of();
+    private volatile List<AssignedRoute> committedRoutes = List.of();
+    /** Timeline ATP comprometida cacheada; evita rebuild por vecino (pico RSS en VM 2 GB). */
+    private volatile CapacityContext committedCapacityCache = CapacityContext.empty();
 
     // Sin topes por cantidad de rutas: el DEADLINE gobierna cuánto se explora (diseño
     // anytime). Con 400 rutas cada iteración es barata y caben cientos; con 3.000 caben
@@ -53,6 +56,24 @@ public class TabuSearch implements OptimizationAlgorithm {
         this.airportManager = Objects.requireNonNull(airportManager, "AirportManager cannot be null");
         this.routeGenerator = new RouteGenerator(flightPlan, airportManager);
         this.evaluator = new SolutionEvaluator(flightPlan, airportManager);
+    }
+
+    private CapacityContext planningCapacity() {
+        return committedCapacityCache.copy();
+    }
+
+    private CapacityContext planningCapacityWith(Collection<AssignedRoute> cycleRoutes) {
+        CapacityContext ctx = planningCapacity();
+        if (cycleRoutes != null) {
+            for (AssignedRoute route : cycleRoutes) {
+                ctx.applyRoute(route);
+            }
+        }
+        return ctx;
+    }
+
+    private void rebuildCommittedCapacityCache() {
+        committedCapacityCache = CapacityContext.fromSolution(committedRoutes, storageBaseline);
     }
     
     /**
@@ -266,8 +287,7 @@ public class TabuSearch implements OptimizationAlgorithm {
         int failedCount = 0;
         
         for (ShipmentBatch batch : affectedBatches) {
-            CapacityContext capacity = CapacityContext.fromSolution(
-                updatedSolution.getRoutes().values(), storageBaseline);
+            CapacityContext capacity = planningCapacityWith(updatedSolution.getRoutes().values());
             AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(
                 batch,
                 alternatives,
@@ -310,8 +330,7 @@ public class TabuSearch implements OptimizationAlgorithm {
     public Solution replan(Solution currentSolution, List<ShipmentBatch> newBatches) {
         Solution updatedSolution = new Solution(currentSolution);
         
-        CapacityContext capacity = CapacityContext.fromSolution(
-            updatedSolution.getRoutes().values(), storageBaseline);
+        CapacityContext capacity = planningCapacityWith(updatedSolution.getRoutes().values());
         for (ShipmentBatch batch : newBatches) {
             AssignedRoute newRoute = routeGenerator.generateFeasibleRoute(batch, capacity);
             if (newRoute != null) {
@@ -334,7 +353,7 @@ public class TabuSearch implements OptimizationAlgorithm {
      */
     private Solution generateInitialSolution(List<ShipmentBatch> batches) {
         Solution solution = new Solution();
-        CapacityContext capacity = CapacityContext.fromBaseline(storageBaseline);
+        CapacityContext capacity = planningCapacity();
         long deadline = maxTimeMillis > 0 ? System.currentTimeMillis() + maxTimeMillis : Long.MAX_VALUE;
         int routed = 0;
         for (ShipmentBatch batch : batches) {
@@ -582,8 +601,7 @@ public class TabuSearch implements OptimizationAlgorithm {
         int regenCount = Math.min(shuffled.size(), random.nextInt(1, 3));
         Solution neighbor = new Solution(current);
         String firstBatchId = null;
-        CapacityContext capacity = CapacityContext.fromSolution(
-            neighbor.getRoutes().values(), storageBaseline);
+        CapacityContext capacity = planningCapacityWith(neighbor.getRoutes().values());
 
         List<String> toRegen = new ArrayList<>(shuffled.subList(0, regenCount));
         for (int i = 0; i < toRegen.size(); i++) {
@@ -594,7 +612,10 @@ public class TabuSearch implements OptimizationAlgorithm {
             capacity.removeRoute(existing);
             ShipmentBatch batch = existing.getBatch();
             AssignedRoute newRoute = routeGenerator.generateFeasibleRouteNoCache(batch, capacity, true);
-            if (newRoute != null) {
+            // Alivio real: rechazar regeneraciones que siguen usando el hub congestionado
+            // como ESCALA cuando el lote no es O/D de ese hub. Soft-relax del generador
+            // podía "aliviar" reeligiendo el mismo hub caliente.
+            if (newRoute != null && !stillUsesCongestedLayover(newRoute, batch, congestedHub)) {
                 neighbor.addRoute(newRoute);
                 capacity.applyRoute(newRoute);
             } else {
@@ -604,9 +625,23 @@ public class TabuSearch implements OptimizationAlgorithm {
         return new Move(neighbor, firstBatchId != null ? firstBatchId : "");
     }
 
+    /** True si la ruta nueva sigue usando {@code hub} como layover y el lote no es O/D de ese hub. */
+    private static boolean stillUsesCongestedLayover(
+            AssignedRoute route, ShipmentBatch batch, Airport hub) {
+        if (batch.origin().equals(hub) || batch.destination().equals(hub)) {
+            return false; // O/D obligatorio: no es un fallo del alivio
+        }
+        List<Flight> flights = route.getFlights();
+        for (int i = 0; i < flights.size() - 1; i++) {
+            if (flights.get(i).destination().equals(hub)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private CapacityContext capacityWithoutBatch(Solution current, String batchId) {
-        CapacityContext capacity = CapacityContext.fromSolution(
-            current.getRoutes().values(), storageBaseline);
+        CapacityContext capacity = planningCapacityWith(current.getRoutes().values());
         AssignedRoute existing = current.getRoute(batchId);
         if (existing != null) {
             capacity.removeRoute(existing);
@@ -621,8 +656,7 @@ public class TabuSearch implements OptimizationAlgorithm {
         }
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
-        CapacityContext capacity = CapacityContext.fromSolution(
-            neighbor.getRoutes().values(), storageBaseline);
+        CapacityContext capacity = planningCapacityWith(neighbor.getRoutes().values());
         int count = random.nextInt(2, Math.min(4, batches.size() + 1));
         String firstBatchId = null;
         
@@ -656,8 +690,7 @@ public class TabuSearch implements OptimizationAlgorithm {
 
         ThreadLocalRandom random = ThreadLocalRandom.current();
         Solution neighbor = new Solution(current);
-        CapacityContext capacity = CapacityContext.fromSolution(
-            neighbor.getRoutes().values(), storageBaseline);
+        CapacityContext capacity = planningCapacityWith(neighbor.getRoutes().values());
         int count = random.nextInt(2, Math.min(4, batchIds.size() + 1));
         String firstBatchId = null;
         
@@ -708,9 +741,21 @@ public class TabuSearch implements OptimizationAlgorithm {
      * Propaga la ocupación de almacén preexistente (rutas de ciclos previos) al evaluador
      * y a la construcción capacity-aware / alivio de congestión de almacén.
      */
+    /** Solo baseline de construcción en CapacityContext. El fitness usa {@link #setEvaluatorStorageBaseline}. */
     public void setStorageBaseline(Map<Airport, Integer> baseline) {
         this.storageBaseline = baseline != null ? baseline : Map.of();
-        this.evaluator.setStorageBaseline(this.storageBaseline);
+        rebuildCommittedCapacityCache();
+    }
+
+    public void setCommittedRoutes(Collection<AssignedRoute> routes) {
+        this.committedRoutes = (routes == null || routes.isEmpty())
+            ? List.of()
+            : List.copyOf(new ArrayList<>(routes));
+        rebuildCommittedCapacityCache();
+    }
+
+    public void setEvaluatorStorageBaseline(Map<Airport, Integer> baseline) {
+        this.evaluator.setStorageBaseline(baseline != null ? baseline : Map.of());
     }
 
     /**
