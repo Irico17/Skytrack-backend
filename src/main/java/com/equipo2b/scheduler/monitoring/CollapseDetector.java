@@ -99,10 +99,26 @@ public class CollapseDetector {
         // 1. Calcular saturación promedio del sistema
         double occupancy = calculateSystemOccupancy(solution);
 
-        // 2. Calcular porcentaje de pedidos no atendibles
-        double unserviceablePercentage = totalBatches > 0
-            ? (failedBatches * 100.0 / totalBatches)
+        // 2. Calcular porcentaje de pedidos no atendibles.
+        //
+        //    El denominador es atendidos + no atendidos, NO solo los atendidos. Los dos
+        //    contadores que llegan aquí son poblaciones distintas (`totalBatches` cuenta
+        //    entradas de la solución, que se inflan con los sub-lotes -S1/-S2; los fallidos
+        //    cuentan lotes sin ruta más los que incumplen SLA), así que dividir uno entre el
+        //    otro podía pasar de 100: justo cuando la red colapsa de verdad. Con el dataset
+        //    de colapso del curso salió 1713/1459 = 117.4%, y CollapseStatus —que valida el
+        //    rango— lanzaba IllegalArgumentException desde el hilo de la simulación: el
+        //    escenario se caía con "Simulación falló" en el momento exacto en que debía
+        //    limitarse a reportar el colapso que acababa de detectar.
+        long attended = Math.max(0, totalBatches);
+        long unserviceable = Math.max(0, failedBatches);
+        long universe = attended + unserviceable;
+        double unserviceablePercentage = universe > 0
+            ? (unserviceable * 100.0 / universe)
             : 0.0;
+        // Cinturón de seguridad: ninguna futura forma de contar lotes debe poder tumbar la
+        // simulación por un porcentaje fuera de rango.
+        unserviceablePercentage = Math.min(100.0, Math.max(0.0, unserviceablePercentage));
 
         // 3. Determinar CollapseLevel según umbrales
         CollapseLevel level = determineCollapseLevel(occupancy, unserviceablePercentage);
@@ -135,7 +151,9 @@ public class CollapseDetector {
         // Usar CapacityMonitor si está disponible (métrica real)
         if (capacityMonitor != null) {
             double realOccupancy = capacityMonitor.calculateAverageFlightOccupancy(solution);
-            return realOccupancy * 100.0;  // Convertir a porcentaje
+            // Acotado a [0,100]: un vuelo sobrecargado puede dar ratio > 1 y CollapseStatus
+            // valida el rango, con lo que el hilo de simulación moriría por reportar saturación.
+            return Math.min(100.0, Math.max(0.0, realOccupancy * 100.0));
         }
 
         // Fallback: estimar ocupación basada en fitness (menos preciso pero no requiere monitor)
