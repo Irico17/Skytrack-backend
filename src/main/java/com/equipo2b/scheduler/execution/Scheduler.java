@@ -349,7 +349,13 @@ public class Scheduler {
         //    fueron validadas cuando se crearon — no vuelven a cambiar (AssignedRoute es
         //    inmutable). Con miles de rutas acumuladas este segundo recorrido completo era
         //    puro trabajo duplicado solo para loguear.
-        ValidationReport validationReport = validator.validate(finalSolution);
+        //    Se pasa el piso de maletas SIN ruta ya en suelo: sin él, "almacén=0 violaciones"
+        //    solo quería decir "las rutas nuevas por sí solas no desbordan", y podía convivir
+        //    con un aeropuerto al 109% en pantalla. (Las rutas comprometidas de ciclos previos
+        //    no entran como piso porque su ocupación es time-phased, no constante: meterlas
+        //    como piso fijo generaría violaciones falsas; su desborde ya lo impide la puerta
+        //    dura time-phased de CapacityContext antes de comprometer la ruta.)
+        ValidationReport validationReport = validator.validate(finalSolution, pendingStorageBaseline);
 
         if (validationReport.isValid()) {
             System.out.println("✓ Rutas de este ciclo válidas");

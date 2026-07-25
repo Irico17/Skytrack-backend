@@ -27,14 +27,31 @@ public class RouteValidator {
      * **Validates: Requirements 13.1, 13.2, 13.4, 13.5**
      */
     public ValidationReport validate(Solution solution) {
+        return validate(solution, Map.of());
+    }
+
+    /**
+     * Igual que {@link #validate(Solution)} pero contando también las maletas que ya están
+     * en el almacén SIN ruta asignada.
+     *
+     * <p><strong>Por qué hace falta:</strong> la validación de almacenes reproducía solo los
+     * eventos de las rutas, así que "almacén=0 violaciones" únicamente significaba "el plan
+     * ruteado por sí solo no desborda". Las maletas registradas y todavía sin ruta ocupan el
+     * mismo almacén y sí cuentan en el inventario que muestra el panel — de ahí que se
+     * pudiera ver un aeropuerto al 109% mientras el ciclo reportaba cero violaciones. Con el
+     * piso incluido, la validación mide lo mismo que la pantalla.</p>
+     *
+     * @param storageBaseline maletas por aeropuerto ya en suelo sin ruta (piso constante)
+     */
+    public ValidationReport validate(Solution solution, Map<Airport, Integer> storageBaseline) {
         ValidationReport report = new ValidationReport();
-        
+
         validateFlightCapacities(solution, report);
-        validateStorageCapacities(solution, report);
+        validateStorageCapacities(solution, storageBaseline, report);
         validateSLACompliance(solution, report);
         validateLayoverTimes(solution, report);
         // validateFlightDurations removed - flight duration is not a business constraint
-        
+
         return report;
     }
     
@@ -83,7 +100,8 @@ public class RouteValidator {
      * 
      * **Validates: Requirements 3.2, 3.3, 13.2**
      */
-    private void validateStorageCapacities(Solution solution, ValidationReport report) {
+    private void validateStorageCapacities(
+            Solution solution, Map<Airport, Integer> storageBaseline, ValidationReport report) {
         // Recopilar todos los eventos de almacenamiento
         List<StorageEvent> allEvents = new ArrayList<>();
         for (AssignedRoute route : solution.getRoutes().values()) {
@@ -93,8 +111,16 @@ public class RouteValidator {
         // Ordenar por timestamp
         allEvents.sort(StorageEvent.CHRONOLOGICAL_ORDER);
         
-        // Simular ocupación de cada aeropuerto
+        // Simular ocupación de cada aeropuerto, partiendo de las maletas que YA están en
+        // suelo sin ruta (piso constante): ocupan el mismo espacio que las rutas planificadas.
         Map<String, Integer> currentOccupancy = new HashMap<>();
+        if (storageBaseline != null) {
+            for (Map.Entry<Airport, Integer> entry : storageBaseline.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
+                    currentOccupancy.put(entry.getKey().id(), entry.getValue());
+                }
+            }
+        }
         
         for (StorageEvent event : allEvents) {
             String airportId = event.airport().id();
